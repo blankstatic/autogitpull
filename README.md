@@ -86,6 +86,7 @@ autogitpull service logs
 - Уведомления: Отправка уведомлений через системные нотификации
 
 
+```sh
 git rev-parse --abbrev-ref HEAD
 git branch --show-current
 git remote show origin
@@ -96,3 +97,4 @@ git diff HEAD origin/master | cat
 git fetch --all
 git fetch origin
 git merge origin/master
+```
