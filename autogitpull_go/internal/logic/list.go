@@ -3,8 +3,8 @@ package logic
 import (
 	"sync"
 
-	"github.com/blankstatic/autogitpull/internal/lib"
-	"github.com/blankstatic/autogitpull/internal/ui"
+	"github.com/blankstatic/autogitpull/autogitpull_go/internal/lib"
+	"github.com/blankstatic/autogitpull/autogitpull_go/internal/ui"
 	"github.com/spf13/cobra"
 )
 

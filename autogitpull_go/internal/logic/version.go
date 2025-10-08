@@ -3,7 +3,7 @@ package logic
 import (
 	"fmt"
 
-	"github.com/blankstatic/autogitpull/internal/lib"
+	"github.com/blankstatic/autogitpull/autogitpull_go/internal/lib"
 	"github.com/spf13/cobra"
 )
 

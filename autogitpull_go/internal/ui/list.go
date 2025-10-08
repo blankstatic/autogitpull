@@ -8,7 +8,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/blankstatic/autogitpull/internal/lib"
+	"github.com/blankstatic/autogitpull/autogitpull_go/internal/lib"
 	"github.com/charmbracelet/bubbles/table"
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"

@@ -6,8 +6,8 @@ import (
 	"os"
 	"time"
 
-	"github.com/blankstatic/autogitpull/internal/lib"
-	"github.com/blankstatic/autogitpull/internal/service"
+	"github.com/blankstatic/autogitpull/autogitpull_go/internal/lib"
+	"github.com/blankstatic/autogitpull/autogitpull_go/internal/service"
 	"github.com/spf13/cobra"
 )
 

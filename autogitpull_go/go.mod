@@ -1,4 +1,4 @@
-module github.com/blankstatic/autogitpull
+module github.com/blankstatic/autogitpull/autogitpull_go
 
 go 1.23.5
 

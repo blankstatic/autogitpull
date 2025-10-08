@@ -9,8 +9,8 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/blankstatic/autogitpull/internal/lib"
-	"github.com/blankstatic/autogitpull/internal/logic"
+	"github.com/blankstatic/autogitpull/autogitpull_go/internal/lib"
+	"github.com/blankstatic/autogitpull/autogitpull_go/internal/logic"
 	"github.com/spf13/cobra"
 )
 

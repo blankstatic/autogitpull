@@ -5,7 +5,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/blankstatic/autogitpull/internal/lib"
+	"github.com/blankstatic/autogitpull/autogitpull_go/internal/lib"
 )
 
 type Daemon struct {
