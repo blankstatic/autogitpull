@@ -8,7 +8,7 @@
 ## Install
 
 ```sh
-sh -c "$(curl -fsSL https://github.com/blankstatic/autogitpull/main/tools/install_darwin_arm64.sh)"
+bash -c "$(curl -fsSL https://raw.githubusercontent.com/blankstatic/autogitpull/main/tools/install_darwin_arm64.sh)"
 ```
 
 ## MacOS Optional Requirements
