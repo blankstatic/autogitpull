@@ -3,6 +3,9 @@ name: Create macOS Release
 on:
   push:
     tags: [ 'v*' ]
+  release:
+    types:
+      - created
 
 permissions:
   contents: write
