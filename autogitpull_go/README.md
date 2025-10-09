@@ -1,3 +1,7 @@
+## Demo
+
+![example](../.vhs/demo.gif)
+
 ## MacOS Optional Requirements
 
 ```sh
