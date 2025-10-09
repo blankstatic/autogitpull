@@ -5,6 +5,12 @@
 ![example](.vhs/demo.gif)
 ![example](../.vhs/demo.gif)
 
+## Install
+
+```sh
+sh -c "$(curl -fsSL https://github.com/blankstatic/autogitpull/main/tools/install_darwin_arm64.sh)"
+```
+
 ## MacOS Optional Requirements
 
 ```sh
