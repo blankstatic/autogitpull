@@ -2,7 +2,7 @@
 
 ## Demo
 
-![example](../.vhs/demo.gif)
+![example](.vhs/demo.gif)
 
 ## MacOS Optional Requirements
 
