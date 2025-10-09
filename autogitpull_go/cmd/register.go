@@ -11,5 +11,5 @@ func init() {
 
 var registerCmd = &cobra.Command{
 	Use: "register",
-	Run: logic.GetRegisterFunc,
+	Run: logic.RegisterCommandHandler,
 }

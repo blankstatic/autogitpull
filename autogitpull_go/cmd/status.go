@@ -6,10 +6,10 @@ import (
 )
 
 func init() {
-	rootCmd.AddCommand(listCmd)
+	rootCmd.AddCommand(statusCmd)
 }
 
-var listCmd = &cobra.Command{
-	Use: "list",
-	Run: logic.GetListFunc,
+var statusCmd = &cobra.Command{
+	Use: "status",
+	Run: logic.StatusCommandHandler,
 }

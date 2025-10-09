@@ -18,6 +18,8 @@ cat /tmp/com.blankstatic.autogitpull.log
 cat /tmp/com.blankstatic.autogitpull.error.log
 ```
 
+## Application
+
 ```sh
 # Удалите карантинный атрибут
 sudo xattr -r -d com.apple.quarantine autogitpull-macos-arm64

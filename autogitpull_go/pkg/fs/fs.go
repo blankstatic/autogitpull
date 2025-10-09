@@ -1,4 +1,4 @@
-package lib
+package fs
 
 import (
 	"fmt"
@@ -7,6 +7,21 @@ import (
 	"slices"
 	"strings"
 )
+
+var DefaultSkipDirs = []string{
+	".git",
+	"node_modules",
+	"vendor",
+	"__pycache__",
+	".idea",
+	".vscode",
+	"build",
+	"dist",
+	"target",
+	".cache",
+	"tmp",
+	"temp",
+}
 
 func GetUserHomeDir() (string, error) {
 	homeDirectory, err := os.UserHomeDir()
@@ -17,12 +32,12 @@ func GetUserHomeDir() (string, error) {
 	return homeDirectory, nil
 }
 
-func GetAppDataDir() (string, error) {
+func GetAppDataDir(appBaseDirName string) (string, error) {
 	homeDir, err := GetUserHomeDir()
 	if err != nil {
 		return "", err
 	}
-	dataDir := filepath.Join(homeDir, AppDataDir)
+	dataDir := filepath.Join(homeDir, appBaseDirName)
 	return dataDir, err
 }
 
@@ -61,7 +76,12 @@ func CheckDirectoryExist(path string) error {
 	return nil
 }
 
-func FindDirectories(rootPath string, detectFunc func(string) error, progressCallback func(string)) ([]string, error) {
+func FindDirectories(
+	rootPath string,
+	detectFunc func(string) error,
+	progressCallback func(string),
+	skipDirs []string,
+) ([]string, error) {
 	var result []string
 
 	err := filepath.Walk(rootPath, func(path string, info os.FileInfo, err error) error {
@@ -73,14 +93,13 @@ func FindDirectories(rootPath string, detectFunc func(string) error, progressCal
 		}
 
 		if info.IsDir() {
-			// Вызываем callback с текущим путем
 			if progressCallback != nil {
 				progressCallback(path)
 			}
 
 			base := filepath.Base(path)
 
-			if ShouldSkipDirectory(base) {
+			if ShouldSkipDirectory(base, skipDirs) {
 				return filepath.SkipDir
 			}
 
@@ -101,12 +120,12 @@ func FindDirectories(rootPath string, detectFunc func(string) error, progressCal
 	return result, nil
 }
 
-func ShouldSkipDirectory(name string) bool {
+func ShouldSkipDirectory(name string, skipDirs []string) bool {
 	if strings.HasPrefix(name, ".") {
 		return true
 	}
 
-	if slices.Contains(SkipDirs, name) {
+	if slices.Contains(skipDirs, name) {
 		return true
 	}
 

@@ -11,5 +11,5 @@ func init() {
 
 var discoverCmd = &cobra.Command{
 	Use: "discover",
-	Run: logic.GetDiscoverFunc,
+	Run: logic.DiscoverCommandHandler,
 }

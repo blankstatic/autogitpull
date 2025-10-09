@@ -1,25 +1,27 @@
 package logic
 
 import (
-	"github.com/blankstatic/autogitpull/autogitpull_go/internal/lib"
+	"github.com/blankstatic/autogitpull/autogitpull_go/internal/config"
+	"github.com/blankstatic/autogitpull/autogitpull_go/pkg/git"
+	"github.com/blankstatic/autogitpull/autogitpull_go/pkg/notifications"
 	"github.com/spf13/cobra"
 )
 
-func GetRegisterFunc(cmd *cobra.Command, args []string) {
-	isSilently := lib.GetIsSilentlyValue(cmd)
+func RegisterCommandHandler(cmd *cobra.Command, args []string) {
+	isSilently := GetIsSilentlyValue(cmd)
 
-	configPath, err := lib.GetConfigPath()
+	configPath, err := config.GetConfigPath()
 	if err != nil {
 		panic(err)
 	}
 
-	storage := lib.NewStorageManager(configPath)
+	storage := config.NewStorageManager(configPath)
 	if err := storage.Load(); err != nil {
 		panic(err)
 	}
 
 	innerFunc := func(path string) error {
-		err := lib.DetectRepository(path)
+		err := git.DetectRepository(path)
 		if err != nil {
 			return err
 		}
@@ -30,11 +32,11 @@ func GetRegisterFunc(cmd *cobra.Command, args []string) {
 		}
 
 		if !isSilently {
-			lib.ShowMessage(lib.AppName, "Register", path)
+			notifications.OSNotify(config.AppName, "Register", path)
 		}
 
 		return nil
 	}
 
-	lib.ProcessArgsAsPaths(args, innerFunc)
+	ProcessArgsAsPaths(args, innerFunc)
 }

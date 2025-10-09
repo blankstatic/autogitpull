@@ -1,4 +1,4 @@
-package lib
+package logic
 
 import (
 	"fmt"
@@ -6,6 +6,7 @@ import (
 	"os/signal"
 	"syscall"
 
+	"github.com/blankstatic/autogitpull/autogitpull_go/pkg/fs"
 	"github.com/mutagen-io/mutagen/pkg/daemon"
 	"github.com/spf13/cobra"
 )
@@ -53,7 +54,7 @@ func AddRepository(path string) {
 
 func ProcessArgsAsPaths(args []string, processPathFunc func(string) error) {
 	if len(args) == 0 {
-		currentDir, err := GetCurrentDirectory()
+		currentDir, err := fs.GetCurrentDirectory()
 		if err != nil {
 			fmt.Println(err)
 			os.Exit(0)
@@ -62,7 +63,7 @@ func ProcessArgsAsPaths(args []string, processPathFunc func(string) error) {
 	}
 
 	for _, path := range args {
-		absCurrentDir, err := PathToAbsPath(path)
+		absCurrentDir, err := fs.PathToAbsPath(path)
 		if err != nil {
 			fmt.Println(err)
 			continue

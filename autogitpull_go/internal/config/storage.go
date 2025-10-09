@@ -1,4 +1,4 @@
-package lib
+package config
 
 import (
 	"encoding/json"
@@ -6,31 +6,13 @@ import (
 	"os"
 	"path/filepath"
 	"time"
+
+	"github.com/blankstatic/autogitpull/autogitpull_go/pkg/git"
 )
-
-type Config struct {
-	Repositories []RepoInfo `json:"repositories"`
-}
-
-type RepoInfo struct {
-	Path          string    `json:"path"`
-	Name          string    `json:"name"`
-	DefaultBranch string    `json:"default_branch"`
-	AddedAt       time.Time `json:"added_at"`
-	LastSync      time.Time `json:"last_sync"`
-}
 
 type StorageManager struct {
 	configPath string
 	config     *Config
-}
-
-func GetConfigPath() (string, error) {
-	homeDir, err := GetUserHomeDir()
-	if err != nil {
-		return "", err
-	}
-	return filepath.Join(homeDir, AppDataDir, ConfigFilename), nil
 }
 
 func NewStorageManager(configPath string) *StorageManager {
@@ -85,7 +67,7 @@ func (sm *StorageManager) AddRepo(path string) error {
 		}
 	}
 
-	defaultBranch, err := GetRemoteDefaultBranch(path)
+	defaultBranch, err := git.GetRemoteDefaultBranch(path)
 	if err != nil || defaultBranch == "" {
 		return fmt.Errorf("remote default branch not detected: %s", path)
 	}

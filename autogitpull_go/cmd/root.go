@@ -4,14 +4,14 @@ import (
 	"fmt"
 	"os"
 
-	"github.com/blankstatic/autogitpull/autogitpull_go/internal/lib"
+	"github.com/blankstatic/autogitpull/autogitpull_go/internal/config"
 	"github.com/blankstatic/autogitpull/autogitpull_go/internal/logic"
 	"github.com/spf13/cobra"
 )
 
 var rootCmd = &cobra.Command{
-	Use: lib.AppName,
-	Run: logic.GetRootFunc,
+	Use: config.AppName,
+	Run: logic.StatusCommandHandler,
 }
 
 var isSilently bool

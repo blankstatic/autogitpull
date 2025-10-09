@@ -11,5 +11,5 @@ func init() {
 
 var unregisterCmd = &cobra.Command{
 	Use: "unregister",
-	Run: logic.GetUnregisterFunc,
+	Run: logic.UnregisterCommandHandler,
 }

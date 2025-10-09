@@ -3,15 +3,18 @@ package logic
 import (
 	"fmt"
 
-	"github.com/blankstatic/autogitpull/autogitpull_go/internal/lib"
+	"github.com/blankstatic/autogitpull/autogitpull_go/internal/config"
+	"github.com/blankstatic/autogitpull/autogitpull_go/pkg/notifications"
 	"github.com/spf13/cobra"
 )
 
-func GetVersionFunc(cmd *cobra.Command, args []string) {
-	isSilently := lib.GetIsSilentlyValue(cmd)
+const AppVersion = "v0.1"
+
+func VersionCommandHandler(cmd *cobra.Command, args []string) {
+	isSilently := GetIsSilentlyValue(cmd)
 	if !isSilently {
-		lib.ShowMessage(lib.AppName, lib.AppName, lib.AppVersion)
+		notifications.OSNotify(config.AppName, config.AppName, AppVersion)
 	}
 
-	fmt.Println(lib.AppName, lib.AppVersion)
+	fmt.Println(config.AppName, AppVersion)
 }

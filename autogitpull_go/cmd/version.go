@@ -11,5 +11,5 @@ func init() {
 
 var versionCmd = &cobra.Command{
 	Use: "version",
-	Run: logic.GetVersionFunc,
+	Run: logic.VersionCommandHandler,
 }
