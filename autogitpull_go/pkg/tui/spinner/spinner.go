@@ -39,8 +39,8 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case tea.KeyMsg:
 		switch msg.String() {
 		case "q", "esc", "ctrl+c", "й":
-			os.Exit(1)
-			return m, nil
+			m.quitting = true
+			return m, tea.Quit
 		default:
 			return m, nil
 		}
@@ -77,7 +77,7 @@ type Controller struct {
 
 func NewController() *Controller {
 	model := initialModel()
-	program := tea.NewProgram(model)
+	program := tea.NewProgram(model, tea.WithAltScreen())
 
 	return &Controller{
 		program: program,
@@ -107,11 +107,13 @@ func (sc *Controller) Quit() {
 
 func Run() {
 	controller := NewController()
+	defer controller.Quit()
 	controller.Run()
 }
 
 func RunWithUpdates(updateChan <-chan string) {
 	controller := NewController()
+	defer controller.Quit()
 	controller.Run()
 
 	go func() {
