@@ -8,7 +8,7 @@ import (
 	"github.com/spf13/cobra"
 )
 
-const AppVersion = "v0.0.9"
+const AppVersion = "v0.0.10"
 
 func VersionCommandHandler(cmd *cobra.Command, args []string) {
 	isSilently := GetIsSilentlyValue(cmd)

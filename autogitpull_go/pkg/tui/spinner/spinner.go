@@ -77,7 +77,7 @@ type Controller struct {
 
 func NewController() *Controller {
 	model := initialModel()
-	program := tea.NewProgram(model, tea.WithAltScreen())
+	program := tea.NewProgram(model)
 
 	return &Controller{
 		program: program,
