@@ -296,13 +296,20 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 }
 
 func (m model) View() string {
-	tableView := baseStyle.Render(m.table.View())
-	helpView := helpStyle.Render(m.helpText)
+	tableHeight := m.calculateTableHeight(len(m.repos))
+
+	tableView := baseStyle.
+		Width(m.windowWidth).
+		Height(tableHeight).
+		Render(m.table.View())
+	helpView := helpStyle.
+		Width(m.windowWidth).
+		Render(m.helpText)
 
 	return lipgloss.NewStyle().
 		Width(m.windowWidth).
 		Height(m.windowHeight).
-		Render(tableView + "\n" + helpView)
+		Render(lipgloss.JoinVertical(lipgloss.Top, tableView, helpView))
 }
 
 func (m model) createTable() table.Model {
@@ -423,15 +430,7 @@ func (m model) calculateTableHeight(rowCount int) int {
 		return minHeight
 	}
 
-	desiredHeight := rowCount + 1
-
-	if desiredHeight < minHeight {
-		return minHeight
-	}
-	if desiredHeight > maxHeight {
-		return maxHeight
-	}
-	return desiredHeight
+	return maxHeight
 }
 
 func handleUnregisterRepo(path string) error {
