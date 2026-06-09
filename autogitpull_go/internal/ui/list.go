@@ -55,6 +55,13 @@ type model struct {
 	program      *tea.Program
 }
 
+const (
+	tableCellHorizontalFrameSize = 2
+	tableHeaderHeight            = 2
+	minTableHeight               = 4
+	helpViewHeight               = 2
+)
+
 func (m model) Init() tea.Cmd {
 	return tea.Batch(
 		tea.WindowSize(),
@@ -99,13 +106,24 @@ func (m model) loadBranchesAsync() tea.Cmd {
 func updateTableWidth(t table.Model, totalWidth int) table.Model {
 	columnPercentages := []int{15, 15, 15, 45, 10}
 
-	borderWidth := 10
-	availableWidth := totalWidth - borderWidth
+	tableFrameWidth := len(columnPercentages) * tableCellHorizontalFrameSize
+	availableWidth := totalWidth - baseStyle.GetHorizontalFrameSize() - tableFrameWidth
+	if availableWidth < len(columnPercentages) {
+		availableWidth = len(columnPercentages)
+	}
 
 	columns := t.Columns()
 	updatedColumns := make([]table.Column, len(columns))
+	usedWidth := 0
 	for i, col := range columns {
 		colWidth := (availableWidth * columnPercentages[i]) / 100
+		if i == len(columns)-1 {
+			colWidth = availableWidth - usedWidth
+		}
+		if colWidth < 1 {
+			colWidth = 1
+		}
+		usedWidth += colWidth
 		updatedColumns[i] = table.Column{
 			Title: col.Title,
 			Width: colWidth,
@@ -203,7 +221,6 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.windowHeight = msg.Height
 
 		m.table = updateTableWidth(m.table, msg.Width)
-		m.table.SetWidth(msg.Width)
 
 		tableHeight := m.calculateTableHeight(len(m.repos))
 		m.table.SetHeight(tableHeight)
@@ -215,12 +232,12 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			}
 		}
 		m.updateTableRows()
-		m.table.SetWidth(m.windowWidth)
+		m.table = updateTableWidth(m.table, m.windowWidth)
 
 	case statusUpdateMsg:
 		m.setStatusByPath(msg.path, msg.status)
 		m.updateTableRows()
-		m.table.SetWidth(m.windowWidth)
+		m.table = updateTableWidth(m.table, m.windowWidth)
 
 	case tea.KeyMsg:
 		switch msg.String() {
@@ -274,7 +291,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 					}
 
 					m.updateTableRows()
-					m.table.SetWidth(m.windowWidth)
+					m.table = updateTableWidth(m.table, m.windowWidth)
 
 					if len(m.repos) == 0 {
 						m.table.SetCursor(0)
@@ -296,11 +313,11 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 }
 
 func (m model) View() string {
-	tableHeight := m.calculateTableHeight(len(m.repos))
+	tableFrameHeight := m.calculateTableFrameHeight()
 
 	tableView := baseStyle.
 		Width(m.windowWidth).
-		Height(tableHeight).
+		Height(tableFrameHeight).
 		Render(m.table.View())
 	helpView := helpStyle.
 		Width(m.windowWidth).
@@ -423,14 +440,30 @@ func (m model) createHelpText() string {
 }
 
 func (m model) calculateTableHeight(rowCount int) int {
-	minHeight := 4
-	maxHeight := m.windowHeight - 3
+	maxHeight := m.calculateTableFrameHeight()
 
-	if maxHeight < minHeight {
-		return minHeight
+	if maxHeight < minTableHeight {
+		return minTableHeight
 	}
 
-	return maxHeight
+	naturalHeight := rowCount + tableHeaderHeight
+	if naturalHeight < minTableHeight {
+		return minTableHeight
+	}
+	if naturalHeight > maxHeight {
+		return maxHeight
+	}
+
+	return naturalHeight
+}
+
+func (m model) calculateTableFrameHeight() int {
+	height := m.windowHeight - helpViewHeight
+	if height < minTableHeight {
+		return minTableHeight
+	}
+
+	return height
 }
 
 func handleUnregisterRepo(path string) error {
