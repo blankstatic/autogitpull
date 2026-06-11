@@ -17,6 +17,11 @@ bash -c "$(curl -fsSL https://raw.githubusercontent.com/blankstatic/autogitpull/
 brew install terminal-notifier
 ```
 
+Test notification
+```sh
+terminal-notifier -message test -title autogitpull -subtitle 'New commit' -open http://localhost -sender com.apple.games
+```
+
 ## Service
 
 ```sh
@@ -39,4 +44,19 @@ sudo xattr -r -d com.apple.quarantine autogitpull-macos-arm64
 
 # Дайте права на выполнение
 sudo chmod +x autogitpull-macos-arm64
+```
+
+# Bundle ID
+```sh
+osascript -e 'id of app "Games"'
+
+com.apple.games
+```
+
+```
+Git Watcher (engine)
+        ↓
+Feature Hub (dashboard UI)
+        ↓
+macOS Notification Center (optional output)
 ```
