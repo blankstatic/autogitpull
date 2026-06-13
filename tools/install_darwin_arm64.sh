@@ -4,7 +4,7 @@ REPO_OWNER="blankstatic"
 REPO_NAME="autogitpull"
 BINARY_NAME="autogitpull"
 VERSION="latest"
-TARGET_DIR="/usr/local/bin"
+TARGET_DIR="${TARGET_DIR:-/usr/local/bin}"
 RAW_BASE_URL="https://raw.githubusercontent.com/$REPO_OWNER/$REPO_NAME/main"
 
 if [[ "$(uname)" != "Darwin" ]]; then
@@ -44,16 +44,22 @@ fi
 
 echo "🔧 Установка в $TARGET_DIR..."
 
-sudo chmod +x "/tmp/$BINARY_NAME"
-sudo xattr -r -d com.apple.quarantine "/tmp/$BINARY_NAME"
+chmod +x "/tmp/$BINARY_NAME"
+xattr -r -d com.apple.quarantine "/tmp/$BINARY_NAME" 2>/dev/null || true
 
-sudo cp "/tmp/$BINARY_NAME" "$TARGET_DIR/$BINARY_NAME"
+if [ -w "$TARGET_DIR" ]; then
+    rm -f "$TARGET_DIR/$BINARY_NAME"
+    install -m 0755 "/tmp/$BINARY_NAME" "$TARGET_DIR/$BINARY_NAME"
+else
+    sudo rm -f "$TARGET_DIR/$BINARY_NAME"
+    sudo install -m 0755 "/tmp/$BINARY_NAME" "$TARGET_DIR/$BINARY_NAME"
+fi
 
 if [ $? -eq 0 ]; then
     echo "✅ Установка завершена успешно!"
     echo "💡 Проверь работу командой: $BINARY_NAME version"
 else
-    echo "❌ Ошибка при копировании файла"
+    echo "❌ Ошибка при установке файла"
     exit 1
 fi
 
