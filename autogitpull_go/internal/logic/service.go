@@ -2,7 +2,6 @@ package logic
 
 import (
 	"fmt"
-	"log"
 	"os"
 	"time"
 
@@ -20,7 +19,7 @@ func ServiceCommandHandler(cmd *cobra.Command, args []string) {
 func runServiceCommand(command string) {
 	configPath, err := config.GetConfigPath()
 	if err != nil {
-		log.Fatal("Error getting config path:", err)
+		exitServiceError("Error getting config path", err)
 	}
 
 	interval := time.Duration(serviceIntervalMin) * time.Minute
@@ -30,43 +29,48 @@ func runServiceCommand(command string) {
 	case "install":
 		err := manager.Install()
 		if err != nil {
-			log.Fatal("Install failed:", err)
+			exitServiceError("Install failed", err)
 		}
-		fmt.Println("✅ Service installed successfully")
+		fmt.Println("OK: service installed")
 
 	case "start":
 		err := manager.Start()
 		if err != nil {
-			log.Fatal("Start failed:", err)
+			exitServiceError("Start failed", err)
 		}
-		fmt.Println("✅ Service started successfully")
+		fmt.Println("OK: service started")
 
 	case "stop":
 		err := manager.Stop()
 		if err != nil {
-			log.Fatal("Stop failed:", err)
+			exitServiceError("Stop failed", err)
 		}
-		fmt.Println("✅ Service stopped successfully")
+		fmt.Println("OK: service stopped")
 
 	case "uninstall":
 		err := manager.Uninstall()
 		if err != nil {
-			log.Fatal("Uninstall failed:", err)
+			exitServiceError("Uninstall failed", err)
 		}
-		fmt.Println("✅ Service uninstalled successfully")
+		fmt.Println("OK: service uninstalled")
 
 	case "status":
 		status, err := manager.Status()
 		if err != nil {
-			log.Fatal("Status check failed:", err)
+			exitServiceError("Status check failed", err)
 		}
-		fmt.Printf("📊 Service status: %s\n", status)
+		fmt.Printf("Service status: %s\n", status)
 
 	default:
 		fmt.Printf("Unknown service command: %s\n", command)
 		printServiceUsage()
 		os.Exit(1)
 	}
+}
+
+func exitServiceError(message string, err error) {
+	fmt.Fprintf(os.Stderr, "%s: %v\n", message, err)
+	os.Exit(1)
 }
 
 func printServiceUsage() {

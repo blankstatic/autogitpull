@@ -3,6 +3,7 @@ package logic
 import (
 	"fmt"
 	"log/slog"
+	"net/url"
 	"os"
 	"os/signal"
 	"strings"
@@ -11,6 +12,8 @@ import (
 	"time"
 
 	"github.com/blankstatic/autogitpull/autogitpull_go/internal/config"
+	"github.com/blankstatic/autogitpull/autogitpull_go/internal/db"
+	"github.com/blankstatic/autogitpull/autogitpull_go/internal/web"
 	"github.com/blankstatic/autogitpull/autogitpull_go/pkg/fs"
 	"github.com/blankstatic/autogitpull/autogitpull_go/pkg/git"
 	"github.com/blankstatic/autogitpull/autogitpull_go/pkg/notifications"
@@ -26,19 +29,25 @@ type Daemon struct {
 	mu          sync.RWMutex
 	onPullStart func(repo *config.RepoInfo)
 	onPullDone  func(repo *config.RepoInfo, result string, err error)
+	updateStore *db.Store
 }
 
 type Config struct {
 	Interval    time.Duration
 	ConfigPath  string
+	Storage     *config.StorageManager
 	OnPullStart func(repo *config.RepoInfo)
 	OnPullDone  func(repo *config.RepoInfo, result string, err error)
+	UpdateStore *db.Store
 }
 
 func NewDaemon(cfg Config) (*Daemon, error) {
-	storage := config.NewStorageManager(cfg.ConfigPath)
-	if err := storage.Load(); err != nil {
-		return nil, err
+	storage := cfg.Storage
+	if storage == nil {
+		storage = config.NewStorageManager(cfg.ConfigPath)
+		if err := storage.Load(); err != nil {
+			return nil, err
+		}
 	}
 
 	return &Daemon{
@@ -47,6 +56,7 @@ func NewDaemon(cfg Config) (*Daemon, error) {
 		stopChan:    make(chan struct{}),
 		onPullStart: cfg.OnPullStart,
 		onPullDone:  cfg.OnPullDone,
+		updateStore: cfg.UpdateStore,
 	}, nil
 }
 
@@ -118,11 +128,26 @@ func (d *Daemon) pullAllRepos() {
 }
 
 func (d *Daemon) pullRepo(repo *config.RepoInfo) {
+	var updateID int64
+	if d.updateStore != nil {
+		var err error
+		updateID, err = d.updateStore.BeginUpdate(repo.Path, repo.Name)
+		if err != nil {
+			slog.Error("failed to record update start", slog.String("repo", repo.Name), slog.String("err", err.Error()))
+		}
+	}
+
 	if d.onPullStart != nil {
 		d.onPullStart(repo)
 	}
 
 	result, err := d.performPull(repo)
+
+	if d.updateStore != nil && updateID > 0 {
+		if recordErr := d.updateStore.FinishUpdate(updateID, result, err); recordErr != nil {
+			slog.Error("failed to record update result", slog.String("repo", repo.Name), slog.String("err", recordErr.Error()))
+		}
+	}
 
 	if d.onPullDone != nil {
 		d.onPullDone(repo, result, err)
@@ -193,19 +218,41 @@ func DaemonCommandHandler(cmd *cobra.Command, args []string) {
 		panic(err)
 	}
 
+	updatesDBPath, err := config.GetUpdatesDBPath()
+	if err != nil {
+		slog.Error("Error getting updates database path", slog.String("err", err.Error()))
+		panic(err)
+	}
+
+	updateStore, err := db.Open(updatesDBPath)
+	if err != nil {
+		slog.Error("Error opening updates database", slog.String("err", err.Error()))
+		panic(err)
+	}
+	defer updateStore.Close()
+
+	storage := config.NewStorageManager(configPath)
+	if err := storage.Load(); err != nil {
+		panic(err)
+	}
+	web.New(updateStore, storage).Start()
+
 	d, err := NewDaemon(Config{
-		Interval:   30 * time.Minute,
-		ConfigPath: configPath,
+		Interval:    30 * time.Minute,
+		ConfigPath:  configPath,
+		Storage:     storage,
+		UpdateStore: updateStore,
 		OnPullStart: func(repo *config.RepoInfo) {
-			slog.Info("🔄 Pulling repository", slog.String("repo", repo.Name))
+			slog.Info("Pulling repository", slog.String("repo", repo.Name))
 		},
 		OnPullDone: func(repo *config.RepoInfo, result string, err error) {
 			if err != nil {
-				slog.Warn("❌ Failed to pull", slog.String("repo", repo.Name), slog.String("err", err.Error()))
+				slog.Warn("Failed to pull", slog.String("repo", repo.Name), slog.String("err", err.Error()))
 			} else {
-				slog.Info("✅ Successfully pulled", slog.String("repo", repo.Name))
+				slog.Info("Successfully pulled", slog.String("repo", repo.Name))
 				if !strings.Contains(result, "up to date") {
-					go notifications.OSNotify(config.AppName, fmt.Sprintf("Pulled: %s", repo.Name), result)
+					notifyURL := "http://localhost:9009/repo?path=" + url.QueryEscape(repo.Path)
+					go notifications.OSNotifyURL(config.AppName, fmt.Sprintf("Pulled: %s", repo.Name), result, notifyURL)
 				}
 			}
 		},
@@ -215,15 +262,11 @@ func DaemonCommandHandler(cmd *cobra.Command, args []string) {
 		panic(err)
 	}
 
-	slog.Info(fmt.Sprintf("🚀 Starting autogitpull daemon (interval: %v)", 30*time.Minute))
+	slog.Info(fmt.Sprintf("Starting autogitpull daemon (interval: %v)", 30*time.Minute))
 
-	storage := config.NewStorageManager(configPath)
-	if err := storage.Load(); err != nil {
-		panic(err)
-	}
 	repos := storage.GetAllRepos()
 	for _, repo := range repos {
-		slog.Info("📁 Monitoring repo", slog.String("repo", repo.Name), slog.String("path", repo.Path))
+		slog.Info("Monitoring repo", slog.String("repo", repo.Name), slog.String("path", repo.Path))
 	}
 
 	d.Start()
@@ -232,8 +275,8 @@ func DaemonCommandHandler(cmd *cobra.Command, args []string) {
 	signal.Notify(sigChan, syscall.SIGINT, syscall.SIGTERM)
 	<-sigChan
 
-	slog.Warn("🛑 Stopping daemon...")
+	slog.Warn("Stopping daemon...")
 	d.Stop()
-	slog.Warn("👋 Daemon stopped")
+	slog.Warn("Daemon stopped")
 
 }

@@ -13,7 +13,11 @@ var InfoIcon []byte
 var WarningIcon []byte
 
 func OSNotify(appName, title, body string) error {
-	if err := customNotify(title, body); err == nil {
+	return OSNotifyURL(appName, title, body, "")
+}
+
+func OSNotifyURL(appName, title, body, openURL string) error {
+	if err := customNotify(title, body, openURL); err == nil {
 		return nil
 	}
 
