@@ -15,12 +15,21 @@ bash -c "$(curl -fsSL https://raw.githubusercontent.com/blankstatic/autogitpull/
 
 ```sh
 brew install terminal-notifier
+tools/featurehub-build.sh --no-notify
 ```
 
 Test notification
 ```sh
-terminal-notifier -message test -title autogitpull -subtitle 'New commit' -open http://localhost -sender com.apple.games
+~/Applications/FeatureHubLauncher.app/Contents/MacOS/terminal-notifier \
+  -message test \
+  -title autogitpull \
+  -subtitle 'New commit' \
+  -open http://localhost
 ```
+
+`autogitpull` uses `~/Applications/FeatureHubLauncher.app` on macOS when it
+exists. Override paths with `AUTOGITPULL_NOTIFIER_APP` and
+`AUTOGITPULL_DASHBOARD_URL`.
 
 ## Service
 
