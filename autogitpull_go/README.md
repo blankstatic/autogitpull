@@ -15,7 +15,21 @@ bash -c "$(curl -fsSL https://raw.githubusercontent.com/blankstatic/autogitpull/
 
 ```sh
 brew install terminal-notifier
+tools/featurehub-build.sh --no-notify
 ```
+
+Test notification
+```sh
+~/Applications/FeatureHubLauncher.app/Contents/MacOS/terminal-notifier \
+  -message test \
+  -title autogitpull \
+  -subtitle 'New commit' \
+  -open http://localhost
+```
+
+`autogitpull` uses `~/Applications/FeatureHubLauncher.app` on macOS when it
+exists. Override paths with `AUTOGITPULL_NOTIFIER_APP` and
+`AUTOGITPULL_DASHBOARD_URL`.
 
 ## Service
 
@@ -39,4 +53,19 @@ sudo xattr -r -d com.apple.quarantine autogitpull-macos-arm64
 
 # Дайте права на выполнение
 sudo chmod +x autogitpull-macos-arm64
+```
+
+# Bundle ID
+```sh
+osascript -e 'id of app "Games"'
+
+com.apple.games
+```
+
+```
+Git Watcher (engine)
+        ↓
+Feature Hub (dashboard UI)
+        ↓
+macOS Notification Center (optional output)
 ```

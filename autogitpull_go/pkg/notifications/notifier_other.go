@@ -1,0 +1,9 @@
+//go:build !darwin
+
+package notifications
+
+import "errors"
+
+func customNotify(title, body string) error {
+	return errors.New("custom notifier is only available on macOS")
+}

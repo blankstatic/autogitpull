@@ -5,6 +5,7 @@ REPO_NAME="autogitpull"
 BINARY_NAME="autogitpull"
 VERSION="latest"
 TARGET_DIR="/usr/local/bin"
+RAW_BASE_URL="https://raw.githubusercontent.com/$REPO_OWNER/$REPO_NAME/main"
 
 if [[ "$(uname)" != "Darwin" ]]; then
     echo "❌ Этот скрипт предназначен только для macOS"
@@ -54,4 +55,22 @@ if [ $? -eq 0 ]; then
 else
     echo "❌ Ошибка при копировании файла"
     exit 1
+fi
+
+if command -v terminal-notifier >/dev/null 2>&1; then
+    echo "🔔 Установка Feature Hub notifier..."
+
+    NOTIFIER_TMP_DIR=$(mktemp -d "${TMPDIR:-/tmp}/autogitpull-notifier.XXXXXX")
+    trap 'rm -rf "$NOTIFIER_TMP_DIR"' EXIT
+
+    if curl -fsSL "$RAW_BASE_URL/tools/featurehub-build.sh" -o "$NOTIFIER_TMP_DIR/featurehub-build.sh" \
+        && curl -fsSL "$RAW_BASE_URL/tools/featurehub.icns" -o "$NOTIFIER_TMP_DIR/featurehub.icns" \
+        && chmod +x "$NOTIFIER_TMP_DIR/featurehub-build.sh" \
+        && "$NOTIFIER_TMP_DIR/featurehub-build.sh" --no-notify; then
+        echo "✅ Feature Hub notifier установлен"
+    else
+        echo "⚠️ Не удалось установить Feature Hub notifier; $BINARY_NAME продолжит использовать fallback уведомления"
+    fi
+else
+    echo "ℹ️ terminal-notifier не найден; для кастомных macOS уведомлений: brew install terminal-notifier"
 fi
