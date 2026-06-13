@@ -1,6 +1,7 @@
 package web
 
 import (
+	"bytes"
 	_ "embed"
 	"fmt"
 	"html/template"
@@ -82,7 +83,7 @@ func (s *Server) index(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	_ = indexTemplate.Execute(w, map[string]any{
+	renderTemplate(w, indexTemplate, map[string]any{
 		"Repos":         repos,
 		"Updates":       updates,
 		"Activity":      activity,
@@ -133,7 +134,7 @@ func (s *Server) repo(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	_ = repoTemplate.Execute(w, map[string]any{
+	renderTemplate(w, repoTemplate, map[string]any{
 		"Repo":         repo,
 		"Updates":      updates,
 		"Activity":     activity,
@@ -141,6 +142,19 @@ func (s *Server) repo(w http.ResponseWriter, r *http.Request) {
 		"TotalUpdates": totalUpdates,
 		"Pagination":   newPagination(r.URL.Path, url.Values{"path": []string{repoPath}}, page, totalUpdates),
 	})
+}
+
+func renderTemplate(w http.ResponseWriter, tmpl *template.Template, data any) {
+	var buf bytes.Buffer
+	if err := tmpl.Execute(&buf, data); err != nil {
+		slog.Error("failed to render web template", slog.String("template", tmpl.Name()), slog.String("err", err.Error()))
+		http.Error(w, "failed to render page", http.StatusInternalServerError)
+		return
+	}
+	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	if _, err := buf.WriteTo(w); err != nil {
+		slog.Error("failed to write web response", slog.String("template", tmpl.Name()), slog.String("err", err.Error()))
+	}
 }
 
 type activityCell struct {
@@ -165,32 +179,33 @@ func (s *Server) activity(repoPath string) (activitySummary, error) {
 	start := today.AddDate(0, 0, -((activityWeeks-1)*7 + int(today.Weekday())))
 
 	var (
-		updates []db.Update
-		err     error
+		times []time.Time
+		err   error
 	)
 	if repoPath == "" {
-		updates, err = s.store.UpdatesSince(start)
+		times, err = s.store.ChangedUpdateTimesSince(start)
 	} else {
-		updates, err = s.store.RepoUpdatesSince(repoPath, start)
+		times, err = s.store.RepoChangedUpdateTimesSince(repoPath, start)
 	}
 	if err != nil {
 		return activitySummary{}, err
 	}
-	return newActivitySummary(updates, start, today, loc), nil
+	return newActivitySummary(times, start, today, loc), nil
 }
 
-func newActivitySummary(updates []db.Update, start, end time.Time, loc *time.Location) activitySummary {
+func newActivitySummary(changedTimes []time.Time, start, end time.Time, loc *time.Location) activitySummary {
 	byDate := map[string]activityCell{}
 	summary := activitySummary{
 		Start: start.Format("Jan 2, 2006"),
 		End:   end.Format("Jan 2, 2006"),
 	}
 
-	for _, update := range updates {
-		if !update.Changed {
+	for _, changedAt := range changedTimes {
+		day := changedAt.In(loc)
+		if day.Before(start) || !day.Before(end.AddDate(0, 0, 1)) {
 			continue
 		}
-		date := update.StartedAt.In(loc).Format("2006-01-02")
+		date := day.Format("2006-01-02")
 		cell := byDate[date]
 		cell.Date = date
 		cell.Count++
