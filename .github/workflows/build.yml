@@ -20,10 +20,14 @@ jobs:
         with:
           go-version: '1.23.5'
 
-      - name: Build for both architectures
+      - name: Build for macOS arm64
+        env:
+          APP_VERSION: ${{ github.ref_name }}
         run: |
           cd autogitpull_go
-          GOOS=darwin GOARCH=arm64 go build -o autogitpull-macos-arm64 .
+          GOOS=darwin GOARCH=arm64 go build -ldflags "-X github.com/blankstatic/autogitpull/autogitpull_go/internal/logic.AppVersion=${APP_VERSION}" -o autogitpull-macos-arm64 .
+          chmod +x autogitpull-macos-arm64
+          tar -czf autogitpull-macos-arm64.tar.gz autogitpull-macos-arm64
 
       - name: Upload build artifacts
         uses: actions/upload-artifact@v4
@@ -31,3 +35,4 @@ jobs:
           name: macos-binaries
           path: |
             autogitpull_go/autogitpull-macos-arm64
+            autogitpull_go/autogitpull-macos-arm64.tar.gz
