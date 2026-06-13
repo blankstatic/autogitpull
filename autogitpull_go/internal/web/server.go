@@ -21,6 +21,7 @@ import (
 const Addr = ":9009"
 const serviceInterval = 30 * time.Minute
 const updatesPerPage = 50
+const activityWeeks = 53
 
 //go:embed assets/featurehub.png
 var appIcon []byte
@@ -75,10 +76,16 @@ func (s *Server) index(w http.ResponseWriter, r *http.Request) {
 	repos := s.storage.GetAllRepos()
 	dbPath, _ := config.GetUpdatesDBPath()
 	serviceStatus := getServiceStatus()
+	activity, err := s.activity("")
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
 
 	_ = indexTemplate.Execute(w, map[string]any{
 		"Repos":         repos,
 		"Updates":       updates,
+		"Activity":      activity,
 		"RepoCount":     len(repos),
 		"UpdateCount":   len(updates),
 		"TotalUpdates":  totalUpdates,
@@ -120,13 +127,110 @@ func (s *Server) repo(w http.ResponseWriter, r *http.Request) {
 		changes = err.Error()
 	}
 
+	activity, err := s.activity(repoPath)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+
 	_ = repoTemplate.Execute(w, map[string]any{
 		"Repo":         repo,
 		"Updates":      updates,
+		"Activity":     activity,
 		"Changes":      changes,
 		"TotalUpdates": totalUpdates,
 		"Pagination":   newPagination(r.URL.Path, url.Values{"path": []string{repoPath}}, page, totalUpdates),
 	})
+}
+
+type activityCell struct {
+	Date  string
+	Title string
+	Count int
+	Level int
+}
+
+type activitySummary struct {
+	Cells       []activityCell
+	Total       int
+	Start       string
+	End         string
+	HasActivity bool
+}
+
+func (s *Server) activity(repoPath string) (activitySummary, error) {
+	loc := moscowLocation()
+	now := time.Now().In(loc)
+	today := time.Date(now.Year(), now.Month(), now.Day(), 0, 0, 0, 0, loc)
+	start := today.AddDate(0, 0, -((activityWeeks-1)*7 + int(today.Weekday())))
+
+	var (
+		updates []db.Update
+		err     error
+	)
+	if repoPath == "" {
+		updates, err = s.store.UpdatesSince(start)
+	} else {
+		updates, err = s.store.RepoUpdatesSince(repoPath, start)
+	}
+	if err != nil {
+		return activitySummary{}, err
+	}
+	return newActivitySummary(updates, start, today, loc), nil
+}
+
+func newActivitySummary(updates []db.Update, start, end time.Time, loc *time.Location) activitySummary {
+	byDate := map[string]activityCell{}
+	summary := activitySummary{
+		Start: start.Format("Jan 2, 2006"),
+		End:   end.Format("Jan 2, 2006"),
+	}
+
+	for _, update := range updates {
+		if !update.Changed {
+			continue
+		}
+		date := update.StartedAt.In(loc).Format("2006-01-02")
+		cell := byDate[date]
+		cell.Date = date
+		cell.Count++
+		byDate[date] = cell
+
+		summary.Total++
+	}
+
+	for day := start; !day.After(end); day = day.AddDate(0, 0, 1) {
+		date := day.Format("2006-01-02")
+		cell := byDate[date]
+		cell.Date = date
+		cell.Level = activityLevel(cell.Count)
+		cell.Title = activityTitle(cell)
+		summary.Cells = append(summary.Cells, cell)
+	}
+	summary.HasActivity = summary.Total > 0
+	return summary
+}
+
+func activityLevel(count int) int {
+	switch {
+	case count == 0:
+		return 0
+	case count == 1:
+		return 1
+	case count <= 3:
+		return 2
+	case count <= 6:
+		return 3
+	default:
+		return 4
+	}
+}
+
+func activityTitle(cell activityCell) string {
+	if cell.Count == 0 {
+		return "No new changes on " + cell.Date
+	}
+	return plural(cell.Count, "changed update") + " on " + cell.Date
 }
 
 type pagination struct {
@@ -326,6 +430,17 @@ var baseCSS = template.CSS(`
 	.panel-title { color: #24292f; }
 	.panel-title:hover { color: #0969da; text-decoration: none; }
 	.panel-body { padding: 16px; }
+	.activity-wrap { overflow-x: auto; padding-bottom: 2px; }
+	.activity-grid { display: grid; grid-auto-flow: column; grid-auto-columns: 12px; grid-template-rows: repeat(7, 12px); gap: 3px; width: max-content; }
+	.activity-cell { width: 12px; height: 12px; border-radius: 2px; background: #ebedf0; border: 1px solid rgba(27,31,36,.06); }
+	.activity-cell:hover { outline: 1px solid #57606a; outline-offset: 1px; }
+	.activity-cell[data-level="1"] { background: #9be9a8; }
+	.activity-cell[data-level="2"] { background: #40c463; }
+	.activity-cell[data-level="3"] { background: #30a14e; }
+	.activity-cell[data-level="4"] { background: #216e39; }
+	.activity-meta { display: flex; align-items: center; justify-content: space-between; gap: 14px; margin-top: 12px; color: #57606a; font-size: 12px; }
+	.activity-legend { display: flex; align-items: center; gap: 5px; white-space: nowrap; }
+	.activity-legend .activity-cell { display: inline-block; flex: 0 0 auto; }
 	.pagination { padding: 12px 16px; display: flex; align-items: center; justify-content: space-between; gap: 12px; border-top: 1px solid #d8dee4; background: #f6f8fa; }
 	.pagination-info { color: #57606a; font-size: 12px; }
 	.pagination-actions { display: flex; gap: 8px; }
@@ -351,7 +466,7 @@ var baseCSS = template.CSS(`
 	.time { white-space: nowrap; }
 	.time-detail { color: #57606a; font-size: 12px; margin-top: 2px; white-space: nowrap; }
 	.empty { color: #57606a; padding: 18px; }
-	@media (max-width: 760px) { .header-inner { display: block; } .summary { grid-template-columns: 1fr; } th:nth-child(4), td:nth-child(4) { display: none; } }
+	@media (max-width: 760px) { .header-inner { display: block; } .summary { grid-template-columns: 1fr; } .activity-meta { align-items: flex-start; flex-direction: column; } th:nth-child(4), td:nth-child(4) { display: none; } }
 `)
 
 var templateFuncs = template.FuncMap{
@@ -406,6 +521,8 @@ var templateFuncs = template.FuncMap{
 	"compactPath": compactPath,
 }
 
+const activityTemplate = `{{define "activity"}}<div class="activity-wrap"><div class="activity-grid" aria-label="Changed update activity from {{.Start}} to {{.End}}">{{range .Cells}}<span class="activity-cell" data-level="{{.Level}}" title="{{.Title}}" aria-label="{{.Title}}"></span>{{end}}</div></div><div class="activity-meta"><div>{{.Total}} changed updates in the last year</div><div class="activity-legend"><span>Less</span><span class="activity-cell" data-level="0"></span><span class="activity-cell" data-level="1"></span><span class="activity-cell" data-level="2"></span><span class="activity-cell" data-level="3"></span><span class="activity-cell" data-level="4"></span><span>More</span></div></div>{{end}}`
+
 var indexTemplate = template.Must(template.New("index").Funcs(templateFuncs).Parse(`
 <!doctype html><html><head><meta charset="utf-8"><title>autogitpull</title><link rel="icon" type="image/png" href="/favicon.ico"><style>` + string(baseCSS) + `</style></head>
 <body><header><div class="header-inner"><a class="brand" href="/"><img class="brand-icon" src="/assets/app-icon.png" alt=""><h1>autogitpull</h1></a></div></header><main>
@@ -416,6 +533,9 @@ var indexTemplate = template.Must(template.New("index").Funcs(templateFuncs).Par
 	<div class="metric"><div class="metric-label">Database</div><div class="path" title="{{.DBPath}}">{{compactPath .DBPath}}</div></div>
 </section>
 <div class="grid">
+<section class="panel" id="activity"><div class="panel-head"><h2><a class="panel-title" href="#activity">Activity</a></h2></div><div class="panel-body">
+{{template "activity" .Activity}}
+</div></section>
 <section class="panel" id="repositories"><div class="panel-head"><h2><a class="panel-title" href="#repositories">Repositories</a></h2></div><div class="panel-body">
 {{if .Repos}}<div class="repo-list">{{range .Repos}}<a class="repo" href="/repo?path={{.Path | urlquery}}" title="{{.Path}}"><div class="repo-title"><strong>{{.Name}}</strong><span class="badge">{{.DefaultBranch}}</span></div><div class="path">{{compactPath .Path}}</div><div class="time-detail">Last sync: {{humanTime .LastSync}} · {{formatTime .LastSync}}</div></a>{{end}}</div>{{else}}<div class="empty">No repositories registered.</div>{{end}}
 </div></section>
@@ -426,7 +546,7 @@ var indexTemplate = template.Must(template.New("index").Funcs(templateFuncs).Par
 </div>
 </main></body></html>
 
-{{define "pagination"}}<div class="pagination"><div class="pagination-info">{{if .Total}}Showing {{.From}}-{{.To}} of {{.Total}} · page {{.Page}} of {{.TotalPages}}{{else}}No records{{end}}</div><div class="pagination-actions">{{if .HasPrev}}<a class="page-link" href="{{.PrevURL}}">Prev</a>{{else}}<span class="page-link disabled">Prev</span>{{end}}{{if .HasNext}}<a class="page-link" href="{{.NextURL}}">Next</a>{{else}}<span class="page-link disabled">Next</span>{{end}}</div></div>{{end}}`))
+{{define "pagination"}}<div class="pagination"><div class="pagination-info">{{if .Total}}Showing {{.From}}-{{.To}} of {{.Total}} · page {{.Page}} of {{.TotalPages}}{{else}}No records{{end}}</div><div class="pagination-actions">{{if .HasPrev}}<a class="page-link" href="{{.PrevURL}}">Prev</a>{{else}}<span class="page-link disabled">Prev</span>{{end}}{{if .HasNext}}<a class="page-link" href="{{.NextURL}}">Next</a>{{else}}<span class="page-link disabled">Next</span>{{end}}</div></div>{{end}}` + activityTemplate))
 
 var repoTemplate = template.Must(template.New("repo").Funcs(templateFuncs).Parse(`
 <!doctype html><html><head><meta charset="utf-8"><title>{{.Repo.Name}} - autogitpull</title><link rel="icon" type="image/png" href="/favicon.ico"><style>` + string(baseCSS) + `</style></head>
@@ -436,6 +556,9 @@ var repoTemplate = template.Must(template.New("repo").Funcs(templateFuncs).Parse
 	<div class="metric"><div class="metric-label">Last sync</div><div class="metric-value">{{humanTime .Repo.LastSync}}</div><div class="metric-detail">{{formatTime .Repo.LastSync}}</div></div>
 	<div class="metric"><div class="metric-label">Recorded events</div><div class="metric-value">{{.TotalUpdates}}</div></div>
 </section>
+<section class="panel" id="activity"><div class="panel-head"><h2><a class="panel-title" href="#activity">Activity</a></h2></div><div class="panel-body">
+{{template "activity" .Activity}}
+</div></section>
 <section class="panel" id="changes"><div class="panel-head"><h2><a class="panel-title" href="#changes">Current local changes</a></h2></div><div class="panel-body"><pre>{{if .Changes}}{{.Changes}}{{else}}No uncommitted changes{{end}}</pre></div></section>
 <section class="panel" id="updates"><div class="panel-head"><h2><a class="panel-title" href="#updates">Updates</a></h2></div>
 {{if .Updates}}<table><tr><th>Time</th><th>Status</th><th>Changed</th><th>Result</th></tr>
@@ -443,4 +566,4 @@ var repoTemplate = template.Must(template.New("repo").Funcs(templateFuncs).Parse
 </table>{{template "pagination" .Pagination}}{{else}}<div class="empty">No updates recorded for this repository.</div>{{end}}</section>
 </main></body></html>
 
-{{define "pagination"}}<div class="pagination"><div class="pagination-info">{{if .Total}}Showing {{.From}}-{{.To}} of {{.Total}} · page {{.Page}} of {{.TotalPages}}{{else}}No records{{end}}</div><div class="pagination-actions">{{if .HasPrev}}<a class="page-link" href="{{.PrevURL}}">Prev</a>{{else}}<span class="page-link disabled">Prev</span>{{end}}{{if .HasNext}}<a class="page-link" href="{{.NextURL}}">Next</a>{{else}}<span class="page-link disabled">Next</span>{{end}}</div></div>{{end}}`))
+{{define "pagination"}}<div class="pagination"><div class="pagination-info">{{if .Total}}Showing {{.From}}-{{.To}} of {{.Total}} · page {{.Page}} of {{.TotalPages}}{{else}}No records{{end}}</div><div class="pagination-actions">{{if .HasPrev}}<a class="page-link" href="{{.PrevURL}}">Prev</a>{{else}}<span class="page-link disabled">Prev</span>{{end}}{{if .HasNext}}<a class="page-link" href="{{.NextURL}}">Next</a>{{else}}<span class="page-link disabled">Next</span>{{end}}</div></div>{{end}}` + activityTemplate))

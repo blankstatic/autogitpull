@@ -98,6 +98,21 @@ func (s *Store) RecentUpdatesPage(limit, offset int) ([]Update, error) {
 	return scanUpdates(rows)
 }
 
+func (s *Store) UpdatesSince(since time.Time) ([]Update, error) {
+	rows, err := s.db.Query(`
+		SELECT id, repo_path, repo_name, status, result, error, changed, started_at, finished_at
+		FROM updates
+		WHERE started_at >= ?
+		ORDER BY started_at ASC
+	`, since.UTC())
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	return scanUpdates(rows)
+}
+
 func (s *Store) RepoUpdates(repoPath string, limit int) ([]Update, error) {
 	return s.RepoUpdatesPage(repoPath, limit, 0)
 }
@@ -110,6 +125,21 @@ func (s *Store) RepoUpdatesPage(repoPath string, limit, offset int) ([]Update, e
 		ORDER BY id DESC
 		LIMIT ? OFFSET ?
 	`, repoPath, limit, offset)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	return scanUpdates(rows)
+}
+
+func (s *Store) RepoUpdatesSince(repoPath string, since time.Time) ([]Update, error) {
+	rows, err := s.db.Query(`
+		SELECT id, repo_path, repo_name, status, result, error, changed, started_at, finished_at
+		FROM updates
+		WHERE repo_path = ? AND started_at >= ?
+		ORDER BY started_at ASC
+	`, repoPath, since.UTC())
 	if err != nil {
 		return nil, err
 	}
