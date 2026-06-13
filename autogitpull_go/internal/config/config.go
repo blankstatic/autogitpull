@@ -32,3 +32,11 @@ func GetConfigPath() (string, error) {
 	}
 	return filepath.Join(homeDir, AppDataDir, ConfigFilename), nil
 }
+
+func GetUpdatesDBPath() (string, error) {
+	homeDir, err := fs.GetUserHomeDir()
+	if err != nil {
+		return "", err
+	}
+	return filepath.Join(homeDir, AppDataDir, "updates.sqlite"), nil
+}

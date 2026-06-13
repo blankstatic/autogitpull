@@ -13,16 +13,19 @@ import (
 
 const (
 	defaultNotifierAppName = "FeatureHubLauncher.app"
-	defaultDashboardURL    = "http://localhost"
+	defaultDashboardURL    = "http://localhost:9009"
 )
 
-func customNotify(title, body string) error {
+func customNotify(title, body, openURL string) error {
 	notifierBin, err := findNotifierBinary()
 	if err != nil {
 		return err
 	}
 
 	dashboardURL := os.Getenv("AUTOGITPULL_DASHBOARD_URL")
+	if openURL != "" {
+		dashboardURL = openURL
+	}
 	if dashboardURL == "" {
 		dashboardURL = defaultDashboardURL
 	}

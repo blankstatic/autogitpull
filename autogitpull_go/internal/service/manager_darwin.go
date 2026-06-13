@@ -5,7 +5,6 @@ package service
 
 import (
 	"fmt"
-	"log"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -109,7 +108,6 @@ func (dm *darwinManager) Install() error {
 		return fmt.Errorf("failed to write plist file: %w", err)
 	}
 
-	log.Printf("Service plist installed at: %s", plistPath)
 	return nil
 }
 
@@ -135,7 +133,6 @@ func (dm *darwinManager) Start() error {
 		return fmt.Errorf("failed to start service: %s - %w", string(output), err)
 	}
 
-	log.Printf("Service '%s' started successfully", serviceName)
 	return nil
 }
 
@@ -152,7 +149,6 @@ func (dm *darwinManager) Stop() error {
 		cmd.Run()
 	}
 
-	log.Printf("Service '%s' stopped successfully", serviceName)
 	return nil
 }
 
@@ -168,7 +164,6 @@ func (dm *darwinManager) Uninstall() error {
 		return fmt.Errorf("failed to remove plist file: %w", err)
 	}
 
-	log.Printf("Service '%s' uninstalled successfully", serviceName)
 	return nil
 }
 

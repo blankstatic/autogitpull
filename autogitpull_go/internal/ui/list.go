@@ -2,6 +2,8 @@ package ui
 
 import (
 	"fmt"
+	"log/slog"
+	"net/url"
 	"os"
 	"sort"
 	"strings"
@@ -9,6 +11,7 @@ import (
 	"time"
 
 	"github.com/blankstatic/autogitpull/autogitpull_go/internal/config"
+	"github.com/blankstatic/autogitpull/autogitpull_go/internal/db"
 	"github.com/blankstatic/autogitpull/autogitpull_go/pkg/git"
 	"github.com/blankstatic/autogitpull/autogitpull_go/pkg/notifications"
 	"github.com/charmbracelet/bubbles/table"
@@ -492,15 +495,41 @@ func handleUnregisterRepo(path string) error {
 func handlePullRepo(repo *config.RepoInfo, modelRef *model) error {
 	var handleError error
 	var pullResult string
+	var updateStore *db.Store
+	var updateID int64
 
 	modelRef.sendStatusUpdate(repo.Path, "Checking branch...")
 
+	updatesDBPath, err := config.GetUpdatesDBPath()
+	if err != nil {
+		slog.Error("failed to get updates database path", slog.String("repo", repo.Name), slog.String("err", err.Error()))
+	} else {
+		updateStore, err = db.Open(updatesDBPath)
+		if err != nil {
+			slog.Error("failed to open updates database", slog.String("repo", repo.Name), slog.String("err", err.Error()))
+		} else {
+			defer updateStore.Close()
+			updateID, err = updateStore.BeginUpdate(repo.Path, repo.Name)
+			if err != nil {
+				slog.Error("failed to record update start", slog.String("repo", repo.Name), slog.String("err", err.Error()))
+			}
+		}
+	}
+
 	defer func() {
+		if updateStore != nil && updateID > 0 {
+			if err := updateStore.FinishUpdate(updateID, pullResult, handleError); err != nil {
+				slog.Error("failed to record update result", slog.String("repo", repo.Name), slog.String("err", err.Error()))
+			}
+		}
+
+		notifyURL := "http://localhost:9009/repo?path=" + url.QueryEscape(repo.Path)
 		if handleError != nil {
-			go notifications.OSNotify(
+			go notifications.OSNotifyURL(
 				config.AppName,
 				fmt.Sprintf("%s pull failed", repo.Name),
 				handleError.Error(),
+				notifyURL,
 			)
 			modelRef.sendStatusUpdate(repo.Path, "Failed")
 
@@ -509,10 +538,11 @@ func handlePullRepo(repo *config.RepoInfo, modelRef *model) error {
 				modelRef.sendStatusUpdate(repo.Path, "Ready")
 			}()
 		} else {
-			go notifications.OSNotify(
+			go notifications.OSNotifyURL(
 				config.AppName,
 				fmt.Sprintf("%s pull", repo.Name),
 				pullResult,
+				notifyURL,
 			)
 			modelRef.sendStatusUpdate(repo.Path, "Success")
 			go updateRepoLastSync(repo.Path)
