@@ -59,3 +59,30 @@ func TestStoreRecordsError(t *testing.T) {
 		t.Fatalf("unexpected update: %+v", updates[0])
 	}
 }
+
+func TestStoreRecordsSkippedDirtyRepo(t *testing.T) {
+	store, err := Open(filepath.Join(t.TempDir(), "updates.sqlite"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+
+	id, err := store.BeginUpdate("/repo/path", "repo")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.FinishUpdate(id, "", errors.New("repository has uncommitted changes")); err != nil {
+		t.Fatal(err)
+	}
+
+	updates, err := store.RepoUpdates("/repo/path", 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(updates) != 1 {
+		t.Fatalf("expected 1 update, got %d", len(updates))
+	}
+	if updates[0].Status != "skipped" || updates[0].Error != "repository has uncommitted changes" || updates[0].Changed {
+		t.Fatalf("unexpected update: %+v", updates[0])
+	}
+}

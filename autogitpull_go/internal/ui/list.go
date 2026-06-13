@@ -531,7 +531,11 @@ func handlePullRepo(repo *config.RepoInfo, modelRef *model) error {
 				handleError.Error(),
 				notifyURL,
 			)
-			modelRef.sendStatusUpdate(repo.Path, "Failed")
+			if db.IsSkippedPullError(handleError.Error()) {
+				modelRef.sendStatusUpdate(repo.Path, "Skipped")
+			} else {
+				modelRef.sendStatusUpdate(repo.Path, "Failed")
+			}
 
 			go func() {
 				time.Sleep(3 * time.Second)

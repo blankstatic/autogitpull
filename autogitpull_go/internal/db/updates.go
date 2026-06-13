@@ -2,6 +2,7 @@ package db
 
 import (
 	"database/sql"
+	"strings"
 	"time"
 
 	_ "github.com/mattn/go-sqlite3"
@@ -64,6 +65,9 @@ func (s *Store) FinishUpdate(id int64, result string, pullErr error) error {
 	if pullErr != nil {
 		status = "error"
 		errText = pullErr.Error()
+		if IsSkippedPullError(errText) {
+			status = "skipped"
+		}
 	}
 
 	changed := status == "success" && result != "" && !isUpToDate(result)
@@ -76,12 +80,16 @@ func (s *Store) FinishUpdate(id int64, result string, pullErr error) error {
 }
 
 func (s *Store) RecentUpdates(limit int) ([]Update, error) {
+	return s.RecentUpdatesPage(limit, 0)
+}
+
+func (s *Store) RecentUpdatesPage(limit, offset int) ([]Update, error) {
 	rows, err := s.db.Query(`
 		SELECT id, repo_path, repo_name, status, result, error, changed, started_at, finished_at
 		FROM updates
 		ORDER BY id DESC
-		LIMIT ?
-	`, limit)
+		LIMIT ? OFFSET ?
+	`, limit, offset)
 	if err != nil {
 		return nil, err
 	}
@@ -91,19 +99,35 @@ func (s *Store) RecentUpdates(limit int) ([]Update, error) {
 }
 
 func (s *Store) RepoUpdates(repoPath string, limit int) ([]Update, error) {
+	return s.RepoUpdatesPage(repoPath, limit, 0)
+}
+
+func (s *Store) RepoUpdatesPage(repoPath string, limit, offset int) ([]Update, error) {
 	rows, err := s.db.Query(`
 		SELECT id, repo_path, repo_name, status, result, error, changed, started_at, finished_at
 		FROM updates
 		WHERE repo_path = ?
 		ORDER BY id DESC
-		LIMIT ?
-	`, repoPath, limit)
+		LIMIT ? OFFSET ?
+	`, repoPath, limit, offset)
 	if err != nil {
 		return nil, err
 	}
 	defer rows.Close()
 
 	return scanUpdates(rows)
+}
+
+func (s *Store) CountUpdates() (int, error) {
+	var count int
+	err := s.db.QueryRow(`SELECT COUNT(*) FROM updates`).Scan(&count)
+	return count, err
+}
+
+func (s *Store) CountRepoUpdates(repoPath string) (int, error) {
+	var count int
+	err := s.db.QueryRow(`SELECT COUNT(*) FROM updates WHERE repo_path = ?`, repoPath).Scan(&count)
+	return count, err
 }
 
 func (s *Store) migrate() error {
@@ -143,4 +167,9 @@ func scanUpdates(rows *sql.Rows) ([]Update, error) {
 
 func isUpToDate(result string) bool {
 	return result == "Already up to date.\n" || result == "Already up-to-date.\n" || result == "Already up to date." || result == "Already up-to-date."
+}
+
+func IsSkippedPullError(errText string) bool {
+	errText = strings.ToLower(strings.TrimSpace(errText))
+	return errText == "repository has changes" || errText == "repository has uncommitted changes"
 }
