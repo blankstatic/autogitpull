@@ -273,7 +273,11 @@ func DaemonCommandHandler(cmd *cobra.Command, args []string) {
 				slog.Info("Successfully pulled", slog.String("repo", repo.Name))
 				if !strings.Contains(result, "up to date") {
 					notifyURL := "http://localhost:9009/repo?path=" + url.QueryEscape(repo.Path)
-					go notifications.OSNotifyURL(config.AppName, fmt.Sprintf("Pulled: %s", repo.Name), result, notifyURL)
+					go func() {
+						if notifyErr := notifications.OSNotifyURL(config.AppName, fmt.Sprintf("Pulled: %s", repo.Name), result, notifyURL); notifyErr != nil {
+							slog.Error("failed to send pull notification", slog.String("repo", repo.Name), slog.String("err", notifyErr.Error()))
+						}
+					}()
 				}
 			}
 		},

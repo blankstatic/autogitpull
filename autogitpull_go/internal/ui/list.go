@@ -486,7 +486,7 @@ func handleUnregisterRepo(path string) error {
 	}
 
 	if !isSilentlyLocal {
-		go notifications.OSNotify(config.AppName, "Unregister", path)
+		notifyAsync("Unregister", path, "")
 	}
 
 	return nil
@@ -525,8 +525,7 @@ func handlePullRepo(repo *config.RepoInfo, modelRef *model) error {
 
 		notifyURL := "http://localhost:9009/repo?path=" + url.QueryEscape(repo.Path)
 		if handleError != nil {
-			go notifications.OSNotifyURL(
-				config.AppName,
+			notifyAsync(
 				fmt.Sprintf("%s pull failed", repo.Name),
 				handleError.Error(),
 				notifyURL,
@@ -542,14 +541,17 @@ func handlePullRepo(repo *config.RepoInfo, modelRef *model) error {
 				modelRef.sendStatusUpdate(repo.Path, "Ready")
 			}()
 		} else {
-			go notifications.OSNotifyURL(
-				config.AppName,
+			notifyAsync(
 				fmt.Sprintf("%s pull", repo.Name),
 				pullResult,
 				notifyURL,
 			)
 			modelRef.sendStatusUpdate(repo.Path, "Success")
-			go updateRepoLastSync(repo.Path)
+			go func() {
+				if err := updateRepoLastSync(repo.Path); err != nil {
+					slog.Error("failed to update repo last sync", slog.String("repo", repo.Name), slog.String("err", err.Error()))
+				}
+			}()
 
 			go func() {
 				time.Sleep(2 * time.Second)
@@ -610,4 +612,12 @@ func updateRepoLastSync(path string) error {
 	}
 	err = storage.UpdateLastSync(path)
 	return err
+}
+
+func notifyAsync(title, body, openURL string) {
+	go func() {
+		if err := notifications.OSNotifyURL(config.AppName, title, body, openURL); err != nil {
+			slog.Error("failed to send notification", slog.String("title", title), slog.String("err", err.Error()))
+		}
+	}()
 }

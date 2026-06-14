@@ -5,6 +5,7 @@ package service
 
 import (
 	"fmt"
+	"html"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -51,6 +52,10 @@ func (dm *darwinManager) getExecutablePath() (string, error) {
 }
 
 func (dm *darwinManager) Install() error {
+	if dm.interval <= 0 {
+		return fmt.Errorf("service interval must be positive")
+	}
+
 	plistPath, err := dm.getPlistPath()
 	if err != nil {
 		return err
@@ -66,7 +71,16 @@ func (dm *darwinManager) Install() error {
 		return fmt.Errorf("failed to create LaunchAgents directory: %w", err)
 	}
 
-	plistContent := fmt.Sprintf(`<?xml version="1.0" encoding="UTF-8"?>
+	plistContent := dm.plistContent(exePath)
+	if err := os.WriteFile(plistPath, []byte(plistContent), 0644); err != nil {
+		return fmt.Errorf("failed to write plist file: %w", err)
+	}
+
+	return nil
+}
+
+func (dm *darwinManager) plistContent(exePath string) string {
+	return fmt.Sprintf(`<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
 <dict>
@@ -97,18 +111,12 @@ func (dm *darwinManager) Install() error {
 </dict>
 </plist>`,
 		serviceName,
-		exePath,
+		html.EscapeString(exePath),
 		serviceName,
 		serviceName,
 		int(dm.interval.Seconds()),
-		filepath.Dir(exePath),
+		html.EscapeString(filepath.Dir(exePath)),
 	)
-
-	if err := os.WriteFile(plistPath, []byte(plistContent), 0644); err != nil {
-		return fmt.Errorf("failed to write plist file: %w", err)
-	}
-
-	return nil
 }
 
 func (dm *darwinManager) Start() error {
