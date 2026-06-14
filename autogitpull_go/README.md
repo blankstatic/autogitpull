@@ -1,13 +1,27 @@
 # autogitpull
 
-`autogitpull` keeps registered Git repositories up to date. It can run on
-demand, show repository status in a terminal UI, or run as a macOS launchd
-service.
+`autogitpull` keeps a list of local Git repositories and safely runs `git pull`
+for them in the background.
 
-## Demo
+It is built for the common "many repos on one machine" workflow: register the
+repositories once, then let the daemon keep default branches up to date while
+you work.
 
-![example](.vhs/demo.gif)
-![example](../.vhs/demo.gif)
+## What It Does
+
+- Registers Git repositories in `~/.autogitpull/config.json`.
+- Detects each repository's remote default branch.
+- Pulls repositories every 30 minutes when the daemon is running.
+- Skips repositories that are not on their default branch.
+- Skips repositories with uncommitted local changes.
+- Records update history in `~/.autogitpull/updates.sqlite`.
+- Shows registered repositories in a terminal UI.
+- Starts a local dashboard at `http://localhost:9009` while the daemon runs.
+- Sends macOS notifications when a pull brings new changes.
+- Can be installed as a macOS `launchd` service.
+
+The safety rule is intentionally simple: `autogitpull` only pulls when the repo
+is on its detected default branch and `git status --porcelain` is clean.
 
 ## Install
 
@@ -20,24 +34,27 @@ bash -c "$(curl -fsSL https://raw.githubusercontent.com/blankstatic/autogitpull/
 The installer downloads the latest `autogitpull-macos-arm64` release to
 `/usr/local/bin/autogitpull`.
 
-For custom macOS notification icons and click-to-open behavior, install
-`terminal-notifier` before running the installer:
+Optional, for richer macOS notifications:
 
 ```sh
 brew install terminal-notifier
 ```
 
-When `terminal-notifier` is present, the installer also builds
-`~/Applications/FeatureHubLauncher.app`. `autogitpull` uses that app for
-notifications and falls back to the built-in notifier when it is missing.
+When `terminal-notifier` is available, the installer also builds
+`~/Applications/FeatureHubLauncher.app` and uses it for clickable
+notifications.
 
 ## Build From Source
-
-From the repository root:
 
 ```sh
 cd autogitpull_go
 go build -o autogitpull .
+```
+
+Run the local binary:
+
+```sh
+./autogitpull --help
 ```
 
 ## Quick Start
@@ -48,19 +65,19 @@ Register the current repository:
 autogitpull register
 ```
 
-Register one or more explicit repositories:
+Register specific repositories:
 
 ```sh
 autogitpull register ~/work/project-a ~/work/project-b
 ```
 
-Discover repositories recursively under a directory:
+Discover and register repositories under a directory:
 
 ```sh
 autogitpull discover ~/work
 ```
 
-Open the terminal status UI:
+Open the terminal UI:
 
 ```sh
 autogitpull status
@@ -72,41 +89,150 @@ Run the daemon in the foreground:
 autogitpull daemon
 ```
 
-## Commands
-
-```sh
-autogitpull [flags]
-autogitpull [command]
-```
-
-Commands:
+Then open:
 
 ```text
-daemon       Run the pull loop in the foreground
-discover     Recursively find Git repositories and add them to the config
-register     Add the current directory or supplied paths to the config
-service      Manage the macOS launchd service
-status       Show registered repositories in the terminal UI
-unregister   Remove the current directory or supplied paths from the config
-version      Print the application version
+http://localhost:9009
+```
+
+## Daily Usage
+
+Use `autogitpull status` to see what is registered:
+
+```sh
+autogitpull status
+```
+
+In the TUI:
+
+```text
+↑/↓  navigate
+p    pull selected repository now
+d    unregister selected repository
+q    quit
+```
+
+Use the daemon when you want automatic updates:
+
+```sh
+autogitpull daemon
+```
+
+The daemon immediately checks all registered repositories, then repeats every
+30 minutes. It logs JSON to stdout when running in the foreground.
+
+## Commands
+
+```text
+autogitpull [command] [flags]
+```
+
+Available commands:
+
+```text
+register [paths...]       Add repositories. With no path, adds the current directory.
+unregister [paths...]     Remove repositories. With no path, removes the current directory.
+discover [paths...]       Recursively find Git repositories and register them.
+status                    Open the terminal UI. This is also the default command.
+daemon                    Run the auto-pull loop and web dashboard in the foreground.
+service <command>         Manage the macOS launchd service.
+version                   Print the version.
 ```
 
 Global flags:
 
 ```text
--s, --silently   suppress desktop notifications for the command
--h, --help       show help
+-s, --silently            Suppress desktop notifications for the command.
+-h, --help                Show help.
 ```
+
+Examples:
+
+```sh
+autogitpull register ~/src/api
+autogitpull discover ~/src
+autogitpull unregister ~/src/old-project
+autogitpull status
+autogitpull version
+```
+
+## macOS Service
+
+Install and start the background service:
+
+```sh
+autogitpull service install
+autogitpull service start
+```
+
+Check service state:
+
+```sh
+autogitpull service status
+```
+
+Stop or remove it:
+
+```sh
+autogitpull service stop
+autogitpull service uninstall
+```
+
+The service runs:
+
+```sh
+autogitpull daemon
+```
+
+It uses launchd label:
+
+```text
+com.blankstatic.autogitpull
+```
+
+Logs:
+
+```sh
+cat /tmp/com.blankstatic.autogitpull.log
+cat /tmp/com.blankstatic.autogitpull.error.log
+```
+
+## Dashboard
+
+When `autogitpull daemon` or the macOS service is running, the dashboard is
+available at:
+
+```text
+http://localhost:9009
+```
+
+The dashboard shows:
+
+- registered repositories;
+- last sync time;
+- update history;
+- skipped pulls;
+- failed pulls;
+- changed update activity for the last year;
+- per-repository details and current local changes.
+
+Notification clicks open the related repository page in this dashboard.
 
 ## Configuration
 
-Configuration is stored at:
+Config file:
 
 ```sh
 ~/.autogitpull/config.json
 ```
 
-Example:
+Update history database:
+
+```sh
+~/.autogitpull/updates.sqlite
+```
+
+Example config:
 
 ```json
 {
@@ -122,90 +248,69 @@ Example:
 }
 ```
 
-`register` only adds repositories where the remote default branch can be
-detected. `discover` skips hidden directories and common heavy folders such as
-`.git`, `node_modules`, `vendor`, `build`, `dist`, `target`, and cache/temp
-directories.
+`register` and `discover` only add repositories where the remote default branch
+can be detected from `origin/HEAD`.
 
-## macOS Service
+`discover` skips hidden and heavy directories such as `.git`, `node_modules`,
+`vendor`, `build`, `dist`, `target`, and cache/temp directories.
 
-Install and start the launchd service:
+## Pull Behavior
 
-```sh
-autogitpull service install
-autogitpull service start
+For every registered repository, `autogitpull` does this:
+
+1. Reads the current branch with `git branch --show-current`.
+2. Compares it with the repository's stored `default_branch`.
+3. Checks local changes with `git status --porcelain`.
+4. Runs `git pull origin` only when the branch matches and the working tree is
+   clean.
+5. Records the result in the update history database.
+
+Common skip cases:
+
+```text
+current branch feature/foo is not default branch main
+repository has uncommitted changes
 ```
 
-Check status or stop it:
-
-```sh
-autogitpull service status
-autogitpull service stop
-```
-
-Uninstall:
-
-```sh
-autogitpull service uninstall
-```
-
-The service runs `autogitpull daemon` every 30 minutes using launchd label
-`com.blankstatic.autogitpull`.
-
-Logs:
-
-```sh
-cat /tmp/com.blankstatic.autogitpull.log
-cat /tmp/com.blankstatic.autogitpull.error.log
-```
+This avoids pulling into feature branches or overwriting active local work.
 
 ## Notifications
 
-On macOS, `autogitpull` first tries to use:
+On macOS, `autogitpull` sends notifications for registration actions and for
+successful pulls that bring changes.
+
+By default it looks for:
 
 ```sh
 ~/Applications/FeatureHubLauncher.app
 ```
 
-Build or rebuild it manually from the repository root:
+Build or rebuild the notification app manually:
 
 ```sh
 brew install terminal-notifier
 tools/featurehub-build.sh --no-notify
 ```
 
-Send a test notification:
-
-```sh
-~/Applications/FeatureHubLauncher.app/Contents/MacOS/terminal-notifier \
-  -message test \
-  -title autogitpull \
-  -subtitle 'New commit' \
-  -open http://localhost
-```
-
 Environment overrides:
 
 ```sh
 AUTOGITPULL_NOTIFIER_APP=/path/to/FeatureHubLauncher.app
-AUTOGITPULL_DASHBOARD_URL=http://localhost
+AUTOGITPULL_DASHBOARD_URL=http://localhost:9009
 ```
 
-The notification app is a customized copy of `terminal-notifier.app` with the
-Feature Hub icon and bundle id `com.blankstatic.featurehub`. This is required
-because `terminal-notifier -sender` uses the sender app as the click action and
-cannot be combined with `-open`.
+Use `--silently` when you do not want desktop notifications for a command:
+
+```sh
+autogitpull register --silently ~/work/project
+```
 
 ## Release Artifacts
 
 GitHub Actions builds the macOS ARM64 binary:
 
 ```text
-autogitpull_go/autogitpull-macos-arm64
-```
-
-The release installer expects the asset name:
-
-```text
 autogitpull-macos-arm64
 ```
+
+The installer expects the release asset to use that exact name.
