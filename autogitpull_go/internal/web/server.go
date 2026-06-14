@@ -445,8 +445,8 @@ var baseCSS = template.CSS(`
 	.panel-title { color: #24292f; }
 	.panel-title:hover { color: #0969da; text-decoration: none; }
 	.panel-body { padding: 16px; }
-	.activity-wrap { overflow-x: auto; padding-bottom: 2px; }
-	.activity-grid { display: grid; grid-auto-flow: column; grid-auto-columns: 12px; grid-template-rows: repeat(7, 12px); gap: 3px; width: max-content; }
+	.activity-wrap { overflow-x: auto; margin: -2px; padding: 2px 2px 4px; }
+	.activity-grid { display: grid; grid-auto-flow: column; grid-auto-columns: 12px; grid-template-rows: repeat(7, 12px); gap: 3px; width: max-content; padding: 2px; }
 	.activity-cell { width: 12px; height: 12px; border-radius: 2px; background: #ebedf0; border: 1px solid rgba(27,31,36,.06); }
 	.activity-cell:hover { outline: 1px solid #57606a; outline-offset: 1px; }
 	.activity-cell[data-level="1"] { background: #9be9a8; }
