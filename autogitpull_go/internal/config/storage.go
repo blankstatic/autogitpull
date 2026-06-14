@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"sync"
 	"time"
 
 	"github.com/blankstatic/autogitpull/autogitpull_go/pkg/git"
@@ -13,6 +14,7 @@ import (
 type StorageManager struct {
 	configPath string
 	config     *Config
+	mu         sync.RWMutex
 }
 
 func NewStorageManager(configPath string) *StorageManager {
@@ -31,15 +33,30 @@ func (sm *StorageManager) Load() error {
 		return err
 	}
 
-	if err := json.Unmarshal(data, &sm.config); err != nil {
+	var cfg Config
+	if err := json.Unmarshal(data, &cfg); err != nil {
 		return err
 	}
+	if cfg.Repositories == nil {
+		cfg.Repositories = []RepoInfo{}
+	}
 
+	sm.mu.Lock()
+	sm.config = &cfg
+	sm.mu.Unlock()
 	return nil
 }
 
 func (sm *StorageManager) Save() error {
-	data, err := json.MarshalIndent(sm.config, "", "  ")
+	sm.mu.RLock()
+	cfg := cloneConfig(sm.config)
+	sm.mu.RUnlock()
+
+	return sm.saveConfig(cfg)
+}
+
+func (sm *StorageManager) saveConfig(cfg *Config) error {
+	data, err := json.MarshalIndent(cfg, "", "  ")
 	if err != nil {
 		return err
 	}
@@ -49,23 +66,45 @@ func (sm *StorageManager) Save() error {
 		return err
 	}
 
-	return os.WriteFile(sm.configPath, data, 0644)
+	tmp, err := os.CreateTemp(dir, filepath.Base(sm.configPath)+".tmp-*")
+	if err != nil {
+		return err
+	}
+	tmpPath := tmp.Name()
+	defer os.Remove(tmpPath)
+
+	if _, err := tmp.Write(data); err != nil {
+		_ = tmp.Close()
+		return err
+	}
+	if err := tmp.Sync(); err != nil {
+		_ = tmp.Close()
+		return err
+	}
+	if err := tmp.Close(); err != nil {
+		return err
+	}
+	if err := os.Chmod(tmpPath, 0644); err != nil {
+		return err
+	}
+	return os.Rename(tmpPath, sm.configPath)
 }
 
 func (sm *StorageManager) createDefaultConfig() error {
-	sm.config = &Config{
+	cfg := &Config{
 		Repositories: []RepoInfo{},
 	}
-	return sm.Save()
+	if err := sm.saveConfig(cfg); err != nil {
+		return err
+	}
+	sm.mu.Lock()
+	sm.config = cfg
+	sm.mu.Unlock()
+	return nil
 }
 
 func (sm *StorageManager) AddRepo(path string) error {
 	name := filepath.Base(path)
-	for _, repo := range sm.config.Repositories {
-		if repo.Path == path {
-			return fmt.Errorf("repo already added: %s", path)
-		}
-	}
 
 	defaultBranch, err := git.GetRemoteDefaultBranch(path)
 	if err != nil || defaultBranch == "" {
@@ -80,53 +119,111 @@ func (sm *StorageManager) AddRepo(path string) error {
 		LastSync:      time.Now(),
 	}
 
-	sm.config.Repositories = append(sm.config.Repositories, newRepo)
-	return sm.Save()
+	sm.mu.Lock()
+	defer sm.mu.Unlock()
+
+	cfg := cloneConfig(sm.config)
+	for _, repo := range cfg.Repositories {
+		if repo.Path == path {
+			return fmt.Errorf("repo already added: %s", path)
+		}
+	}
+	cfg.Repositories = append(cfg.Repositories, newRepo)
+	if err := sm.saveConfig(cfg); err != nil {
+		return err
+	}
+	sm.config = cfg
+	return nil
 }
 
 func (sm *StorageManager) RemoveRepo(path string) error {
-	for i, repo := range sm.config.Repositories {
+	sm.mu.Lock()
+	defer sm.mu.Unlock()
+
+	cfg := cloneConfig(sm.config)
+
+	for i, repo := range cfg.Repositories {
 		if repo.Path == path {
-			sm.config.Repositories = append(sm.config.Repositories[:i],
-				sm.config.Repositories[i+1:]...)
-			return sm.Save()
+			cfg.Repositories = append(cfg.Repositories[:i],
+				cfg.Repositories[i+1:]...)
+			if err := sm.saveConfig(cfg); err != nil {
+				return err
+			}
+			sm.config = cfg
+			return nil
 		}
 	}
 	return fmt.Errorf("repository not found: %s", path)
 }
 
 func (sm *StorageManager) UpdateRepo(path string, updates map[string]interface{}) error {
-	for i, repo := range sm.config.Repositories {
+	sm.mu.Lock()
+	defer sm.mu.Unlock()
+
+	cfg := cloneConfig(sm.config)
+
+	for i, repo := range cfg.Repositories {
 		if repo.Path == path {
 			if name, ok := updates["name"].(string); ok {
-				sm.config.Repositories[i].Name = name
+				cfg.Repositories[i].Name = name
 			}
-			sm.config.Repositories[i].LastSync = time.Now()
-			return sm.Save()
+			cfg.Repositories[i].LastSync = time.Now()
+			if err := sm.saveConfig(cfg); err != nil {
+				return err
+			}
+			sm.config = cfg
+			return nil
 		}
 	}
 	return fmt.Errorf("repository not found: %s", path)
 }
 
 func (sm *StorageManager) UpdateLastSync(path string) error {
-	for i, repo := range sm.config.Repositories {
+	sm.mu.Lock()
+	defer sm.mu.Unlock()
+
+	cfg := cloneConfig(sm.config)
+
+	for i, repo := range cfg.Repositories {
 		if repo.Path == path {
-			sm.config.Repositories[i].LastSync = time.Now()
-			return sm.Save()
+			cfg.Repositories[i].LastSync = time.Now()
+			if err := sm.saveConfig(cfg); err != nil {
+				return err
+			}
+			sm.config = cfg
+			return nil
 		}
 	}
 	return fmt.Errorf("repository not found: %s", path)
 }
 
 func (sm *StorageManager) GetRepo(path string) (*RepoInfo, error) {
+	sm.mu.RLock()
+	defer sm.mu.RUnlock()
+
 	for _, repo := range sm.config.Repositories {
 		if repo.Path == path {
-			return &repo, nil
+			repoCopy := repo
+			return &repoCopy, nil
 		}
 	}
 	return nil, fmt.Errorf("repository not found: %s", path)
 }
 
 func (sm *StorageManager) GetAllRepos() []RepoInfo {
-	return sm.config.Repositories
+	sm.mu.RLock()
+	defer sm.mu.RUnlock()
+
+	repos := make([]RepoInfo, len(sm.config.Repositories))
+	copy(repos, sm.config.Repositories)
+	return repos
+}
+
+func cloneConfig(cfg *Config) *Config {
+	if cfg == nil {
+		return &Config{Repositories: []RepoInfo{}}
+	}
+	repos := make([]RepoInfo, len(cfg.Repositories))
+	copy(repos, cfg.Repositories)
+	return &Config{Repositories: repos}
 }

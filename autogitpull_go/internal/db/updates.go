@@ -98,6 +98,21 @@ func (s *Store) RecentUpdatesPage(limit, offset int) ([]Update, error) {
 	return scanUpdates(rows)
 }
 
+func (s *Store) ChangedUpdateTimesSince(since time.Time) ([]time.Time, error) {
+	rows, err := s.db.Query(`
+		SELECT started_at
+		FROM updates
+		WHERE changed = 1 AND started_at >= ?
+		ORDER BY started_at ASC
+	`, since.UTC())
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	return scanTimes(rows)
+}
+
 func (s *Store) RepoUpdates(repoPath string, limit int) ([]Update, error) {
 	return s.RepoUpdatesPage(repoPath, limit, 0)
 }
@@ -116,6 +131,21 @@ func (s *Store) RepoUpdatesPage(repoPath string, limit, offset int) ([]Update, e
 	defer rows.Close()
 
 	return scanUpdates(rows)
+}
+
+func (s *Store) RepoChangedUpdateTimesSince(repoPath string, since time.Time) ([]time.Time, error) {
+	rows, err := s.db.Query(`
+		SELECT started_at
+		FROM updates
+		WHERE repo_path = ? AND changed = 1 AND started_at >= ?
+		ORDER BY started_at ASC
+	`, repoPath, since.UTC())
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	return scanTimes(rows)
 }
 
 func (s *Store) CountUpdates() (int, error) {
@@ -145,6 +175,8 @@ func (s *Store) migrate() error {
 		);
 		CREATE INDEX IF NOT EXISTS idx_updates_repo_path_id ON updates(repo_path, id DESC);
 		CREATE INDEX IF NOT EXISTS idx_updates_id ON updates(id DESC);
+		CREATE INDEX IF NOT EXISTS idx_updates_changed_started_at ON updates(changed, started_at);
+		CREATE INDEX IF NOT EXISTS idx_updates_repo_changed_started_at ON updates(repo_path, changed, started_at);
 	`)
 	return err
 }
@@ -163,6 +195,18 @@ func scanUpdates(rows *sql.Rows) ([]Update, error) {
 		updates = append(updates, u)
 	}
 	return updates, rows.Err()
+}
+
+func scanTimes(rows *sql.Rows) ([]time.Time, error) {
+	var times []time.Time
+	for rows.Next() {
+		var t time.Time
+		if err := rows.Scan(&t); err != nil {
+			return nil, err
+		}
+		times = append(times, t)
+	}
+	return times, rows.Err()
 }
 
 func isUpToDate(result string) bool {

@@ -63,12 +63,19 @@ const (
 	tableHeaderHeight            = 2
 	minTableHeight               = 4
 	helpViewHeight               = 2
+	defaultTableWidth            = 140
+	loadingBranchText            = "..."
+	checkingStatusText           = "Checking..."
+	readyStatusText              = "Ready"
+	dirtyStatusText              = "Has uncommitted changes"
+	failedStatusText             = "FAIL"
 )
 
 func (m model) Init() tea.Cmd {
 	return tea.Batch(
 		tea.WindowSize(),
 		m.loadBranchesAsync(),
+		m.loadStatusesAsync(),
 	)
 }
 
@@ -99,6 +106,38 @@ func (m model) loadBranchesAsync() tea.Cmd {
 
 		var updates []branchUpdateMsg
 		for update := range branchChan {
+			updates = append(updates, update)
+		}
+
+		return updates
+	}
+}
+
+func (m model) loadStatusesAsync() tea.Cmd {
+	return func() tea.Msg {
+		var wg sync.WaitGroup
+		statusChan := make(chan statusUpdateMsg, len(m.repos))
+
+		for _, repo := range m.repos {
+			wg.Add(1)
+			go func(path string) {
+				defer wg.Done()
+
+				hasChanges, err := git.GitHasUncommitedChanges(path)
+				statusChan <- statusUpdateMsg{
+					path:   path,
+					status: statusTextForChanges(hasChanges, err),
+				}
+			}(repo.Path)
+		}
+
+		go func() {
+			wg.Wait()
+			close(statusChan)
+		}()
+
+		var updates []statusUpdateMsg
+		for update := range statusChan {
 			updates = append(updates, update)
 		}
 
@@ -174,33 +213,8 @@ func (m *model) sendStatusUpdate(path string, status string) {
 }
 
 func (m *model) updateTableRows() {
-	rows := []table.Row{}
-	for i, repo := range m.repos {
-		var currentBranch string
-		var status string
-
-		if i < len(m.branches) && m.branches[i] != "" {
-			currentBranch = m.branches[i]
-		} else {
-			currentBranch = "..."
-		}
-
-		if i < len(m.statuses) && m.statuses[i] != "" {
-			status = m.statuses[i]
-		} else {
-			status = "Ready"
-		}
-
-		rows = append(rows, table.Row{
-			repo.Name,
-			currentBranch,
-			repo.DefaultBranch,
-			repo.Path,
-			status,
-		})
-	}
-
 	currentCursor := m.table.Cursor()
+	rows := m.tableRows()
 
 	m.table.SetRows(rows)
 
@@ -233,6 +247,13 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			if update.index < len(m.branches) {
 				m.branches[update.index] = update.currentBranch
 			}
+		}
+		m.updateTableRows()
+		m.table = updateTableWidth(m.table, m.windowWidth)
+
+	case []statusUpdateMsg:
+		for _, update := range msg {
+			m.setStatusByPath(update.path, update.status)
 		}
 		m.updateTableRows()
 		m.table = updateTableWidth(m.table, m.windowWidth)
@@ -333,50 +354,39 @@ func (m model) View() string {
 }
 
 func (m model) createTable() table.Model {
-	columns := []table.Column{
-		{Title: "NAME"},
-		{Title: "CURRENT"},
-		{Title: "BRANCH"},
-		{Title: "PATH"},
-		{Title: "STATUS"},
-	}
-
-	rows := []table.Row{}
-	for i, repo := range m.repos {
-		var currentBranch string
-		var status string
-
-		if i < len(m.branches) && m.branches[i] != "" {
-			currentBranch = m.branches[i]
-		} else {
-			currentBranch = "..."
-		}
-
-		if i < len(m.statuses) && m.statuses[i] != "" {
-			status = m.statuses[i]
-		} else {
-			status = "Ready"
-		}
-
-		rows = append(rows, table.Row{
-			repo.Name,
-			currentBranch,
-			repo.DefaultBranch,
-			repo.Path,
-			status,
-		})
-	}
-
+	rows := m.tableRows()
 	tableHeight := m.calculateTableHeight(len(rows))
 
 	t := table.New(
-		table.WithColumns(columns),
+		table.WithColumns(tableColumns()),
 		table.WithRows(rows),
 		table.WithFocused(true),
 		table.WithHeight(tableHeight),
 		table.WithWidth(m.windowWidth-4),
 	)
 
+	t.SetStyles(tableStyles())
+
+	if m.windowWidth > 0 {
+		t = updateTableWidth(t, m.windowWidth)
+	} else {
+		t = updateTableWidth(t, defaultTableWidth)
+	}
+
+	return t
+}
+
+func tableColumns() []table.Column {
+	return []table.Column{
+		{Title: "NAME"},
+		{Title: "CURRENT"},
+		{Title: "BRANCH"},
+		{Title: "PATH"},
+		{Title: "STATUS"},
+	}
+}
+
+func tableStyles() table.Styles {
 	s := table.DefaultStyles()
 	s.Header = s.Header.
 		BorderStyle(lipgloss.NormalBorder()).
@@ -384,15 +394,45 @@ func (m model) createTable() table.Model {
 		BorderBottom(true).
 		Bold(false)
 	s.Selected = selectedRepoStyle
-	t.SetStyles(s)
+	return s
+}
 
-	if m.windowWidth > 0 {
-		t = updateTableWidth(t, m.windowWidth)
-	} else {
-		t = updateTableWidth(t, 140)
+func (m model) tableRows() []table.Row {
+	rows := []table.Row{}
+	for i, repo := range m.repos {
+		rows = append(rows, table.Row{
+			repo.Name,
+			m.branchText(i),
+			repo.DefaultBranch,
+			repo.Path,
+			m.statusText(i),
+		})
 	}
+	return rows
+}
 
-	return t
+func (m model) branchText(index int) string {
+	if index < len(m.branches) && m.branches[index] != "" {
+		return m.branches[index]
+	}
+	return loadingBranchText
+}
+
+func (m model) statusText(index int) string {
+	if index < len(m.statuses) && m.statuses[index] != "" {
+		return m.statuses[index]
+	}
+	return readyStatusText
+}
+
+func statusTextForChanges(hasChanges bool, err error) string {
+	if err != nil {
+		return failedStatusText
+	}
+	if hasChanges {
+		return dirtyStatusText
+	}
+	return readyStatusText
 }
 
 func DrawListTable(wg *sync.WaitGroup, repos []config.RepoInfo, isSilently bool) {
@@ -402,11 +442,27 @@ func DrawListTable(wg *sync.WaitGroup, repos []config.RepoInfo, isSilently bool)
 		return strings.ToLower(repos[i].Name) < strings.ToLower(repos[j].Name)
 	})
 
+	initialModel := newListModel(wg, repos)
+	initialModel.table = initialModel.createTable()
+	initialModel.helpText = initialModel.createHelpText()
+
+	p := tea.NewProgram(&initialModel, tea.WithAltScreen())
+
+	initialModel.program = p
+
+	if _, err := p.Run(); err != nil {
+		fmt.Println("Error running program:", err)
+		os.Exit(1)
+	}
+	fmt.Println()
+}
+
+func newListModel(wg *sync.WaitGroup, repos []config.RepoInfo) model {
 	branches := make([]string, len(repos))
 	statuses := make([]string, len(repos))
 
 	for i := range statuses {
-		statuses[i] = "Ready"
+		statuses[i] = checkingStatusText
 	}
 
 	initialModel := model{
@@ -420,18 +476,7 @@ func DrawListTable(wg *sync.WaitGroup, repos []config.RepoInfo, isSilently bool)
 	}
 
 	copy(initialModel.initialRepos, repos)
-
-	initialModel.table = initialModel.createTable()
-	initialModel.helpText = initialModel.createHelpText()
-
-	p := tea.NewProgram(&initialModel, tea.WithAltScreen())
-
-	initialModel.program = p
-
-	if _, err := p.Run(); err != nil {
-		fmt.Println("Error running program:", err)
-		os.Exit(1)
-	}
+	return initialModel
 }
 
 func (m model) createHelpText() string {
@@ -486,7 +531,7 @@ func handleUnregisterRepo(path string) error {
 	}
 
 	if !isSilentlyLocal {
-		go notifications.OSNotify(config.AppName, "Unregister", path)
+		notifyAsync("Unregister", path, "")
 	}
 
 	return nil
@@ -525,8 +570,7 @@ func handlePullRepo(repo *config.RepoInfo, modelRef *model) error {
 
 		notifyURL := "http://localhost:9009/repo?path=" + url.QueryEscape(repo.Path)
 		if handleError != nil {
-			go notifications.OSNotifyURL(
-				config.AppName,
+			notifyAsync(
 				fmt.Sprintf("%s pull failed", repo.Name),
 				handleError.Error(),
 				notifyURL,
@@ -539,17 +583,24 @@ func handlePullRepo(repo *config.RepoInfo, modelRef *model) error {
 
 			go func() {
 				time.Sleep(3 * time.Second)
-				modelRef.sendStatusUpdate(repo.Path, "Ready")
+				if db.IsSkippedPullError(handleError.Error()) {
+					modelRef.sendStatusUpdate(repo.Path, dirtyStatusText)
+				} else {
+					modelRef.sendStatusUpdate(repo.Path, readyStatusText)
+				}
 			}()
 		} else {
-			go notifications.OSNotifyURL(
-				config.AppName,
+			notifyAsync(
 				fmt.Sprintf("%s pull", repo.Name),
 				pullResult,
 				notifyURL,
 			)
 			modelRef.sendStatusUpdate(repo.Path, "Success")
-			go updateRepoLastSync(repo.Path)
+			go func() {
+				if err := updateRepoLastSync(repo.Path); err != nil {
+					slog.Error("failed to update repo last sync", slog.String("repo", repo.Name), slog.String("err", err.Error()))
+				}
+			}()
 
 			go func() {
 				time.Sleep(2 * time.Second)
@@ -582,7 +633,7 @@ func handlePullRepo(repo *config.RepoInfo, modelRef *model) error {
 	}
 	if hasChanges {
 		handleError = fmt.Errorf("repository has changes")
-		modelRef.sendStatusUpdate(repo.Path, "Has uncommitted changes")
+		modelRef.sendStatusUpdate(repo.Path, dirtyStatusText)
 		return handleError
 	}
 
@@ -610,4 +661,12 @@ func updateRepoLastSync(path string) error {
 	}
 	err = storage.UpdateLastSync(path)
 	return err
+}
+
+func notifyAsync(title, body, openURL string) {
+	go func() {
+		if err := notifications.OSNotifyURL(config.AppName, title, body, openURL); err != nil {
+			slog.Error("failed to send notification", slog.String("title", title), slog.String("err", err.Error()))
+		}
+	}()
 }

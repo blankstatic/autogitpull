@@ -42,6 +42,10 @@ type Config struct {
 }
 
 func NewDaemon(cfg Config) (*Daemon, error) {
+	if cfg.Interval <= 0 {
+		return nil, fmt.Errorf("interval must be positive")
+	}
+
 	storage := cfg.Storage
 	if storage == nil {
 		storage = config.NewStorageManager(cfg.ConfigPath)
@@ -76,17 +80,23 @@ func (d *Daemon) Start() {
 
 func (d *Daemon) Stop() {
 	d.mu.Lock()
-	defer d.mu.Unlock()
-
 	if !d.isRunning {
+		d.mu.Unlock()
 		return
 	}
 
 	d.isRunning = false
-	close(d.stopChan)
+	stopChan := d.stopChan
+	close(stopChan)
+	d.mu.Unlock()
+
 	d.wg.Wait()
 
-	d.stopChan = make(chan struct{})
+	d.mu.Lock()
+	if d.stopChan == stopChan {
+		d.stopChan = make(chan struct{})
+	}
+	d.mu.Unlock()
 }
 
 func (d *Daemon) IsRunning() bool {
@@ -154,7 +164,9 @@ func (d *Daemon) pullRepo(repo *config.RepoInfo) {
 	}
 
 	if err == nil {
-		d.storage.UpdateLastSync(repo.Path)
+		if syncErr := d.storage.UpdateLastSync(repo.Path); syncErr != nil {
+			slog.Error("failed to update last sync", slog.String("repo", repo.Name), slog.String("err", syncErr.Error()))
+		}
 	}
 }
 
@@ -185,15 +197,24 @@ func (d *Daemon) performPull(repo *config.RepoInfo) (string, error) {
 }
 
 func (d *Daemon) UpdateInterval(newInterval time.Duration) {
-	d.mu.Lock()
-	defer d.mu.Unlock()
+	if newInterval <= 0 {
+		return
+	}
 
-	if d.isRunning {
+	d.mu.Lock()
+	wasRunning := d.isRunning
+	d.mu.Unlock()
+
+	if wasRunning {
 		d.Stop()
-		d.interval = newInterval
+	}
+
+	d.mu.Lock()
+	d.interval = newInterval
+	d.mu.Unlock()
+
+	if wasRunning {
 		d.Start()
-	} else {
-		d.interval = newInterval
 	}
 }
 
@@ -252,7 +273,11 @@ func DaemonCommandHandler(cmd *cobra.Command, args []string) {
 				slog.Info("Successfully pulled", slog.String("repo", repo.Name))
 				if !strings.Contains(result, "up to date") {
 					notifyURL := "http://localhost:9009/repo?path=" + url.QueryEscape(repo.Path)
-					go notifications.OSNotifyURL(config.AppName, fmt.Sprintf("Pulled: %s", repo.Name), result, notifyURL)
+					go func() {
+						if notifyErr := notifications.OSNotifyURL(config.AppName, fmt.Sprintf("Pulled: %s", repo.Name), result, notifyURL); notifyErr != nil {
+							slog.Error("failed to send pull notification", slog.String("repo", repo.Name), slog.String("err", notifyErr.Error()))
+						}
+					}()
 				}
 			}
 		},
