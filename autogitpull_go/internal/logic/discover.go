@@ -26,13 +26,22 @@ func DiscoverCommandHandler(cmd *cobra.Command, args []string) {
 
 	var countRepos uint
 
-	updateChan := make(chan string)
+	var updateChan chan string
+	var spinnerDone chan struct{}
 
-	go func() {
-		spinner.RunWithUpdates(updateChan)
-	}()
+	if !isSilently {
+		updateChan = make(chan string)
+		spinnerDone = make(chan struct{})
+		go func() {
+			defer close(spinnerDone)
+			spinner.RunWithUpdates(updateChan)
+		}()
+	}
 
 	updateText := func(text string) {
+		if updateChan == nil {
+			return
+		}
 		select {
 		case updateChan <- text:
 		case <-time.After(100 * time.Millisecond):
@@ -40,7 +49,12 @@ func DiscoverCommandHandler(cmd *cobra.Command, args []string) {
 		}
 	}
 
-	defer close(updateChan)
+	defer func() {
+		if updateChan != nil {
+			close(updateChan)
+			<-spinnerDone
+		}
+	}()
 
 	innerFunc := func(path string) error {
 		updateText(fmt.Sprintf("Scanning: %s", path))

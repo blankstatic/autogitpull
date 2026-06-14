@@ -454,6 +454,7 @@ func DrawListTable(wg *sync.WaitGroup, repos []config.RepoInfo, isSilently bool)
 		fmt.Println("Error running program:", err)
 		os.Exit(1)
 	}
+	fmt.Println()
 }
 
 func newListModel(wg *sync.WaitGroup, repos []config.RepoInfo) model {

@@ -5,7 +5,6 @@ import (
 
 	"github.com/blankstatic/autogitpull/autogitpull_go/internal/config"
 	"github.com/blankstatic/autogitpull/autogitpull_go/internal/ui"
-	"github.com/blankstatic/autogitpull/autogitpull_go/pkg/tui/spinner"
 	"github.com/spf13/cobra"
 )
 
@@ -27,8 +26,6 @@ func StatusCommandHandler(cmd *cobra.Command, args []string) {
 	repos := storage.GetAllRepos()
 
 	ui.DrawListTable(wg, repos, isSilently)
-
-	go spinner.Run()
 
 	wg.Wait()
 }

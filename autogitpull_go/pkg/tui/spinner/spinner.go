@@ -2,7 +2,6 @@ package spinner
 
 import (
 	"fmt"
-	"os"
 
 	"github.com/charmbracelet/bubbles/spinner"
 	tea "github.com/charmbracelet/bubbletea"
@@ -73,6 +72,7 @@ func (m model) View() string {
 
 type Controller struct {
 	program *tea.Program
+	done    chan error
 }
 
 func NewController() *Controller {
@@ -81,16 +81,22 @@ func NewController() *Controller {
 
 	return &Controller{
 		program: program,
+		done:    make(chan error, 1),
 	}
 }
 
-func (sc *Controller) Run() {
+func (sc *Controller) Start() {
 	go func() {
-		if _, err := sc.program.Run(); err != nil {
-			fmt.Println(err)
-			os.Exit(1)
-		}
+		_, err := sc.program.Run()
+		sc.done <- err
 	}()
+}
+
+func (sc *Controller) Wait() error {
+	if sc.done == nil {
+		return nil
+	}
+	return <-sc.done
 }
 
 func (sc *Controller) UpdateText(text string) {
@@ -108,17 +114,24 @@ func (sc *Controller) Quit() {
 func Run() {
 	controller := NewController()
 	defer controller.Quit()
-	controller.Run()
+	controller.Start()
+	if err := controller.Wait(); err != nil {
+		fmt.Println(err)
+	}
+	fmt.Println()
 }
 
 func RunWithUpdates(updateChan <-chan string) {
 	controller := NewController()
-	defer controller.Quit()
-	controller.Run()
+	controller.Start()
 
-	go func() {
-		for text := range updateChan {
-			controller.UpdateText(text)
-		}
-	}()
+	for text := range updateChan {
+		controller.UpdateText(text)
+	}
+
+	controller.Quit()
+	if err := controller.Wait(); err != nil {
+		fmt.Println(err)
+	}
+	fmt.Println()
 }
