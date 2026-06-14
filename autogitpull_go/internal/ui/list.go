@@ -63,6 +63,9 @@ const (
 	tableHeaderHeight            = 2
 	minTableHeight               = 4
 	helpViewHeight               = 2
+	defaultTableWidth            = 140
+	loadingBranchText            = "..."
+	readyStatusText              = "Ready"
 )
 
 func (m model) Init() tea.Cmd {
@@ -174,33 +177,8 @@ func (m *model) sendStatusUpdate(path string, status string) {
 }
 
 func (m *model) updateTableRows() {
-	rows := []table.Row{}
-	for i, repo := range m.repos {
-		var currentBranch string
-		var status string
-
-		if i < len(m.branches) && m.branches[i] != "" {
-			currentBranch = m.branches[i]
-		} else {
-			currentBranch = "..."
-		}
-
-		if i < len(m.statuses) && m.statuses[i] != "" {
-			status = m.statuses[i]
-		} else {
-			status = "Ready"
-		}
-
-		rows = append(rows, table.Row{
-			repo.Name,
-			currentBranch,
-			repo.DefaultBranch,
-			repo.Path,
-			status,
-		})
-	}
-
 	currentCursor := m.table.Cursor()
+	rows := m.tableRows()
 
 	m.table.SetRows(rows)
 
@@ -333,50 +311,39 @@ func (m model) View() string {
 }
 
 func (m model) createTable() table.Model {
-	columns := []table.Column{
-		{Title: "NAME"},
-		{Title: "CURRENT"},
-		{Title: "BRANCH"},
-		{Title: "PATH"},
-		{Title: "STATUS"},
-	}
-
-	rows := []table.Row{}
-	for i, repo := range m.repos {
-		var currentBranch string
-		var status string
-
-		if i < len(m.branches) && m.branches[i] != "" {
-			currentBranch = m.branches[i]
-		} else {
-			currentBranch = "..."
-		}
-
-		if i < len(m.statuses) && m.statuses[i] != "" {
-			status = m.statuses[i]
-		} else {
-			status = "Ready"
-		}
-
-		rows = append(rows, table.Row{
-			repo.Name,
-			currentBranch,
-			repo.DefaultBranch,
-			repo.Path,
-			status,
-		})
-	}
-
+	rows := m.tableRows()
 	tableHeight := m.calculateTableHeight(len(rows))
 
 	t := table.New(
-		table.WithColumns(columns),
+		table.WithColumns(tableColumns()),
 		table.WithRows(rows),
 		table.WithFocused(true),
 		table.WithHeight(tableHeight),
 		table.WithWidth(m.windowWidth-4),
 	)
 
+	t.SetStyles(tableStyles())
+
+	if m.windowWidth > 0 {
+		t = updateTableWidth(t, m.windowWidth)
+	} else {
+		t = updateTableWidth(t, defaultTableWidth)
+	}
+
+	return t
+}
+
+func tableColumns() []table.Column {
+	return []table.Column{
+		{Title: "NAME"},
+		{Title: "CURRENT"},
+		{Title: "BRANCH"},
+		{Title: "PATH"},
+		{Title: "STATUS"},
+	}
+}
+
+func tableStyles() table.Styles {
 	s := table.DefaultStyles()
 	s.Header = s.Header.
 		BorderStyle(lipgloss.NormalBorder()).
@@ -384,15 +351,35 @@ func (m model) createTable() table.Model {
 		BorderBottom(true).
 		Bold(false)
 	s.Selected = selectedRepoStyle
-	t.SetStyles(s)
+	return s
+}
 
-	if m.windowWidth > 0 {
-		t = updateTableWidth(t, m.windowWidth)
-	} else {
-		t = updateTableWidth(t, 140)
+func (m model) tableRows() []table.Row {
+	rows := []table.Row{}
+	for i, repo := range m.repos {
+		rows = append(rows, table.Row{
+			repo.Name,
+			m.branchText(i),
+			repo.DefaultBranch,
+			repo.Path,
+			m.statusText(i),
+		})
 	}
+	return rows
+}
 
-	return t
+func (m model) branchText(index int) string {
+	if index < len(m.branches) && m.branches[index] != "" {
+		return m.branches[index]
+	}
+	return loadingBranchText
+}
+
+func (m model) statusText(index int) string {
+	if index < len(m.statuses) && m.statuses[index] != "" {
+		return m.statuses[index]
+	}
+	return readyStatusText
 }
 
 func DrawListTable(wg *sync.WaitGroup, repos []config.RepoInfo, isSilently bool) {
@@ -402,11 +389,26 @@ func DrawListTable(wg *sync.WaitGroup, repos []config.RepoInfo, isSilently bool)
 		return strings.ToLower(repos[i].Name) < strings.ToLower(repos[j].Name)
 	})
 
+	initialModel := newListModel(wg, repos)
+	initialModel.table = initialModel.createTable()
+	initialModel.helpText = initialModel.createHelpText()
+
+	p := tea.NewProgram(&initialModel, tea.WithAltScreen())
+
+	initialModel.program = p
+
+	if _, err := p.Run(); err != nil {
+		fmt.Println("Error running program:", err)
+		os.Exit(1)
+	}
+}
+
+func newListModel(wg *sync.WaitGroup, repos []config.RepoInfo) model {
 	branches := make([]string, len(repos))
 	statuses := make([]string, len(repos))
 
 	for i := range statuses {
-		statuses[i] = "Ready"
+		statuses[i] = readyStatusText
 	}
 
 	initialModel := model{
@@ -420,18 +422,7 @@ func DrawListTable(wg *sync.WaitGroup, repos []config.RepoInfo, isSilently bool)
 	}
 
 	copy(initialModel.initialRepos, repos)
-
-	initialModel.table = initialModel.createTable()
-	initialModel.helpText = initialModel.createHelpText()
-
-	p := tea.NewProgram(&initialModel, tea.WithAltScreen())
-
-	initialModel.program = p
-
-	if _, err := p.Run(); err != nil {
-		fmt.Println("Error running program:", err)
-		os.Exit(1)
-	}
+	return initialModel
 }
 
 func (m model) createHelpText() string {
