@@ -1,6 +1,7 @@
 package ui
 
 import (
+	"errors"
 	"testing"
 
 	"github.com/blankstatic/autogitpull/autogitpull_go/internal/config"
@@ -42,12 +43,34 @@ func TestNewListModelInitializesParallelSlices(t *testing.T) {
 		t.Fatalf("expected %d statuses, got %d", len(repos), len(m.statuses))
 	}
 	for i, status := range m.statuses {
-		if status != "Ready" {
-			t.Fatalf("expected status %d to be Ready, got %q", i, status)
+		if status != "Checking..." {
+			t.Fatalf("expected status %d to be Checking..., got %q", i, status)
 		}
 	}
 	if len(m.initialRepos) != len(repos) {
 		t.Fatalf("expected %d initial repos, got %d", len(repos), len(m.initialRepos))
+	}
+}
+
+func TestStatusTextForChanges(t *testing.T) {
+	tests := []struct {
+		name       string
+		hasChanges bool
+		err        error
+		want       string
+	}{
+		{name: "clean", want: "Ready"},
+		{name: "dirty", hasChanges: true, want: "Has uncommitted changes"},
+		{name: "error", err: errors.New("git failed"), want: "FAIL"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := statusTextForChanges(tt.hasChanges, tt.err)
+			if got != tt.want {
+				t.Fatalf("expected %q, got %q", tt.want, got)
+			}
+		})
 	}
 }
 

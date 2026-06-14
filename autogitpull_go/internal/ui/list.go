@@ -65,13 +65,17 @@ const (
 	helpViewHeight               = 2
 	defaultTableWidth            = 140
 	loadingBranchText            = "..."
+	checkingStatusText           = "Checking..."
 	readyStatusText              = "Ready"
+	dirtyStatusText              = "Has uncommitted changes"
+	failedStatusText             = "FAIL"
 )
 
 func (m model) Init() tea.Cmd {
 	return tea.Batch(
 		tea.WindowSize(),
 		m.loadBranchesAsync(),
+		m.loadStatusesAsync(),
 	)
 }
 
@@ -102,6 +106,38 @@ func (m model) loadBranchesAsync() tea.Cmd {
 
 		var updates []branchUpdateMsg
 		for update := range branchChan {
+			updates = append(updates, update)
+		}
+
+		return updates
+	}
+}
+
+func (m model) loadStatusesAsync() tea.Cmd {
+	return func() tea.Msg {
+		var wg sync.WaitGroup
+		statusChan := make(chan statusUpdateMsg, len(m.repos))
+
+		for _, repo := range m.repos {
+			wg.Add(1)
+			go func(path string) {
+				defer wg.Done()
+
+				hasChanges, err := git.GitHasUncommitedChanges(path)
+				statusChan <- statusUpdateMsg{
+					path:   path,
+					status: statusTextForChanges(hasChanges, err),
+				}
+			}(repo.Path)
+		}
+
+		go func() {
+			wg.Wait()
+			close(statusChan)
+		}()
+
+		var updates []statusUpdateMsg
+		for update := range statusChan {
 			updates = append(updates, update)
 		}
 
@@ -211,6 +247,13 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			if update.index < len(m.branches) {
 				m.branches[update.index] = update.currentBranch
 			}
+		}
+		m.updateTableRows()
+		m.table = updateTableWidth(m.table, m.windowWidth)
+
+	case []statusUpdateMsg:
+		for _, update := range msg {
+			m.setStatusByPath(update.path, update.status)
 		}
 		m.updateTableRows()
 		m.table = updateTableWidth(m.table, m.windowWidth)
@@ -382,6 +425,16 @@ func (m model) statusText(index int) string {
 	return readyStatusText
 }
 
+func statusTextForChanges(hasChanges bool, err error) string {
+	if err != nil {
+		return failedStatusText
+	}
+	if hasChanges {
+		return dirtyStatusText
+	}
+	return readyStatusText
+}
+
 func DrawListTable(wg *sync.WaitGroup, repos []config.RepoInfo, isSilently bool) {
 	isSilentlyLocal = isSilently
 
@@ -408,7 +461,7 @@ func newListModel(wg *sync.WaitGroup, repos []config.RepoInfo) model {
 	statuses := make([]string, len(repos))
 
 	for i := range statuses {
-		statuses[i] = readyStatusText
+		statuses[i] = checkingStatusText
 	}
 
 	initialModel := model{
@@ -529,7 +582,11 @@ func handlePullRepo(repo *config.RepoInfo, modelRef *model) error {
 
 			go func() {
 				time.Sleep(3 * time.Second)
-				modelRef.sendStatusUpdate(repo.Path, "Ready")
+				if db.IsSkippedPullError(handleError.Error()) {
+					modelRef.sendStatusUpdate(repo.Path, dirtyStatusText)
+				} else {
+					modelRef.sendStatusUpdate(repo.Path, readyStatusText)
+				}
 			}()
 		} else {
 			notifyAsync(
@@ -575,7 +632,7 @@ func handlePullRepo(repo *config.RepoInfo, modelRef *model) error {
 	}
 	if hasChanges {
 		handleError = fmt.Errorf("repository has changes")
-		modelRef.sendStatusUpdate(repo.Path, "Has uncommitted changes")
+		modelRef.sendStatusUpdate(repo.Path, dirtyStatusText)
 		return handleError
 	}
 
