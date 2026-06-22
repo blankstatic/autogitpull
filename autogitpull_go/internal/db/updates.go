@@ -24,6 +24,11 @@ type Update struct {
 	FinishedAt time.Time
 }
 
+type UpdateFilter struct {
+	ChangedOnly bool
+	Status      string
+}
+
 func Open(path string) (*Store, error) {
 	db, err := sql.Open("sqlite3", path)
 	if err != nil {
@@ -84,12 +89,19 @@ func (s *Store) RecentUpdates(limit int) ([]Update, error) {
 }
 
 func (s *Store) RecentUpdatesPage(limit, offset int) ([]Update, error) {
+	return s.RecentUpdatesPageFiltered(limit, offset, UpdateFilter{})
+}
+
+func (s *Store) RecentUpdatesPageFiltered(limit, offset int, filter UpdateFilter) ([]Update, error) {
+	where, args := updateFilterWhere(filter)
+	args = append(args, limit, offset)
 	rows, err := s.db.Query(`
 		SELECT id, repo_path, repo_name, status, result, error, changed, started_at, finished_at
 		FROM updates
+		`+where+`
 		ORDER BY id DESC
 		LIMIT ? OFFSET ?
-	`, limit, offset)
+	`, args...)
 	if err != nil {
 		return nil, err
 	}
@@ -118,13 +130,24 @@ func (s *Store) RepoUpdates(repoPath string, limit int) ([]Update, error) {
 }
 
 func (s *Store) RepoUpdatesPage(repoPath string, limit, offset int) ([]Update, error) {
+	return s.RepoUpdatesPageFiltered(repoPath, limit, offset, UpdateFilter{})
+}
+
+func (s *Store) RepoUpdatesPageFiltered(repoPath string, limit, offset int, filter UpdateFilter) ([]Update, error) {
+	where, args := updateFilterWhere(filter)
+	if where == "" {
+		where = "WHERE repo_path = ?"
+	} else {
+		where += " AND repo_path = ?"
+	}
+	args = append(args, repoPath, limit, offset)
 	rows, err := s.db.Query(`
 		SELECT id, repo_path, repo_name, status, result, error, changed, started_at, finished_at
 		FROM updates
-		WHERE repo_path = ?
+		`+where+`
 		ORDER BY id DESC
 		LIMIT ? OFFSET ?
-	`, repoPath, limit, offset)
+	`, args...)
 	if err != nil {
 		return nil, err
 	}
@@ -149,15 +172,51 @@ func (s *Store) RepoChangedUpdateTimesSince(repoPath string, since time.Time) ([
 }
 
 func (s *Store) CountUpdates() (int, error) {
+	return s.CountUpdatesFiltered(UpdateFilter{})
+}
+
+func (s *Store) CountUpdatesFiltered(filter UpdateFilter) (int, error) {
 	var count int
-	err := s.db.QueryRow(`SELECT COUNT(*) FROM updates`).Scan(&count)
+	query := `SELECT COUNT(*) FROM updates`
+	where, args := updateFilterWhere(filter)
+	query += " " + where
+	err := s.db.QueryRow(query, args...).Scan(&count)
 	return count, err
 }
 
 func (s *Store) CountRepoUpdates(repoPath string) (int, error) {
+	return s.CountRepoUpdatesFiltered(repoPath, UpdateFilter{})
+}
+
+func (s *Store) CountRepoUpdatesFiltered(repoPath string, filter UpdateFilter) (int, error) {
 	var count int
-	err := s.db.QueryRow(`SELECT COUNT(*) FROM updates WHERE repo_path = ?`, repoPath).Scan(&count)
+	query := `SELECT COUNT(*) FROM updates WHERE repo_path = ?`
+	args := []any{repoPath}
+	if filter.ChangedOnly {
+		query += ` AND changed = 1`
+	}
+	if filter.Status != "" {
+		query += ` AND status = ?`
+		args = append(args, filter.Status)
+	}
+	err := s.db.QueryRow(query, args...).Scan(&count)
 	return count, err
+}
+
+func updateFilterWhere(filter UpdateFilter) (string, []any) {
+	var conditions []string
+	var args []any
+	if filter.ChangedOnly {
+		conditions = append(conditions, "changed = 1")
+	}
+	if filter.Status != "" {
+		conditions = append(conditions, "status = ?")
+		args = append(args, filter.Status)
+	}
+	if len(conditions) == 0 {
+		return "", nil
+	}
+	return "WHERE " + strings.Join(conditions, " AND "), args
 }
 
 func (s *Store) migrate() error {

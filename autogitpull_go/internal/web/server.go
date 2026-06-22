@@ -23,6 +23,8 @@ const Addr = ":9009"
 const serviceInterval = 30 * time.Minute
 const updatesPerPage = 50
 const activityWeeks = 53
+const eventFilterChanges = "changes"
+const eventFilterAll = "all"
 
 //go:embed assets/featurehub.png
 var appIcon []byte
@@ -61,14 +63,16 @@ func (s *Server) routes() {
 
 func (s *Server) index(w http.ResponseWriter, r *http.Request) {
 	page := pageFromRequest(r)
-	totalUpdates, err := s.store.CountUpdates()
+	filter := eventFilterFromRequest(r)
+	updateFilter := updateFilterFromEventFilter(filter)
+	totalUpdates, err := s.store.CountUpdatesFiltered(updateFilter)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
 	page = clampPage(page, totalUpdates)
 
-	updates, err := s.store.RecentUpdatesPage(updatesPerPage, pageOffset(page))
+	updates, err := s.store.RecentUpdatesPageFiltered(updatesPerPage, pageOffset(page), updateFilter)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
@@ -90,7 +94,8 @@ func (s *Server) index(w http.ResponseWriter, r *http.Request) {
 		"RepoCount":     len(repos),
 		"UpdateCount":   len(updates),
 		"TotalUpdates":  totalUpdates,
-		"Pagination":    newPagination(r.URL.Path, nil, page, totalUpdates),
+		"Pagination":    newPagination(r.URL.Path, filterQueryValues(filter), page, totalUpdates),
+		"EventFilter":   newEventFilter(r.URL.Path, nil, filter),
 		"DBPath":        dbPath,
 		"ServiceStatus": serviceStatus,
 	})
@@ -110,14 +115,16 @@ func (s *Server) repo(w http.ResponseWriter, r *http.Request) {
 	}
 
 	page := pageFromRequest(r)
-	totalUpdates, err := s.store.CountRepoUpdates(repoPath)
+	filter := eventFilterFromRequest(r)
+	updateFilter := updateFilterFromEventFilter(filter)
+	totalUpdates, err := s.store.CountRepoUpdatesFiltered(repoPath, updateFilter)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
 	page = clampPage(page, totalUpdates)
 
-	updates, err := s.store.RepoUpdatesPage(repoPath, updatesPerPage, pageOffset(page))
+	updates, err := s.store.RepoUpdatesPageFiltered(repoPath, updatesPerPage, pageOffset(page), updateFilter)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
@@ -140,7 +147,8 @@ func (s *Server) repo(w http.ResponseWriter, r *http.Request) {
 		"Activity":     activity,
 		"Changes":      changes,
 		"TotalUpdates": totalUpdates,
-		"Pagination":   newPagination(r.URL.Path, url.Values{"path": []string{repoPath}}, page, totalUpdates),
+		"Pagination":   newPagination(r.URL.Path, repoQueryValues(repoPath, filter), page, totalUpdates),
+		"EventFilter":  newEventFilter(r.URL.Path, url.Values{"path": []string{repoPath}}, filter),
 	})
 }
 
@@ -176,7 +184,7 @@ func (s *Server) activity(repoPath string) (activitySummary, error) {
 	loc := moscowLocation()
 	now := time.Now().In(loc)
 	today := time.Date(now.Year(), now.Month(), now.Day(), 0, 0, 0, 0, loc)
-	start := today.AddDate(0, 0, -((activityWeeks-1)*7 + int(today.Weekday())))
+	start := activityStart(today)
 
 	var (
 		times []time.Time
@@ -191,6 +199,11 @@ func (s *Server) activity(repoPath string) (activitySummary, error) {
 		return activitySummary{}, err
 	}
 	return newActivitySummary(times, start, today, loc), nil
+}
+
+func activityStart(today time.Time) time.Time {
+	daysSinceMonday := (int(today.Weekday()) + 6) % 7
+	return today.AddDate(0, 0, -((activityWeeks-1)*7 + daysSinceMonday))
 }
 
 func newActivitySummary(changedTimes []time.Time, start, end time.Time, loc *time.Location) activitySummary {
@@ -260,6 +273,113 @@ type pagination struct {
 	To         int
 }
 
+type eventFilter struct {
+	Current string
+	Options []eventFilterOption
+}
+
+type eventFilterOption struct {
+	Label string
+	URL   string
+	Class string
+}
+
+func eventFilterFromRequest(r *http.Request) string {
+	filter := r.URL.Query().Get("filter")
+	switch filter {
+	case eventFilterAll, "success", "error", "skipped", "running":
+		return filter
+	default:
+		return eventFilterChanges
+	}
+}
+
+func updateFilterFromEventFilter(filter string) db.UpdateFilter {
+	if filter == eventFilterChanges {
+		return db.UpdateFilter{ChangedOnly: true}
+	}
+	if filter != "" && filter != eventFilterAll {
+		return db.UpdateFilter{Status: filter}
+	}
+	return db.UpdateFilter{}
+}
+
+func filterLabel(filter string) string {
+	switch filter {
+	case eventFilterAll:
+		return "All"
+	case "success":
+		return "Success"
+	case "error":
+		return "Error"
+	case "skipped":
+		return "Skipped"
+	case "running":
+		return "Running"
+	default:
+		return "Changes"
+	}
+}
+
+func eventFilterOptions() []string {
+	return []string{eventFilterChanges, "success", "error", "skipped", "running", eventFilterAll}
+}
+
+func filterQueryValue(filter string) string {
+	if filter == eventFilterChanges {
+		return ""
+	}
+	return filter
+}
+
+func newEventFilter(path string, values url.Values, current string) eventFilter {
+	filter := eventFilter{
+		Current: current,
+	}
+	for _, option := range eventFilterOptions() {
+		class := "filter-link"
+		if option == current {
+			class += " active"
+		}
+		filter.Options = append(filter.Options, eventFilterOption{
+			Label: filterLabel(option),
+			URL:   filterURL(path, values, option),
+			Class: class,
+		})
+	}
+	return filter
+}
+
+func filterURL(path string, values url.Values, filter string) string {
+	next := cloneValues(values)
+	queryValue := filterQueryValue(filter)
+	if queryValue == "" {
+		next.Del("filter")
+	} else {
+		next.Set("filter", queryValue)
+	}
+	query := next.Encode()
+	if query == "" {
+		return path
+	}
+	return path + "?" + query
+}
+
+func filterQueryValues(filter string) url.Values {
+	return repoQueryValues("", filter)
+}
+
+func repoQueryValues(repoPath, filter string) url.Values {
+	values := url.Values{}
+	if repoPath != "" {
+		values.Set("path", repoPath)
+	}
+	if queryValue := filterQueryValue(filter); queryValue != "" {
+		values.Set("filter", queryValue)
+	}
+	return values
+}
+
 func pageFromRequest(r *http.Request) int {
 	page, err := strconv.Atoi(r.URL.Query().Get("page"))
 	if err != nil || page < 1 {
@@ -316,12 +436,7 @@ func newPagination(path string, values url.Values, page, total int) pagination {
 }
 
 func pageURL(path string, values url.Values, page int) string {
-	next := url.Values{}
-	for key, vals := range values {
-		for _, val := range vals {
-			next.Add(key, val)
-		}
-	}
+	next := cloneValues(values)
 	if page > 1 {
 		next.Set("page", strconv.Itoa(page))
 	}
@@ -330,6 +445,16 @@ func pageURL(path string, values url.Values, page int) string {
 		return path
 	}
 	return path + "?" + query
+}
+
+func cloneValues(values url.Values) url.Values {
+	next := url.Values{}
+	for key, vals := range values {
+		for _, val := range vals {
+			next.Add(key, val)
+		}
+	}
+	return next
 }
 
 func (s *Server) icon(w http.ResponseWriter, r *http.Request) {
@@ -445,10 +570,15 @@ var baseCSS = template.CSS(`
 	.panel-title { color: #24292f; }
 	.panel-title:hover { color: #0969da; text-decoration: none; }
 	.panel-body { padding: 16px; }
-	.activity-wrap { overflow-x: auto; margin: -2px; padding: 2px 2px 4px; }
+	.filter { display: inline-flex; gap: 4px; padding: 3px; border: 1px solid #d0d7de; border-radius: 8px; background: white; }
+	.filter-link { display: inline-flex; min-height: 26px; align-items: center; padding: 3px 9px; border-radius: 6px; color: #57606a; font-size: 12px; font-weight: 600; }
+	.filter-link:hover { color: #24292f; text-decoration: none; }
+	.filter-link.active { background: #0969da; color: white; }
+	.activity-wrap { overflow-x: auto; margin: -2px; padding: 2px 2px 36px; }
 	.activity-grid { display: grid; grid-auto-flow: column; grid-auto-columns: 12px; grid-template-rows: repeat(7, 12px); gap: 3px; width: max-content; padding: 2px; }
-	.activity-cell { width: 12px; height: 12px; border-radius: 2px; background: #ebedf0; border: 1px solid rgba(27,31,36,.06); }
-	.activity-cell:hover { outline: 1px solid #57606a; outline-offset: 1px; }
+	.activity-cell { position: relative; width: 12px; height: 12px; border-radius: 2px; background: #ebedf0; border: 1px solid rgba(27,31,36,.06); }
+	.activity-cell:hover, .activity-cell:focus-visible { outline: 1px solid #57606a; outline-offset: 1px; }
+	.activity-cell[data-title]:hover::after, .activity-cell[data-title]:focus-visible::after { content: attr(data-title); position: absolute; z-index: 2; top: 18px; left: 50%; transform: translateX(-50%); padding: 5px 7px; border-radius: 6px; background: #24292f; color: white; font-size: 12px; line-height: 1.2; white-space: nowrap; box-shadow: 0 4px 12px rgba(27,31,36,.15); pointer-events: none; }
 	.activity-cell[data-level="1"] { background: #9be9a8; }
 	.activity-cell[data-level="2"] { background: #40c463; }
 	.activity-cell[data-level="3"] { background: #30a14e; }
@@ -536,7 +666,7 @@ var templateFuncs = template.FuncMap{
 	"compactPath": compactPath,
 }
 
-const activityTemplate = `{{define "activity"}}<div class="activity-wrap"><div class="activity-grid" aria-label="Changed update activity from {{.Start}} to {{.End}}">{{range .Cells}}<span class="activity-cell" data-level="{{.Level}}" title="{{.Title}}" aria-label="{{.Title}}"></span>{{end}}</div></div><div class="activity-meta"><div>{{.Total}} changed updates in the last year</div><div class="activity-legend"><span>Less</span><span class="activity-cell" data-level="0"></span><span class="activity-cell" data-level="1"></span><span class="activity-cell" data-level="2"></span><span class="activity-cell" data-level="3"></span><span class="activity-cell" data-level="4"></span><span>More</span></div></div>{{end}}`
+const activityTemplate = `{{define "activity"}}<div class="activity-wrap"><div class="activity-grid" aria-label="Changed update activity from {{.Start}} to {{.End}}">{{range .Cells}}<span class="activity-cell" data-level="{{.Level}}" data-title="{{.Title}}" aria-label="{{.Title}}" tabindex="0"></span>{{end}}</div></div><div class="activity-meta"><div>{{.Total}} changed updates in the last year</div><div class="activity-legend"><span>Less</span><span class="activity-cell" data-level="0"></span><span class="activity-cell" data-level="1"></span><span class="activity-cell" data-level="2"></span><span class="activity-cell" data-level="3"></span><span class="activity-cell" data-level="4"></span><span>More</span></div></div>{{end}}`
 
 var indexTemplate = template.Must(template.New("index").Funcs(templateFuncs).Parse(`
 <!doctype html><html><head><meta charset="utf-8"><title>autogitpull</title><link rel="icon" type="image/png" href="/favicon.ico"><style>` + string(baseCSS) + `</style></head>
@@ -554,10 +684,10 @@ var indexTemplate = template.Must(template.New("index").Funcs(templateFuncs).Par
 <section class="panel" id="repositories"><div class="panel-head"><h2><a class="panel-title" href="#repositories">Repositories</a></h2></div><div class="panel-body">
 {{if .Repos}}<div class="repo-list">{{range .Repos}}<a class="repo" href="/repo?path={{.Path | urlquery}}" title="{{.Path}}"><div class="repo-title"><strong>{{.Name}}</strong><span class="badge">{{.DefaultBranch}}</span></div><div class="path">{{compactPath .Path}}</div><div class="time-detail">Last sync: {{humanTime .LastSync}} · {{formatTime .LastSync}}</div></a>{{end}}</div>{{else}}<div class="empty">No repositories registered.</div>{{end}}
 </div></section>
-<section class="panel" id="updates"><div class="panel-head"><h2><a class="panel-title" href="#updates">Recent updates</a></h2></div>
+<section class="panel" id="updates"><div class="panel-head"><h2><a class="panel-title" href="#updates">Recent updates</a></h2><div class="filter">{{range .EventFilter.Options}}<a class="{{.Class}}" href="{{.URL}}">{{.Label}}</a>{{end}}</div></div>
 {{if .Updates}}<table><tr><th>Time</th><th>Repo</th><th>Status</th><th>Result</th></tr>
 {{range .Updates}}<tr><td><div class="time">{{humanTime .StartedAt}}</div><div class="time-detail">{{formatTime .StartedAt}}</div></td><td><a href="/repo?path={{.RepoPath | urlquery}}">{{.RepoName}}</a><div class="path" title="{{.RepoPath}}">{{compactPath .RepoPath}}</div></td><td><span class="badge {{statusClass .Status}}">{{.Status}}</span></td><td><pre>{{if .Error}}{{.Error}}{{else}}{{.Result | firstLine}}{{end}}</pre></td></tr>{{end}}
-</table>{{template "pagination" .Pagination}}{{else}}<div class="empty">No updates recorded yet.</div>{{end}}</section>
+</table>{{template "pagination" .Pagination}}{{else}}<div class="empty">No updates match this filter.</div>{{end}}</section>
 </div>
 </main></body></html>
 
@@ -575,10 +705,10 @@ var repoTemplate = template.Must(template.New("repo").Funcs(templateFuncs).Parse
 {{template "activity" .Activity}}
 </div></section>
 <section class="panel" id="changes"><div class="panel-head"><h2><a class="panel-title" href="#changes">Current local changes</a></h2></div><div class="panel-body"><pre>{{if .Changes}}{{.Changes}}{{else}}No uncommitted changes{{end}}</pre></div></section>
-<section class="panel" id="updates"><div class="panel-head"><h2><a class="panel-title" href="#updates">Updates</a></h2></div>
+<section class="panel" id="updates"><div class="panel-head"><h2><a class="panel-title" href="#updates">Updates</a></h2><div class="filter">{{range .EventFilter.Options}}<a class="{{.Class}}" href="{{.URL}}">{{.Label}}</a>{{end}}</div></div>
 {{if .Updates}}<table><tr><th>Time</th><th>Status</th><th>Changed</th><th>Result</th></tr>
 {{range .Updates}}<tr><td><div class="time">{{humanTime .StartedAt}}</div><div class="time-detail">{{formatTime .StartedAt}}</div></td><td><span class="badge {{statusClass .Status}}">{{.Status}}</span></td><td>{{changedText .Changed}}</td><td><pre>{{if .Error}}{{.Error}}{{else}}{{.Result}}{{end}}</pre></td></tr>{{end}}
-</table>{{template "pagination" .Pagination}}{{else}}<div class="empty">No updates recorded for this repository.</div>{{end}}</section>
+</table>{{template "pagination" .Pagination}}{{else}}<div class="empty">No updates match this filter.</div>{{end}}</section>
 </main></body></html>
 
 {{define "pagination"}}<div class="pagination"><div class="pagination-info">{{if .Total}}Showing {{.From}}-{{.To}} of {{.Total}} · page {{.Page}} of {{.TotalPages}}{{else}}No records{{end}}</div><div class="pagination-actions">{{if .HasPrev}}<a class="page-link" href="{{.PrevURL}}">Prev</a>{{else}}<span class="page-link disabled">Prev</span>{{end}}{{if .HasNext}}<a class="page-link" href="{{.NextURL}}">Next</a>{{else}}<span class="page-link disabled">Next</span>{{end}}</div></div>{{end}}` + activityTemplate))

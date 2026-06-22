@@ -121,12 +121,70 @@ func TestChangedUpdateTimesSinceFiltersChangedRows(t *testing.T) {
 	}
 }
 
+func TestFilteredUpdatePagesAndCounts(t *testing.T) {
+	store, err := Open(filepath.Join(t.TempDir(), "updates.sqlite"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+
+	now := time.Date(2026, 6, 12, 12, 0, 0, 0, time.UTC)
+	insertUpdate(t, store, "/repo/a", "a", true, now)
+	insertUpdateWithStatus(t, store, "/repo/a", "a", "error", false, now.Add(time.Second))
+	insertUpdate(t, store, "/repo/b", "b", true, now.Add(2*time.Second))
+
+	total, err := store.CountUpdatesFiltered(UpdateFilter{ChangedOnly: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if total != 2 {
+		t.Fatalf("expected 2 changed updates, got %d", total)
+	}
+
+	updates, err := store.RecentUpdatesPageFiltered(10, 0, UpdateFilter{ChangedOnly: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(updates) != 2 || !updates[0].Changed || !updates[1].Changed {
+		t.Fatalf("unexpected filtered updates: %+v", updates)
+	}
+
+	repoTotal, err := store.CountRepoUpdatesFiltered("/repo/a", UpdateFilter{ChangedOnly: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if repoTotal != 1 {
+		t.Fatalf("expected 1 changed repo update, got %d", repoTotal)
+	}
+
+	repoUpdates, err := store.RepoUpdatesPageFiltered("/repo/a", 10, 0, UpdateFilter{ChangedOnly: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(repoUpdates) != 1 || !repoUpdates[0].Changed || repoUpdates[0].RepoPath != "/repo/a" {
+		t.Fatalf("unexpected filtered repo updates: %+v", repoUpdates)
+	}
+
+	errorUpdates, err := store.RecentUpdatesPageFiltered(10, 0, UpdateFilter{Status: "error"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(errorUpdates) != 1 || errorUpdates[0].Status != "error" {
+		t.Fatalf("unexpected status filtered updates: %+v", errorUpdates)
+	}
+}
+
 func insertUpdate(t *testing.T, store *Store, repoPath, repoName string, changed bool, startedAt time.Time) {
+	t.Helper()
+	insertUpdateWithStatus(t, store, repoPath, repoName, "success", changed, startedAt)
+}
+
+func insertUpdateWithStatus(t *testing.T, store *Store, repoPath, repoName, status string, changed bool, startedAt time.Time) {
 	t.Helper()
 	_, err := store.db.Exec(`
 		INSERT INTO updates (repo_path, repo_name, status, result, changed, started_at, finished_at)
-		VALUES (?, ?, 'success', 'test', ?, ?, ?)
-	`, repoPath, repoName, changed, startedAt, startedAt.Add(time.Second))
+		VALUES (?, ?, ?, 'test', ?, ?, ?)
+	`, repoPath, repoName, status, changed, startedAt, startedAt.Add(time.Second))
 	if err != nil {
 		t.Fatal(err)
 	}
