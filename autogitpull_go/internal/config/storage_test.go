@@ -19,6 +19,12 @@ func TestLoadCreatesDefaultConfig(t *testing.T) {
 	if len(repos) != 0 {
 		t.Fatalf("expected no repositories, got %d", len(repos))
 	}
+	if got := sm.GetConfig().PullIntervalMinutes; got != DefaultPullIntervalMinutes {
+		t.Fatalf("expected default pull interval %d, got %d", DefaultPullIntervalMinutes, got)
+	}
+	if got := sm.GetConfig().HistoryRetentionDays; got != DefaultHistoryRetentionDays {
+		t.Fatalf("expected default history retention %d, got %d", DefaultHistoryRetentionDays, got)
+	}
 }
 
 func TestGetAllReposReturnsCopy(t *testing.T) {
@@ -41,6 +47,39 @@ func TestGetAllReposReturnsCopy(t *testing.T) {
 	}
 	if stored[0].Name != "a" {
 		t.Fatalf("expected stored repo name to remain unchanged, got %q", stored[0].Name)
+	}
+}
+
+func TestSetRepoPausedAndPullInterval(t *testing.T) {
+	sm := NewStorageManager(filepath.Join(t.TempDir(), "config.json"))
+	sm.config = &Config{Repositories: []RepoInfo{{
+		Path:          "/repo/a",
+		Name:          "a",
+		DefaultBranch: "main",
+	}}}
+
+	if err := sm.SetRepoPaused("/repo/a", true); err != nil {
+		t.Fatal(err)
+	}
+	repo, err := sm.GetRepo("/repo/a")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !repo.Paused {
+		t.Fatal("expected repo to be paused")
+	}
+
+	if err := sm.SetPullIntervalMinutes(5); err != nil {
+		t.Fatal(err)
+	}
+	if err := sm.SetHistoryRetentionDays(90); err != nil {
+		t.Fatal(err)
+	}
+	if got := sm.GetConfig().PullInterval(); got != 5*time.Minute {
+		t.Fatalf("expected 5 minute interval, got %s", got)
+	}
+	if got := sm.GetConfig().HistoryRetention(); got != 90*24*time.Hour {
+		t.Fatalf("expected 90 day retention, got %s", got)
 	}
 }
 

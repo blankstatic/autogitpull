@@ -9,18 +9,23 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"os/exec"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/blankstatic/autogitpull/autogitpull_go/internal/config"
 	"github.com/blankstatic/autogitpull/autogitpull_go/internal/db"
 	servicepkg "github.com/blankstatic/autogitpull/autogitpull_go/internal/service"
+	versionpkg "github.com/blankstatic/autogitpull/autogitpull_go/internal/version"
 	"github.com/blankstatic/autogitpull/autogitpull_go/pkg/git"
+	"github.com/blankstatic/autogitpull/autogitpull_go/pkg/notifications"
 )
 
 const Addr = ":9009"
 const serviceInterval = 30 * time.Minute
+const serviceLabel = "com.blankstatic.autogitpull"
 const updatesPerPage = 50
 const activityWeeks = 53
 const eventFilterChanges = "changes"
@@ -33,6 +38,93 @@ type Server struct {
 	store   *db.Store
 	storage *config.StorageManager
 	mux     *http.ServeMux
+}
+
+type RepoCard struct {
+	Repo       config.RepoInfo
+	LastUpdate *db.Update
+}
+
+type DaemonStatus struct {
+	NextRunAt       time.Time
+	LastRunStarted  time.Time
+	LastRunDuration time.Duration
+	RunningRepos    []string
+	Checked         int
+	Success         int
+	Skipped         int
+	Error           int
+}
+
+var daemonStatus = struct {
+	sync.RWMutex
+	status DaemonStatus
+}{}
+
+func SetDaemonNextRun(t time.Time) {
+	daemonStatus.Lock()
+	daemonStatus.status.NextRunAt = t
+	daemonStatus.Unlock()
+}
+
+func SetDaemonRunStarted(t time.Time) {
+	daemonStatus.Lock()
+	daemonStatus.status.LastRunStarted = t
+	daemonStatus.status.RunningRepos = nil
+	daemonStatus.status.Checked = 0
+	daemonStatus.status.Success = 0
+	daemonStatus.status.Skipped = 0
+	daemonStatus.status.Error = 0
+	daemonStatus.Unlock()
+}
+
+func SetDaemonRunFinished(duration time.Duration) {
+	daemonStatus.Lock()
+	daemonStatus.status.LastRunDuration = duration
+	daemonStatus.status.RunningRepos = nil
+	daemonStatus.Unlock()
+}
+
+func AddDaemonRunResult(status string) {
+	daemonStatus.Lock()
+	defer daemonStatus.Unlock()
+	daemonStatus.status.Checked++
+	switch status {
+	case "success":
+		daemonStatus.status.Success++
+	case "skipped":
+		daemonStatus.status.Skipped++
+	default:
+		daemonStatus.status.Error++
+	}
+}
+
+func SetDaemonRepoRunning(repoName string, running bool) {
+	daemonStatus.Lock()
+	defer daemonStatus.Unlock()
+	if running {
+		for _, name := range daemonStatus.status.RunningRepos {
+			if name == repoName {
+				return
+			}
+		}
+		daemonStatus.status.RunningRepos = append(daemonStatus.status.RunningRepos, repoName)
+		return
+	}
+	for i, name := range daemonStatus.status.RunningRepos {
+		if name == repoName {
+			daemonStatus.status.RunningRepos = append(daemonStatus.status.RunningRepos[:i], daemonStatus.status.RunningRepos[i+1:]...)
+			return
+		}
+	}
+}
+
+func GetDaemonStatus() DaemonStatus {
+	daemonStatus.RLock()
+	defer daemonStatus.RUnlock()
+	status := daemonStatus.status
+	status.RunningRepos = append([]string(nil), status.RunningRepos...)
+	return status
 }
 
 func New(store *db.Store, storage *config.StorageManager) *Server {
@@ -57,6 +149,11 @@ func (s *Server) Start() {
 func (s *Server) routes() {
 	s.mux.HandleFunc("/", s.index)
 	s.mux.HandleFunc("/repo", s.repo)
+	s.mux.HandleFunc("/repo/pull", s.pullRepo)
+	s.mux.HandleFunc("/repo/pause", s.pauseRepo)
+	s.mux.HandleFunc("/repo/open", s.openRepo)
+	s.mux.HandleFunc("/repo/unregister", s.unregisterRepo)
+	s.mux.HandleFunc("/settings", s.settings)
 	s.mux.HandleFunc("/favicon.ico", s.icon)
 	s.mux.HandleFunc("/assets/app-icon.png", s.icon)
 }
@@ -79,8 +176,14 @@ func (s *Server) index(w http.ResponseWriter, r *http.Request) {
 	}
 
 	repos := s.storage.GetAllRepos()
+	latestUpdates, err := s.store.LatestUpdatesByRepo()
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
 	dbPath, _ := config.GetUpdatesDBPath()
 	serviceStatus := getServiceStatus()
+	cfg := s.storage.GetConfig()
 	activity, err := s.activity("")
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
@@ -89,6 +192,7 @@ func (s *Server) index(w http.ResponseWriter, r *http.Request) {
 
 	renderTemplate(w, indexTemplate, map[string]any{
 		"Repos":         repos,
+		"RepoCards":     repoCards(repos, latestUpdates),
 		"Updates":       updates,
 		"Activity":      activity,
 		"RepoCount":     len(repos),
@@ -97,7 +201,14 @@ func (s *Server) index(w http.ResponseWriter, r *http.Request) {
 		"Pagination":    newPagination(r.URL.Path, filterQueryValues(filter), page, totalUpdates),
 		"EventFilter":   newEventFilter(r.URL.Path, nil, filter),
 		"DBPath":        dbPath,
+		"ConfigPath":    s.storage.ConfigPath(),
 		"ServiceStatus": serviceStatus,
+		"ServiceLabel":  serviceLabel,
+		"AppVersion":    versionpkg.AppVersion,
+		"PullInterval":  cfg.PullIntervalMinutes,
+		"RetentionDays": cfg.HistoryRetentionDays,
+		"DaemonStatus":  GetDaemonStatus(),
+		"Flash":         flashFromRequest(r),
 	})
 }
 
@@ -149,7 +260,252 @@ func (s *Server) repo(w http.ResponseWriter, r *http.Request) {
 		"TotalUpdates": totalUpdates,
 		"Pagination":   newPagination(r.URL.Path, repoQueryValues(repoPath, filter), page, totalUpdates),
 		"EventFilter":  newEventFilter(r.URL.Path, url.Values{"path": []string{repoPath}}, filter),
+		"Flash":        flashFromRequest(r),
 	})
+}
+
+func (s *Server) pullRepo(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	repoPath := r.FormValue("path")
+	if repoPath == "" {
+		http.Error(w, "missing path", http.StatusBadRequest)
+		return
+	}
+	repo, err := s.storage.GetRepo(repoPath)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusNotFound)
+		return
+	}
+
+	updateID, err := s.store.BeginUpdate(repo.Path, repo.Name)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	result, pullErr := performPull(repo)
+	if err := s.store.FinishUpdate(updateID, result, pullErr); err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	notifyURL := "http://localhost" + Addr + repoURL(repo.Path, "")
+	if pullErr != nil {
+		go func() {
+			if notifyErr := notifications.OSNotifyURL(config.AppName, fmt.Sprintf("%s pull failed", repo.Name), pullErr.Error(), notifyURL); notifyErr != nil {
+				slog.Error("failed to send pull notification", slog.String("repo", repo.Name), slog.String("err", notifyErr.Error()))
+			}
+		}()
+		http.Redirect(w, r, repoURLWithFlash(repoPath, eventFilterAll, "Pull failed: "+pullErr.Error()), http.StatusSeeOther)
+		return
+	}
+	if pullErr == nil {
+		_ = s.storage.UpdateLastSync(repo.Path)
+		go func() {
+			if notifyErr := notifications.OSNotifyURL(config.AppName, fmt.Sprintf("%s pull", repo.Name), result, notifyURL); notifyErr != nil {
+				slog.Error("failed to send pull notification", slog.String("repo", repo.Name), slog.String("err", notifyErr.Error()))
+			}
+		}()
+	}
+	http.Redirect(w, r, repoURLWithFlash(repoPath, eventFilterAll, "Pulled successfully"), http.StatusSeeOther)
+}
+
+func (s *Server) pauseRepo(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	repoPath := r.FormValue("path")
+	if repoPath == "" {
+		http.Error(w, "missing path", http.StatusBadRequest)
+		return
+	}
+	paused := r.FormValue("paused") == "1"
+	if err := s.storage.SetRepoPaused(repoPath, paused); err != nil {
+		http.Error(w, err.Error(), http.StatusNotFound)
+		return
+	}
+	if paused {
+		redirectRepoFlash(w, r, repoPath, "Repo paused")
+		return
+	}
+	redirectRepoFlash(w, r, repoPath, "Repo resumed")
+}
+
+func (s *Server) settings(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	minutes, err := strconv.Atoi(r.FormValue("pull_interval_minutes"))
+	if err != nil || minutes <= 0 {
+		http.Error(w, "pull interval must be positive", http.StatusBadRequest)
+		return
+	}
+	retentionDays, err := strconv.Atoi(r.FormValue("history_retention_days"))
+	if err != nil || retentionDays <= 0 {
+		http.Error(w, "history retention must be positive", http.StatusBadRequest)
+		return
+	}
+	if err := s.storage.SetPullIntervalMinutes(minutes); err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+	if err := s.storage.SetHistoryRetentionDays(retentionDays); err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+	if _, err := s.store.DeleteUpdatesBefore(time.Now().Add(-time.Duration(retentionDays) * 24 * time.Hour)); err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	http.Redirect(w, r, "/?flash="+url.QueryEscape("Settings saved"), http.StatusSeeOther)
+}
+
+func (s *Server) openRepo(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	repoPath := r.FormValue("path")
+	if _, err := s.storage.GetRepo(repoPath); err != nil {
+		http.Error(w, err.Error(), http.StatusNotFound)
+		return
+	}
+	target := r.FormValue("target")
+	var cmd *exec.Cmd
+	switch target {
+	case "code":
+		cmd = exec.Command("open", "-a", "Visual Studio Code", repoPath)
+	case "terminal":
+		cmd = exec.Command("open", "-a", "Terminal", repoPath)
+	default:
+		cmd = exec.Command("open", repoPath)
+	}
+	if err := cmd.Start(); err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	redirectRepoFlash(w, r, repoPath, "Opened in "+openTargetLabel(target))
+}
+
+func (s *Server) unregisterRepo(w http.ResponseWriter, r *http.Request) {
+	if r.Method == http.MethodGet {
+		repoPath := r.URL.Query().Get("path")
+		repo, err := s.storage.GetRepo(repoPath)
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusNotFound)
+			return
+		}
+		renderTemplate(w, unregisterTemplate, map[string]any{"Repo": repo})
+		return
+	}
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	repoPath := r.FormValue("path")
+	if repoPath == "" {
+		http.Error(w, "missing path", http.StatusBadRequest)
+		return
+	}
+	repo, err := s.storage.GetRepo(repoPath)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusNotFound)
+		return
+	}
+	if r.FormValue("confirm_name") != repo.Name {
+		http.Error(w, "confirmation does not match repository name", http.StatusBadRequest)
+		return
+	}
+	if err := s.storage.RemoveRepo(repoPath); err != nil {
+		http.Error(w, err.Error(), http.StatusNotFound)
+		return
+	}
+	http.Redirect(w, r, "/?flash="+url.QueryEscape("Repo unregistered: "+repo.Name), http.StatusSeeOther)
+}
+
+func repoCards(repos []config.RepoInfo, latest map[string]db.Update) []RepoCard {
+	cards := make([]RepoCard, 0, len(repos))
+	for _, repo := range repos {
+		card := RepoCard{Repo: repo}
+		if update, ok := latest[repo.Path]; ok {
+			updateCopy := update
+			card.LastUpdate = &updateCopy
+		}
+		cards = append(cards, card)
+	}
+	return cards
+}
+
+func redirectRepo(w http.ResponseWriter, r *http.Request, repoPath string) {
+	http.Redirect(w, r, repoURL(repoPath, ""), http.StatusSeeOther)
+}
+
+func redirectRepoFlash(w http.ResponseWriter, r *http.Request, repoPath, flash string) {
+	http.Redirect(w, r, repoURLWithFlash(repoPath, "", flash), http.StatusSeeOther)
+}
+
+func repoURL(repoPath, filter string) string {
+	values := url.Values{}
+	if filter != "" {
+		values.Set("filter", filter)
+	}
+	return "/repo?" + queryWithPath(values, repoPath)
+}
+
+func repoURLWithFlash(repoPath, filter, flash string) string {
+	values := url.Values{}
+	if filter != "" {
+		values.Set("filter", filter)
+	}
+	if flash != "" {
+		values.Set("flash", flash)
+	}
+	return "/repo?" + queryWithPath(values, repoPath)
+}
+
+func queryWithPath(values url.Values, repoPath string) string {
+	query := values.Encode()
+	pathQuery := "path=" + strings.ReplaceAll(url.QueryEscape(repoPath), "%2F", "/")
+	if query == "" {
+		return pathQuery
+	}
+	return query + "&" + pathQuery
+}
+
+func flashFromRequest(r *http.Request) string {
+	return strings.TrimSpace(r.URL.Query().Get("flash"))
+}
+
+func openTargetLabel(target string) string {
+	switch target {
+	case "code":
+		return "VS Code"
+	case "terminal":
+		return "Terminal"
+	default:
+		return "Finder"
+	}
+}
+
+func performPull(repo *config.RepoInfo) (string, error) {
+	currentBranch, err := git.GetCurrentBranch(repo.Path)
+	if err != nil {
+		return "", fmt.Errorf("get current branch: %w", err)
+	}
+	if currentBranch != repo.DefaultBranch {
+		return "", fmt.Errorf("current branch %s is not default branch %s", currentBranch, repo.DefaultBranch)
+	}
+	hasChanges, err := git.GitHasUncommitedChanges(repo.Path)
+	if err != nil {
+		return "", fmt.Errorf("check changes: %w", err)
+	}
+	if hasChanges {
+		return "", fmt.Errorf("repository has uncommitted changes")
+	}
+	return git.GitPull(repo.Path)
 }
 
 func renderTemplate(w http.ResponseWriter, tmpl *template.Template, data any) {
@@ -528,6 +884,31 @@ func plural(n int, unit string) string {
 	return fmt.Sprintf("%d %ss", n, unit)
 }
 
+func humanizeNumber(n int) string {
+	sign := ""
+	if n < 0 {
+		sign = "-"
+		n = -n
+	}
+	switch {
+	case n >= 1_000_000:
+		return sign + compactNumber(n, 1_000_000, "m")
+	case n >= 1_000:
+		return sign + compactNumber(n, 1_000, "k")
+	default:
+		return sign + strconv.Itoa(n)
+	}
+}
+
+func compactNumber(n, unit int, suffix string) string {
+	whole := n / unit
+	decimal := (n % unit) / (unit / 10)
+	if decimal == 0 || whole >= 100 {
+		return fmt.Sprintf("%d%s", whole, suffix)
+	}
+	return fmt.Sprintf("%d.%d%s", whole, decimal, suffix)
+}
+
 func compactPath(path string) string {
 	homeDir, err := os.UserHomeDir()
 	if err != nil || homeDir == "" {
@@ -570,11 +951,12 @@ var baseCSS = template.CSS(`
 	.panel-title { color: #24292f; }
 	.panel-title:hover { color: #0969da; text-decoration: none; }
 	.panel-body { padding: 16px; }
+	.flash { margin-bottom: 18px; padding: 10px 12px; border: 1px solid #b6e3ff; border-radius: 8px; background: #ddf4ff; color: #0969da; font-weight: 600; }
 	.filter { display: inline-flex; gap: 4px; padding: 3px; border: 1px solid #d0d7de; border-radius: 8px; background: white; }
 	.filter-link { display: inline-flex; min-height: 26px; align-items: center; padding: 3px 9px; border-radius: 6px; color: #57606a; font-size: 12px; font-weight: 600; }
 	.filter-link:hover { color: #24292f; text-decoration: none; }
 	.filter-link.active { background: #0969da; color: white; }
-	.activity-wrap { overflow-x: auto; margin: -2px; padding: 2px 2px 36px; }
+	.activity-wrap { overflow-x: auto; overflow-y: visible; margin: -2px; padding: 2px 160px 36px; }
 	.activity-grid { display: grid; grid-auto-flow: column; grid-auto-columns: 12px; grid-template-rows: repeat(7, 12px); gap: 3px; width: max-content; padding: 2px; }
 	.activity-cell { position: relative; width: 12px; height: 12px; border-radius: 2px; background: #ebedf0; border: 1px solid rgba(27,31,36,.06); }
 	.activity-cell:hover, .activity-cell:focus-visible { outline: 1px solid #57606a; outline-offset: 1px; }
@@ -591,10 +973,19 @@ var baseCSS = template.CSS(`
 	.pagination-actions { display: flex; gap: 8px; }
 	.page-link { display: inline-flex; align-items: center; min-height: 28px; padding: 4px 10px; border: 1px solid #d0d7de; border-radius: 6px; background: white; color: #24292f; font-size: 12px; font-weight: 600; }
 	.page-link.disabled { color: #8c959f; background: #f6f8fa; pointer-events: none; }
+	.actions { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+	.action-form { display: inline-flex; align-items: center; gap: 8px; margin: 0; }
+	.input { width: 76px; min-height: 28px; padding: 4px 8px; border: 1px solid #d0d7de; border-radius: 6px; font: inherit; }
+	.input.confirm { width: 220px; }
+	.button { display: inline-flex; align-items: center; min-height: 28px; padding: 4px 10px; border: 1px solid #d0d7de; border-radius: 6px; background: white; color: #24292f; font: inherit; font-size: 12px; font-weight: 600; cursor: pointer; }
+	.button:hover { background: #f6f8fa; }
+	.button.danger { color: #cf222e; }
 	.repo-list { display: grid; grid-template-columns: repeat(auto-fill, minmax(300px, 1fr)); gap: 10px; }
-	.repo { display: block; border: 1px solid #d8dee4; border-radius: 8px; padding: 12px; background: #fff; color: inherit; transition: border-color .12s ease, box-shadow .12s ease, transform .12s ease; }
+	.repo { display: block; min-width: 0; border: 1px solid #d8dee4; border-radius: 8px; padding: 12px; background: #fff; color: inherit; transition: border-color .12s ease, box-shadow .12s ease, transform .12s ease; }
 	.repo:hover { border-color: #8c959f; box-shadow: 0 1px 4px rgba(27,31,36,.08); transform: translateY(-1px); text-decoration: none; }
-	.repo-title { display: flex; justify-content: space-between; gap: 10px; align-items: baseline; margin-bottom: 7px; }
+	.repo-title { display: flex; justify-content: space-between; gap: 10px; align-items: baseline; margin-bottom: 7px; min-width: 0; }
+	.repo-title strong { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+	.repo-detail { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 	table { width: 100%; border-collapse: collapse; }
 	th, td { padding: 10px 12px; border-bottom: 1px solid #d8dee4; text-align: left; vertical-align: top; }
 	th { color: #57606a; font-size: 12px; background: #f6f8fa; font-weight: 650; text-transform: uppercase; letter-spacing: .04em; }
@@ -605,12 +996,14 @@ var baseCSS = template.CSS(`
 	.badge.error { background: #ffebe9; color: #cf222e; }
 	.badge.running { background: #ddf4ff; color: #0969da; }
 	.badge.skipped { background: #fff1db; color: #9a6700; }
+	.badge.paused { background: #eaeef2; color: #57606a; }
 	.badge.service-running { background: #dafbe1; color: #116329; }
 	.badge.service-stopped { background: #ffebe9; color: #cf222e; }
 	.badge.service-loaded { background: #ddf4ff; color: #0969da; }
 	.time { white-space: nowrap; }
 	.time-detail { color: #57606a; font-size: 12px; margin-top: 2px; white-space: nowrap; }
 	.empty { color: #57606a; padding: 18px; }
+	footer { max-width: 1180px; margin: 0 auto; padding: 0 24px 28px; color: #57606a; font-size: 12px; }
 	@media (max-width: 760px) { .header-inner { display: block; } .summary { grid-template-columns: 1fr; } .activity-meta { align-items: flex-start; flex-direction: column; } th:nth-child(4), td:nth-child(4) { display: none; } }
 `)
 
@@ -653,6 +1046,9 @@ var templateFuncs = template.FuncMap{
 		}
 		return humanizeDuration(time.Since(t))
 	},
+	"humanDuration": humanDurationUnit,
+	"join":          strings.Join,
+	"humanNumber":   humanizeNumber,
 	"firstLine": func(s string) string {
 		s = strings.TrimSpace(s)
 		if s == "" {
@@ -666,40 +1062,51 @@ var templateFuncs = template.FuncMap{
 	"compactPath": compactPath,
 }
 
-const activityTemplate = `{{define "activity"}}<div class="activity-wrap"><div class="activity-grid" aria-label="Changed update activity from {{.Start}} to {{.End}}">{{range .Cells}}<span class="activity-cell" data-level="{{.Level}}" data-title="{{.Title}}" aria-label="{{.Title}}" tabindex="0"></span>{{end}}</div></div><div class="activity-meta"><div>{{.Total}} changed updates in the last year</div><div class="activity-legend"><span>Less</span><span class="activity-cell" data-level="0"></span><span class="activity-cell" data-level="1"></span><span class="activity-cell" data-level="2"></span><span class="activity-cell" data-level="3"></span><span class="activity-cell" data-level="4"></span><span>More</span></div></div>{{end}}`
+const activityTemplate = `{{define "activity"}}<div class="activity-wrap"><div class="activity-grid" aria-label="Changed update activity from {{.Start}} to {{.End}}">{{range .Cells}}<span class="activity-cell" data-level="{{.Level}}" data-title="{{.Title}}" aria-label="{{.Title}}" tabindex="0"></span>{{end}}</div></div><div class="activity-meta"><div>{{humanNumber .Total}} changed updates in the last year</div><div class="activity-legend"><span>Less</span><span class="activity-cell" data-level="0"></span><span class="activity-cell" data-level="1"></span><span class="activity-cell" data-level="2"></span><span class="activity-cell" data-level="3"></span><span class="activity-cell" data-level="4"></span><span>More</span></div></div>{{end}}`
 
 var indexTemplate = template.Must(template.New("index").Funcs(templateFuncs).Parse(`
 <!doctype html><html><head><meta charset="utf-8"><title>autogitpull</title><link rel="icon" type="image/png" href="/favicon.ico"><style>` + string(baseCSS) + `</style></head>
-<body><header><div class="header-inner"><a class="brand" href="/"><img class="brand-icon" src="/assets/app-icon.png" alt=""><h1>autogitpull</h1></a></div></header><main>
+<body><header><div class="header-inner"><a class="brand" href="/"><img class="brand-icon" src="/assets/app-icon.png" alt=""><h1>autogitpull</h1></a><form class="action-form" method="post" action="/settings"><input class="input" type="number" min="1" name="pull_interval_minutes" value="{{.PullInterval}}" aria-label="Pull interval minutes"><button class="button" type="submit">Interval, min</button><input class="input" type="number" min="1" name="history_retention_days" value="{{.RetentionDays}}" aria-label="History retention days"><button class="button" type="submit">Retention, days</button></form></div></header><main>
+{{if .Flash}}<div class="flash">{{.Flash}}</div>{{end}}
 <section class="summary">
-	<div class="metric"><div class="metric-label">Repositories</div><div class="metric-value">{{.RepoCount}}</div></div>
-	<div class="metric"><div class="metric-label">Recent events</div><div class="metric-value">{{.TotalUpdates}}</div></div>
-	<div class="metric"><div class="metric-label">Service</div><div class="metric-value"><span class="badge {{serviceStatusClass .ServiceStatus}}">{{.ServiceStatus}}</span></div><div class="metric-detail">launchd service</div></div>
+	<div class="metric"><div class="metric-label">Repositories</div><div class="metric-value">{{humanNumber .RepoCount}}</div></div>
+	<div class="metric"><div class="metric-label">Recent events</div><div class="metric-value">{{humanNumber .TotalUpdates}}</div></div>
+	<div class="metric"><div class="metric-label">Service</div><div class="metric-value"><span class="badge {{serviceStatusClass .ServiceStatus}}">{{.ServiceStatus}}</span></div><div class="metric-detail">{{.ServiceLabel}}</div></div>
 	<div class="metric"><div class="metric-label">Database</div><div class="path" title="{{.DBPath}}">{{compactPath .DBPath}}</div></div>
 </section>
 <div class="grid">
+<section class="panel" id="daemon"><div class="panel-head"><h2><a class="panel-title" href="#daemon">Daemon</a></h2></div><div class="panel-body">
+<div class="summary">
+	<div class="metric"><div class="metric-label">Next run</div><div class="metric-value">{{humanTime .DaemonStatus.NextRunAt}}</div><div class="metric-detail">{{formatTime .DaemonStatus.NextRunAt}}</div></div>
+	<div class="metric"><div class="metric-label">Last run</div><div class="metric-value">{{if .DaemonStatus.LastRunDuration}}{{humanDuration .DaemonStatus.LastRunDuration}}{{else}}-{{end}}</div><div class="metric-detail">{{formatTime .DaemonStatus.LastRunStarted}}</div></div>
+	<div class="metric"><div class="metric-label">Pulling now</div><div class="metric-value">{{humanNumber (len .DaemonStatus.RunningRepos)}}</div><div class="metric-detail">{{if .DaemonStatus.RunningRepos}}{{join .DaemonStatus.RunningRepos ", "}}{{else}}Idle{{end}}</div></div>
+	<div class="metric"><div class="metric-label">Last run result</div><div class="metric-value">{{humanNumber .DaemonStatus.Checked}}</div><div class="metric-detail">ok {{humanNumber .DaemonStatus.Success}} · skipped {{humanNumber .DaemonStatus.Skipped}} · error {{humanNumber .DaemonStatus.Error}}</div></div>
+</div>
+</div></section>
 <section class="panel" id="activity"><div class="panel-head"><h2><a class="panel-title" href="#activity">Activity</a></h2></div><div class="panel-body">
 {{template "activity" .Activity}}
 </div></section>
 <section class="panel" id="repositories"><div class="panel-head"><h2><a class="panel-title" href="#repositories">Repositories</a></h2></div><div class="panel-body">
-{{if .Repos}}<div class="repo-list">{{range .Repos}}<a class="repo" href="/repo?path={{.Path | urlquery}}" title="{{.Path}}"><div class="repo-title"><strong>{{.Name}}</strong><span class="badge">{{.DefaultBranch}}</span></div><div class="path">{{compactPath .Path}}</div><div class="time-detail">Last sync: {{humanTime .LastSync}} · {{formatTime .LastSync}}</div></a>{{end}}</div>{{else}}<div class="empty">No repositories registered.</div>{{end}}
+{{if .RepoCards}}<div class="repo-list">{{range .RepoCards}}<a class="repo" href="/repo?path={{.Repo.Path | urlquery}}" title="{{.Repo.Path}}"><div class="repo-title"><strong>{{.Repo.Name}}</strong><span class="actions">{{if .Repo.Paused}}<span class="badge paused">paused</span>{{end}}{{if .LastUpdate}}<span class="badge {{statusClass .LastUpdate.Status}}">{{.LastUpdate.Status}}</span>{{end}}<span class="badge">{{.Repo.DefaultBranch}}</span></span></div><div class="path repo-detail">{{compactPath .Repo.Path}}</div><div class="time-detail repo-detail" title="{{if .LastUpdate}}{{if .LastUpdate.Error}}{{.LastUpdate.Error | firstLine}}{{else}}{{.LastUpdate.Result | firstLine}}{{end}}{{end}}">{{if .LastUpdate}}Last event: {{humanTime .LastUpdate.StartedAt}} · {{if .LastUpdate.Error}}{{.LastUpdate.Error | firstLine}}{{else}}{{.LastUpdate.Result | firstLine}}{{end}}{{else}}No recorded events{{end}}</div><div class="time-detail repo-detail">Last sync: {{humanTime .Repo.LastSync}} · {{formatTime .Repo.LastSync}}</div></a>{{end}}</div>{{else}}<div class="empty">No repositories registered.</div>{{end}}
 </div></section>
 <section class="panel" id="updates"><div class="panel-head"><h2><a class="panel-title" href="#updates">Recent updates</a></h2><div class="filter">{{range .EventFilter.Options}}<a class="{{.Class}}" href="{{.URL}}">{{.Label}}</a>{{end}}</div></div>
 {{if .Updates}}<table><tr><th>Time</th><th>Repo</th><th>Status</th><th>Result</th></tr>
 {{range .Updates}}<tr><td><div class="time">{{humanTime .StartedAt}}</div><div class="time-detail">{{formatTime .StartedAt}}</div></td><td><a href="/repo?path={{.RepoPath | urlquery}}">{{.RepoName}}</a><div class="path" title="{{.RepoPath}}">{{compactPath .RepoPath}}</div></td><td><span class="badge {{statusClass .Status}}">{{.Status}}</span></td><td><pre>{{if .Error}}{{.Error}}{{else}}{{.Result | firstLine}}{{end}}</pre></td></tr>{{end}}
 </table>{{template "pagination" .Pagination}}{{else}}<div class="empty">No updates match this filter.</div>{{end}}</section>
 </div>
-</main></body></html>
+</main><footer>version {{.AppVersion}} · config <span class="path">{{compactPath .ConfigPath}}</span> · db <span class="path">{{compactPath .DBPath}}</span> · service {{.ServiceLabel}}</footer></body></html>
 
-{{define "pagination"}}<div class="pagination"><div class="pagination-info">{{if .Total}}Showing {{.From}}-{{.To}} of {{.Total}} · page {{.Page}} of {{.TotalPages}}{{else}}No records{{end}}</div><div class="pagination-actions">{{if .HasPrev}}<a class="page-link" href="{{.PrevURL}}">Prev</a>{{else}}<span class="page-link disabled">Prev</span>{{end}}{{if .HasNext}}<a class="page-link" href="{{.NextURL}}">Next</a>{{else}}<span class="page-link disabled">Next</span>{{end}}</div></div>{{end}}` + activityTemplate))
+{{define "pagination"}}<div class="pagination"><div class="pagination-info">{{if .Total}}Showing {{humanNumber .From}}-{{humanNumber .To}} of {{humanNumber .Total}} · page {{humanNumber .Page}} of {{humanNumber .TotalPages}}{{else}}No records{{end}}</div><div class="pagination-actions">{{if .HasPrev}}<a class="page-link" href="{{.PrevURL}}">Prev</a>{{else}}<span class="page-link disabled">Prev</span>{{end}}{{if .HasNext}}<a class="page-link" href="{{.NextURL}}">Next</a>{{else}}<span class="page-link disabled">Next</span>{{end}}</div></div>{{end}}` + activityTemplate))
 
 var repoTemplate = template.Must(template.New("repo").Funcs(templateFuncs).Parse(`
 <!doctype html><html><head><meta charset="utf-8"><title>{{.Repo.Name}} - autogitpull</title><link rel="icon" type="image/png" href="/favicon.ico"><style>` + string(baseCSS) + `</style></head>
-<body><header><div class="header-inner"><a class="brand" href="/"><img class="brand-icon" src="/assets/app-icon.png" alt=""><div class="header-title"><h1>{{.Repo.Name}}</h1><div class="header-path" title="{{.Repo.Path}}">{{compactPath .Repo.Path}}</div></div></a><a class="badge" href="/">Back</a></div></header><main class="grid">
+<body><header><div class="header-inner"><a class="brand" href="/"><img class="brand-icon" src="/assets/app-icon.png" alt=""><div class="header-title"><h1>{{.Repo.Name}}</h1><div class="header-path" title="{{.Repo.Path}}">{{compactPath .Repo.Path}}</div></div></a><div class="actions"><form class="action-form" method="post" action="/repo/pull"><input type="hidden" name="path" value="{{.Repo.Path}}"><button class="button" type="submit">Pull now</button></form><form class="action-form" method="post" action="/repo/open"><input type="hidden" name="path" value="{{.Repo.Path}}"><input type="hidden" name="target" value="finder"><button class="button" type="submit">Finder</button></form><form class="action-form" method="post" action="/repo/open"><input type="hidden" name="path" value="{{.Repo.Path}}"><input type="hidden" name="target" value="terminal"><button class="button" type="submit">Terminal</button></form><form class="action-form" method="post" action="/repo/open"><input type="hidden" name="path" value="{{.Repo.Path}}"><input type="hidden" name="target" value="code"><button class="button" type="submit">VS Code</button></form><form class="action-form" method="post" action="/repo/pause"><input type="hidden" name="path" value="{{.Repo.Path}}">{{if .Repo.Paused}}<input type="hidden" name="paused" value="0"><button class="button" type="submit">Resume</button>{{else}}<input type="hidden" name="paused" value="1"><button class="button" type="submit">Pause</button>{{end}}</form><a class="button danger" href="/repo/unregister?path={{.Repo.Path | urlquery}}">Unregister</a><a class="badge" href="/">Back</a></div></div></header><main class="grid">
+{{if .Flash}}<div class="flash">{{.Flash}}</div>{{end}}
 <section class="summary">
 	<div class="metric"><div class="metric-label">Default branch</div><div class="metric-value">{{.Repo.DefaultBranch}}</div></div>
 	<div class="metric"><div class="metric-label">Last sync</div><div class="metric-value">{{humanTime .Repo.LastSync}}</div><div class="metric-detail">{{formatTime .Repo.LastSync}}</div></div>
-	<div class="metric"><div class="metric-label">Recorded events</div><div class="metric-value">{{.TotalUpdates}}</div></div>
+	<div class="metric"><div class="metric-label">Recorded events</div><div class="metric-value">{{humanNumber .TotalUpdates}}</div></div>
+	<div class="metric"><div class="metric-label">Auto pull</div><div class="metric-value">{{if .Repo.Paused}}<span class="badge paused">paused</span>{{else}}<span class="badge success">enabled</span>{{end}}</div></div>
 </section>
 <section class="panel" id="activity"><div class="panel-head"><h2><a class="panel-title" href="#activity">Activity</a></h2></div><div class="panel-body">
 {{template "activity" .Activity}}
@@ -707,8 +1114,21 @@ var repoTemplate = template.Must(template.New("repo").Funcs(templateFuncs).Parse
 <section class="panel" id="changes"><div class="panel-head"><h2><a class="panel-title" href="#changes">Current local changes</a></h2></div><div class="panel-body"><pre>{{if .Changes}}{{.Changes}}{{else}}No uncommitted changes{{end}}</pre></div></section>
 <section class="panel" id="updates"><div class="panel-head"><h2><a class="panel-title" href="#updates">Updates</a></h2><div class="filter">{{range .EventFilter.Options}}<a class="{{.Class}}" href="{{.URL}}">{{.Label}}</a>{{end}}</div></div>
 {{if .Updates}}<table><tr><th>Time</th><th>Status</th><th>Changed</th><th>Result</th></tr>
-{{range .Updates}}<tr><td><div class="time">{{humanTime .StartedAt}}</div><div class="time-detail">{{formatTime .StartedAt}}</div></td><td><span class="badge {{statusClass .Status}}">{{.Status}}</span></td><td>{{changedText .Changed}}</td><td><pre>{{if .Error}}{{.Error}}{{else}}{{.Result}}{{end}}</pre></td></tr>{{end}}
+{{range .Updates}}<tr><td><div class="time">{{humanTime .StartedAt}}</div><div class="time-detail">{{formatTime .StartedAt}}</div></td><td><span class="badge {{statusClass .Status}}">{{.Status}}</span>{{if .SkipReason}}<div class="time-detail">{{.SkipReason}}</div>{{end}}</td><td>{{changedText .Changed}}</td><td><pre>{{if .Error}}{{.Error}}{{else}}{{.Result}}{{end}}</pre></td></tr>{{end}}
 </table>{{template "pagination" .Pagination}}{{else}}<div class="empty">No updates match this filter.</div>{{end}}</section>
 </main></body></html>
 
-{{define "pagination"}}<div class="pagination"><div class="pagination-info">{{if .Total}}Showing {{.From}}-{{.To}} of {{.Total}} · page {{.Page}} of {{.TotalPages}}{{else}}No records{{end}}</div><div class="pagination-actions">{{if .HasPrev}}<a class="page-link" href="{{.PrevURL}}">Prev</a>{{else}}<span class="page-link disabled">Prev</span>{{end}}{{if .HasNext}}<a class="page-link" href="{{.NextURL}}">Next</a>{{else}}<span class="page-link disabled">Next</span>{{end}}</div></div>{{end}}` + activityTemplate))
+{{define "pagination"}}<div class="pagination"><div class="pagination-info">{{if .Total}}Showing {{humanNumber .From}}-{{humanNumber .To}} of {{humanNumber .Total}} · page {{humanNumber .Page}} of {{humanNumber .TotalPages}}{{else}}No records{{end}}</div><div class="pagination-actions">{{if .HasPrev}}<a class="page-link" href="{{.PrevURL}}">Prev</a>{{else}}<span class="page-link disabled">Prev</span>{{end}}{{if .HasNext}}<a class="page-link" href="{{.NextURL}}">Next</a>{{else}}<span class="page-link disabled">Next</span>{{end}}</div></div>{{end}}` + activityTemplate))
+
+var unregisterTemplate = template.Must(template.New("unregister").Funcs(templateFuncs).Parse(`
+<!doctype html><html><head><meta charset="utf-8"><title>Unregister {{.Repo.Name}} - autogitpull</title><link rel="icon" type="image/png" href="/favicon.ico"><style>` + string(baseCSS) + `</style></head>
+<body><header><div class="header-inner"><a class="brand" href="/"><img class="brand-icon" src="/assets/app-icon.png" alt=""><div class="header-title"><h1>Unregister {{.Repo.Name}}</h1><div class="header-path" title="{{.Repo.Path}}">{{compactPath .Repo.Path}}</div></div></a><a class="badge" href="/repo?path={{.Repo.Path | urlquery}}">Back</a></div></header><main class="grid">
+<section class="panel"><div class="panel-head"><h2>Confirm unregister</h2></div><div class="panel-body">
+<p>This removes the repository from autogitpull config. It does not delete files from disk.</p>
+<form class="action-form" method="post" action="/repo/unregister">
+	<input type="hidden" name="path" value="{{.Repo.Path}}">
+	<input class="input confirm" name="confirm_name" placeholder="Type {{.Repo.Name}}" autocomplete="off">
+	<button class="button danger" type="submit">Unregister</button>
+</form>
+</div></section>
+</main></body></html>`))

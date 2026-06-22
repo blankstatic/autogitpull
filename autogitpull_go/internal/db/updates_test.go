@@ -83,7 +83,34 @@ func TestStoreRecordsSkippedDirtyRepo(t *testing.T) {
 	if len(updates) != 1 {
 		t.Fatalf("expected 1 update, got %d", len(updates))
 	}
-	if updates[0].Status != "skipped" || updates[0].Error != "repository has uncommitted changes" || updates[0].Changed {
+	if updates[0].Status != "skipped" || updates[0].Error != "repository has uncommitted changes" || updates[0].SkipReason != "dirty_worktree" || updates[0].Changed {
+		t.Fatalf("unexpected update: %+v", updates[0])
+	}
+}
+
+func TestStoreRecordsSkippedDefaultBranchReason(t *testing.T) {
+	store, err := Open(filepath.Join(t.TempDir(), "updates.sqlite"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+
+	id, err := store.BeginUpdate("/repo/path", "repo")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.FinishUpdate(id, "", errors.New("current branch feature is not default branch main")); err != nil {
+		t.Fatal(err)
+	}
+
+	updates, err := store.RepoUpdates("/repo/path", 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(updates) != 1 {
+		t.Fatalf("expected 1 update, got %d", len(updates))
+	}
+	if updates[0].Status != "skipped" || updates[0].SkipReason != "not_default_branch" {
 		t.Fatalf("unexpected update: %+v", updates[0])
 	}
 }
@@ -171,6 +198,43 @@ func TestFilteredUpdatePagesAndCounts(t *testing.T) {
 	}
 	if len(errorUpdates) != 1 || errorUpdates[0].Status != "error" {
 		t.Fatalf("unexpected status filtered updates: %+v", errorUpdates)
+	}
+}
+
+func TestLatestUpdatesByRepoAndDeleteBefore(t *testing.T) {
+	store, err := Open(filepath.Join(t.TempDir(), "updates.sqlite"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+
+	old := time.Date(2026, 1, 1, 12, 0, 0, 0, time.UTC)
+	recent := old.Add(24 * time.Hour)
+	insertUpdateWithStatus(t, store, "/repo/a", "a", "success", false, old)
+	insertUpdateWithStatus(t, store, "/repo/a", "a", "error", false, recent)
+	insertUpdateWithStatus(t, store, "/repo/b", "b", "skipped", false, recent)
+
+	latest, err := store.LatestUpdatesByRepo()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if latest["/repo/a"].Status != "error" || latest["/repo/b"].Status != "skipped" {
+		t.Fatalf("unexpected latest updates: %+v", latest)
+	}
+
+	deleted, err := store.DeleteUpdatesBefore(recent)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if deleted != 1 {
+		t.Fatalf("expected 1 deleted row, got %d", deleted)
+	}
+	total, err := store.CountUpdates()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if total != 2 {
+		t.Fatalf("expected 2 remaining rows, got %d", total)
 	}
 }
 

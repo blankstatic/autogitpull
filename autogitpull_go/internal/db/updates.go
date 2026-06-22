@@ -19,6 +19,7 @@ type Update struct {
 	Status     string
 	Result     string
 	Error      string
+	SkipReason string
 	Changed    bool
 	StartedAt  time.Time
 	FinishedAt time.Time
@@ -67,10 +68,12 @@ func (s *Store) BeginUpdate(repoPath, repoName string) (int64, error) {
 func (s *Store) FinishUpdate(id int64, result string, pullErr error) error {
 	status := "success"
 	errText := ""
+	skipReason := ""
 	if pullErr != nil {
 		status = "error"
 		errText = pullErr.Error()
-		if IsSkippedPullError(errText) {
+		skipReason = SkipReasonFromPullError(errText)
+		if skipReason != "" {
 			status = "skipped"
 		}
 	}
@@ -78,9 +81,9 @@ func (s *Store) FinishUpdate(id int64, result string, pullErr error) error {
 	changed := status == "success" && result != "" && !isUpToDate(result)
 	_, err := s.db.Exec(`
 		UPDATE updates
-		SET status = ?, result = ?, error = ?, changed = ?, finished_at = ?
+		SET status = ?, result = ?, error = ?, skip_reason = ?, changed = ?, finished_at = ?
 		WHERE id = ?
-	`, status, result, errText, changed, time.Now().UTC(), id)
+	`, status, result, errText, skipReason, changed, time.Now().UTC(), id)
 	return err
 }
 
@@ -96,7 +99,7 @@ func (s *Store) RecentUpdatesPageFiltered(limit, offset int, filter UpdateFilter
 	where, args := updateFilterWhere(filter)
 	args = append(args, limit, offset)
 	rows, err := s.db.Query(`
-		SELECT id, repo_path, repo_name, status, result, error, changed, started_at, finished_at
+		SELECT id, repo_path, repo_name, status, result, error, skip_reason, changed, started_at, finished_at
 		FROM updates
 		`+where+`
 		ORDER BY id DESC
@@ -142,7 +145,7 @@ func (s *Store) RepoUpdatesPageFiltered(repoPath string, limit, offset int, filt
 	}
 	args = append(args, repoPath, limit, offset)
 	rows, err := s.db.Query(`
-		SELECT id, repo_path, repo_name, status, result, error, changed, started_at, finished_at
+		SELECT id, repo_path, repo_name, status, result, error, skip_reason, changed, started_at, finished_at
 		FROM updates
 		`+where+`
 		ORDER BY id DESC
@@ -169,6 +172,40 @@ func (s *Store) RepoChangedUpdateTimesSince(repoPath string, since time.Time) ([
 	defer rows.Close()
 
 	return scanTimes(rows)
+}
+
+func (s *Store) LatestUpdatesByRepo() (map[string]Update, error) {
+	rows, err := s.db.Query(`
+		SELECT u.id, u.repo_path, u.repo_name, u.status, u.result, u.error, u.skip_reason, u.changed, u.started_at, u.finished_at
+		FROM updates u
+		INNER JOIN (
+			SELECT repo_path, MAX(id) AS id
+			FROM updates
+			GROUP BY repo_path
+		) latest ON latest.id = u.id
+	`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	updates, err := scanUpdates(rows)
+	if err != nil {
+		return nil, err
+	}
+	byRepo := make(map[string]Update, len(updates))
+	for _, update := range updates {
+		byRepo[update.RepoPath] = update
+	}
+	return byRepo, nil
+}
+
+func (s *Store) DeleteUpdatesBefore(before time.Time) (int64, error) {
+	res, err := s.db.Exec(`DELETE FROM updates WHERE started_at < ?`, before.UTC())
+	if err != nil {
+		return 0, err
+	}
+	return res.RowsAffected()
 }
 
 func (s *Store) CountUpdates() (int, error) {
@@ -228,6 +265,7 @@ func (s *Store) migrate() error {
 			status TEXT NOT NULL,
 			result TEXT NOT NULL DEFAULT '',
 			error TEXT NOT NULL DEFAULT '',
+			skip_reason TEXT NOT NULL DEFAULT '',
 			changed INTEGER NOT NULL DEFAULT 0,
 			started_at TIMESTAMP NOT NULL,
 			finished_at TIMESTAMP
@@ -235,6 +273,14 @@ func (s *Store) migrate() error {
 		CREATE INDEX IF NOT EXISTS idx_updates_repo_path_id ON updates(repo_path, id DESC);
 		CREATE INDEX IF NOT EXISTS idx_updates_id ON updates(id DESC);
 		CREATE INDEX IF NOT EXISTS idx_updates_changed_started_at ON updates(changed, started_at);
+	`)
+	if err != nil {
+		return err
+	}
+	if _, err := s.db.Exec(`ALTER TABLE updates ADD COLUMN skip_reason TEXT NOT NULL DEFAULT ''`); err != nil && !strings.Contains(err.Error(), "duplicate column name") {
+		return err
+	}
+	_, err = s.db.Exec(`
 		CREATE INDEX IF NOT EXISTS idx_updates_repo_changed_started_at ON updates(repo_path, changed, started_at);
 	`)
 	return err
@@ -245,7 +291,7 @@ func scanUpdates(rows *sql.Rows) ([]Update, error) {
 	for rows.Next() {
 		var u Update
 		var finishedAt sql.NullTime
-		if err := rows.Scan(&u.ID, &u.RepoPath, &u.RepoName, &u.Status, &u.Result, &u.Error, &u.Changed, &u.StartedAt, &finishedAt); err != nil {
+		if err := rows.Scan(&u.ID, &u.RepoPath, &u.RepoName, &u.Status, &u.Result, &u.Error, &u.SkipReason, &u.Changed, &u.StartedAt, &finishedAt); err != nil {
 			return nil, err
 		}
 		if finishedAt.Valid {
@@ -273,6 +319,19 @@ func isUpToDate(result string) bool {
 }
 
 func IsSkippedPullError(errText string) bool {
+	return SkipReasonFromPullError(errText) != ""
+}
+
+func SkipReasonFromPullError(errText string) string {
 	errText = strings.ToLower(strings.TrimSpace(errText))
-	return errText == "repository has changes" || errText == "repository has uncommitted changes"
+	switch {
+	case errText == "repository has changes", errText == "repository has uncommitted changes":
+		return "dirty_worktree"
+	case strings.HasPrefix(errText, "current branch ") && strings.Contains(errText, " is not default branch "):
+		return "not_default_branch"
+	case errText == "repository paused":
+		return "paused"
+	default:
+		return ""
+	}
 }

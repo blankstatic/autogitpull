@@ -40,6 +40,12 @@ func (sm *StorageManager) Load() error {
 	if cfg.Repositories == nil {
 		cfg.Repositories = []RepoInfo{}
 	}
+	if cfg.PullIntervalMinutes <= 0 {
+		cfg.PullIntervalMinutes = DefaultPullIntervalMinutes
+	}
+	if cfg.HistoryRetentionDays <= 0 {
+		cfg.HistoryRetentionDays = DefaultHistoryRetentionDays
+	}
 
 	sm.mu.Lock()
 	sm.config = &cfg
@@ -53,6 +59,10 @@ func (sm *StorageManager) Save() error {
 	sm.mu.RUnlock()
 
 	return sm.saveConfig(cfg)
+}
+
+func (sm *StorageManager) ConfigPath() string {
+	return sm.configPath
 }
 
 func (sm *StorageManager) saveConfig(cfg *Config) error {
@@ -92,7 +102,9 @@ func (sm *StorageManager) saveConfig(cfg *Config) error {
 
 func (sm *StorageManager) createDefaultConfig() error {
 	cfg := &Config{
-		Repositories: []RepoInfo{},
+		Repositories:         []RepoInfo{},
+		PullIntervalMinutes:  DefaultPullIntervalMinutes,
+		HistoryRetentionDays: DefaultHistoryRetentionDays,
 	}
 	if err := sm.saveConfig(cfg); err != nil {
 		return err
@@ -178,6 +190,64 @@ func (sm *StorageManager) UpdateRepo(path string, updates map[string]interface{}
 	return fmt.Errorf("repository not found: %s", path)
 }
 
+func (sm *StorageManager) GetConfig() Config {
+	sm.mu.RLock()
+	defer sm.mu.RUnlock()
+	return *cloneConfig(sm.config)
+}
+
+func (sm *StorageManager) SetPullIntervalMinutes(minutes int) error {
+	if minutes <= 0 {
+		return fmt.Errorf("pull interval must be positive")
+	}
+
+	sm.mu.Lock()
+	defer sm.mu.Unlock()
+
+	cfg := cloneConfig(sm.config)
+	cfg.PullIntervalMinutes = minutes
+	if err := sm.saveConfig(cfg); err != nil {
+		return err
+	}
+	sm.config = cfg
+	return nil
+}
+
+func (sm *StorageManager) SetHistoryRetentionDays(days int) error {
+	if days <= 0 {
+		return fmt.Errorf("history retention must be positive")
+	}
+
+	sm.mu.Lock()
+	defer sm.mu.Unlock()
+
+	cfg := cloneConfig(sm.config)
+	cfg.HistoryRetentionDays = days
+	if err := sm.saveConfig(cfg); err != nil {
+		return err
+	}
+	sm.config = cfg
+	return nil
+}
+
+func (sm *StorageManager) SetRepoPaused(path string, paused bool) error {
+	sm.mu.Lock()
+	defer sm.mu.Unlock()
+
+	cfg := cloneConfig(sm.config)
+	for i, repo := range cfg.Repositories {
+		if repo.Path == path {
+			cfg.Repositories[i].Paused = paused
+			if err := sm.saveConfig(cfg); err != nil {
+				return err
+			}
+			sm.config = cfg
+			return nil
+		}
+	}
+	return fmt.Errorf("repository not found: %s", path)
+}
+
 func (sm *StorageManager) UpdateLastSync(path string) error {
 	sm.mu.Lock()
 	defer sm.mu.Unlock()
@@ -221,9 +291,17 @@ func (sm *StorageManager) GetAllRepos() []RepoInfo {
 
 func cloneConfig(cfg *Config) *Config {
 	if cfg == nil {
-		return &Config{Repositories: []RepoInfo{}}
+		return &Config{Repositories: []RepoInfo{}, PullIntervalMinutes: DefaultPullIntervalMinutes, HistoryRetentionDays: DefaultHistoryRetentionDays}
 	}
 	repos := make([]RepoInfo, len(cfg.Repositories))
 	copy(repos, cfg.Repositories)
-	return &Config{Repositories: repos}
+	pullIntervalMinutes := cfg.PullIntervalMinutes
+	if pullIntervalMinutes <= 0 {
+		pullIntervalMinutes = DefaultPullIntervalMinutes
+	}
+	historyRetentionDays := cfg.HistoryRetentionDays
+	if historyRetentionDays <= 0 {
+		historyRetentionDays = DefaultHistoryRetentionDays
+	}
+	return &Config{Repositories: repos, PullIntervalMinutes: pullIntervalMinutes, HistoryRetentionDays: historyRetentionDays}
 }

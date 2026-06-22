@@ -5,6 +5,9 @@ import (
 	"net/url"
 	"testing"
 	"time"
+
+	"github.com/blankstatic/autogitpull/autogitpull_go/internal/config"
+	"github.com/blankstatic/autogitpull/autogitpull_go/internal/db"
 )
 
 func TestNewActivitySummaryCountsOnlyProvidedChangedTimes(t *testing.T) {
@@ -77,5 +80,43 @@ func TestEventFilterURLs(t *testing.T) {
 	}
 	if options["All"].Class != "filter-link active" || options["Changes"].Class != "filter-link" {
 		t.Fatalf("unexpected filter options: %+v", options)
+	}
+}
+
+func TestHumanizeNumber(t *testing.T) {
+	tests := map[int]string{
+		999:     "999",
+		1000:    "1k",
+		1500:    "1.5k",
+		100000:  "100k",
+		1250000: "1.2m",
+		-1200:   "-1.2k",
+	}
+	for input, want := range tests {
+		if got := humanizeNumber(input); got != want {
+			t.Fatalf("humanizeNumber(%d) = %q, want %q", input, got, want)
+		}
+	}
+}
+
+func TestRepoURLCanIncludeFilter(t *testing.T) {
+	if got := repoURL("/repo/a", eventFilterAll); got != "/repo?filter=all&path=/repo/a" {
+		t.Fatalf("unexpected repo url: %q", got)
+	}
+}
+
+func TestRepoCardsAttachLatestUpdate(t *testing.T) {
+	repos := []config.RepoInfo{{Path: "/repo/a", Name: "a"}, {Path: "/repo/b", Name: "b"}}
+	latest := map[string]db.Update{"/repo/a": {RepoPath: "/repo/a", Status: "error"}}
+
+	cards := repoCards(repos, latest)
+	if len(cards) != 2 {
+		t.Fatalf("expected 2 cards, got %d", len(cards))
+	}
+	if cards[0].LastUpdate == nil || cards[0].LastUpdate.Status != "error" {
+		t.Fatalf("expected latest update on first card: %+v", cards[0])
+	}
+	if cards[1].LastUpdate != nil {
+		t.Fatalf("expected no latest update on second card: %+v", cards[1])
 	}
 }
