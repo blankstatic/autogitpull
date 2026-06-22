@@ -83,7 +83,34 @@ func TestStoreRecordsSkippedDirtyRepo(t *testing.T) {
 	if len(updates) != 1 {
 		t.Fatalf("expected 1 update, got %d", len(updates))
 	}
-	if updates[0].Status != "skipped" || updates[0].Error != "repository has uncommitted changes" || updates[0].Changed {
+	if updates[0].Status != "skipped" || updates[0].Error != "repository has uncommitted changes" || updates[0].SkipReason != "dirty_worktree" || updates[0].Changed {
+		t.Fatalf("unexpected update: %+v", updates[0])
+	}
+}
+
+func TestStoreRecordsSkippedDefaultBranchReason(t *testing.T) {
+	store, err := Open(filepath.Join(t.TempDir(), "updates.sqlite"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+
+	id, err := store.BeginUpdate("/repo/path", "repo")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.FinishUpdate(id, "", errors.New("current branch feature is not default branch main")); err != nil {
+		t.Fatal(err)
+	}
+
+	updates, err := store.RepoUpdates("/repo/path", 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(updates) != 1 {
+		t.Fatalf("expected 1 update, got %d", len(updates))
+	}
+	if updates[0].Status != "skipped" || updates[0].SkipReason != "not_default_branch" {
 		t.Fatalf("unexpected update: %+v", updates[0])
 	}
 }
@@ -121,12 +148,107 @@ func TestChangedUpdateTimesSinceFiltersChangedRows(t *testing.T) {
 	}
 }
 
+func TestFilteredUpdatePagesAndCounts(t *testing.T) {
+	store, err := Open(filepath.Join(t.TempDir(), "updates.sqlite"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+
+	now := time.Date(2026, 6, 12, 12, 0, 0, 0, time.UTC)
+	insertUpdate(t, store, "/repo/a", "a", true, now)
+	insertUpdateWithStatus(t, store, "/repo/a", "a", "error", false, now.Add(time.Second))
+	insertUpdate(t, store, "/repo/b", "b", true, now.Add(2*time.Second))
+
+	total, err := store.CountUpdatesFiltered(UpdateFilter{ChangedOnly: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if total != 2 {
+		t.Fatalf("expected 2 changed updates, got %d", total)
+	}
+
+	updates, err := store.RecentUpdatesPageFiltered(10, 0, UpdateFilter{ChangedOnly: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(updates) != 2 || !updates[0].Changed || !updates[1].Changed {
+		t.Fatalf("unexpected filtered updates: %+v", updates)
+	}
+
+	repoTotal, err := store.CountRepoUpdatesFiltered("/repo/a", UpdateFilter{ChangedOnly: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if repoTotal != 1 {
+		t.Fatalf("expected 1 changed repo update, got %d", repoTotal)
+	}
+
+	repoUpdates, err := store.RepoUpdatesPageFiltered("/repo/a", 10, 0, UpdateFilter{ChangedOnly: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(repoUpdates) != 1 || !repoUpdates[0].Changed || repoUpdates[0].RepoPath != "/repo/a" {
+		t.Fatalf("unexpected filtered repo updates: %+v", repoUpdates)
+	}
+
+	errorUpdates, err := store.RecentUpdatesPageFiltered(10, 0, UpdateFilter{Status: "error"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(errorUpdates) != 1 || errorUpdates[0].Status != "error" {
+		t.Fatalf("unexpected status filtered updates: %+v", errorUpdates)
+	}
+}
+
+func TestLatestUpdatesByRepoAndDeleteBefore(t *testing.T) {
+	store, err := Open(filepath.Join(t.TempDir(), "updates.sqlite"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+
+	old := time.Date(2026, 1, 1, 12, 0, 0, 0, time.UTC)
+	recent := old.Add(24 * time.Hour)
+	insertUpdateWithStatus(t, store, "/repo/a", "a", "success", false, old)
+	insertUpdateWithStatus(t, store, "/repo/a", "a", "error", false, recent)
+	insertUpdateWithStatus(t, store, "/repo/b", "b", "skipped", false, recent)
+
+	latest, err := store.LatestUpdatesByRepo()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if latest["/repo/a"].Status != "error" || latest["/repo/b"].Status != "skipped" {
+		t.Fatalf("unexpected latest updates: %+v", latest)
+	}
+
+	deleted, err := store.DeleteUpdatesBefore(recent)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if deleted != 1 {
+		t.Fatalf("expected 1 deleted row, got %d", deleted)
+	}
+	total, err := store.CountUpdates()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if total != 2 {
+		t.Fatalf("expected 2 remaining rows, got %d", total)
+	}
+}
+
 func insertUpdate(t *testing.T, store *Store, repoPath, repoName string, changed bool, startedAt time.Time) {
+	t.Helper()
+	insertUpdateWithStatus(t, store, repoPath, repoName, "success", changed, startedAt)
+}
+
+func insertUpdateWithStatus(t *testing.T, store *Store, repoPath, repoName, status string, changed bool, startedAt time.Time) {
 	t.Helper()
 	_, err := store.db.Exec(`
 		INSERT INTO updates (repo_path, repo_name, status, result, changed, started_at, finished_at)
-		VALUES (?, ?, 'success', 'test', ?, ?, ?)
-	`, repoPath, repoName, changed, startedAt, startedAt.Add(time.Second))
+		VALUES (?, ?, ?, 'test', ?, ?, ?)
+	`, repoPath, repoName, status, changed, startedAt, startedAt.Add(time.Second))
 	if err != nil {
 		t.Fatal(err)
 	}

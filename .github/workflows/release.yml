@@ -32,7 +32,7 @@ jobs:
           APP_VERSION: ${{ github.event.release.tag_name || github.ref_name }}
         run: |
           cd autogitpull_go
-          GOOS=darwin GOARCH=arm64 go build -ldflags "-X github.com/blankstatic/autogitpull/autogitpull_go/internal/logic.AppVersion=${APP_VERSION}" -o autogitpull-macos-arm64 .
+          GOOS=darwin GOARCH=arm64 go build -ldflags "-X github.com/blankstatic/autogitpull/autogitpull_go/internal/version.AppVersion=${APP_VERSION}" -o autogitpull-macos-arm64 .
           chmod +x autogitpull-macos-arm64
           tar -czf autogitpull-macos-arm64.tar.gz autogitpull-macos-arm64
 
