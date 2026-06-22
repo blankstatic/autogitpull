@@ -1,6 +1,7 @@
 package web
 
 import (
+	"errors"
 	"net/http/httptest"
 	"net/url"
 	"testing"
@@ -69,13 +70,13 @@ func TestEventFilterURLs(t *testing.T) {
 		options[option.Label] = option
 	}
 
-	if options["Changes"].URL != "/repo?path=%2Frepo%2Fa" {
+	if options["Changes"].URL != "/repo?path=/repo/a#updates" {
 		t.Fatalf("unexpected changes url: %q", options["Changes"].URL)
 	}
-	if options["Error"].URL != "/repo?filter=error&path=%2Frepo%2Fa" {
+	if options["Error"].URL != "/repo?filter=error&path=/repo/a#updates" {
 		t.Fatalf("unexpected error url: %q", options["Error"].URL)
 	}
-	if options["All"].URL != "/repo?filter=all&path=%2Frepo%2Fa" {
+	if options["All"].URL != "/repo?filter=all&path=/repo/a#updates" {
 		t.Fatalf("unexpected all url: %q", options["All"].URL)
 	}
 	if options["All"].Class != "filter-link active" || options["Changes"].Class != "filter-link" {
@@ -102,6 +103,26 @@ func TestHumanizeNumber(t *testing.T) {
 func TestRepoURLCanIncludeFilter(t *testing.T) {
 	if got := repoURL("/repo/a", eventFilterAll); got != "/repo?filter=all&path=/repo/a" {
 		t.Fatalf("unexpected repo url: %q", got)
+	}
+}
+
+func TestFlashFromRequestUsesStatusClass(t *testing.T) {
+	req := httptest.NewRequest("GET", "/?flash=Pull+failed&flash_type=error", nil)
+
+	flash := flashFromRequest(req)
+	if flash.Text != "Pull failed" || flash.Class != "error" {
+		t.Fatalf("unexpected flash: %+v", flash)
+	}
+}
+
+func TestPullFlashUsesSkippedForDirtyWorktree(t *testing.T) {
+	err := errors.New("repository has uncommitted changes")
+
+	if got := pullFlashText(err); got != "Pull skipped: repository has uncommitted changes" {
+		t.Fatalf("unexpected flash text: %q", got)
+	}
+	if got := pullFlashType(err); got != "skipped" {
+		t.Fatalf("unexpected flash type: %q", got)
 	}
 }
 

@@ -248,6 +248,24 @@ func (sm *StorageManager) SetRepoPaused(path string, paused bool) error {
 	return fmt.Errorf("repository not found: %s", path)
 }
 
+func (sm *StorageManager) SetRepoNotify(path string, notify bool) error {
+	sm.mu.Lock()
+	defer sm.mu.Unlock()
+
+	cfg := cloneConfig(sm.config)
+	for i, repo := range cfg.Repositories {
+		if repo.Path == path {
+			cfg.Repositories[i].Notify = boolPtr(notify)
+			if err := sm.saveConfig(cfg); err != nil {
+				return err
+			}
+			sm.config = cfg
+			return nil
+		}
+	}
+	return fmt.Errorf("repository not found: %s", path)
+}
+
 func (sm *StorageManager) UpdateLastSync(path string) error {
 	sm.mu.Lock()
 	defer sm.mu.Unlock()
@@ -295,6 +313,12 @@ func cloneConfig(cfg *Config) *Config {
 	}
 	repos := make([]RepoInfo, len(cfg.Repositories))
 	copy(repos, cfg.Repositories)
+	for i := range repos {
+		if repos[i].Notify != nil {
+			notify := *repos[i].Notify
+			repos[i].Notify = &notify
+		}
+	}
 	pullIntervalMinutes := cfg.PullIntervalMinutes
 	if pullIntervalMinutes <= 0 {
 		pullIntervalMinutes = DefaultPullIntervalMinutes
@@ -304,4 +328,8 @@ func cloneConfig(cfg *Config) *Config {
 		historyRetentionDays = DefaultHistoryRetentionDays
 	}
 	return &Config{Repositories: repos, PullIntervalMinutes: pullIntervalMinutes, HistoryRetentionDays: historyRetentionDays}
+}
+
+func boolPtr(v bool) *bool {
+	return &v
 }

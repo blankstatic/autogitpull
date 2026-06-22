@@ -28,7 +28,7 @@ type Daemon struct {
 	wg          sync.WaitGroup
 	mu          sync.RWMutex
 	onPullStart func(repo *config.RepoInfo)
-	onPullDone  func(repo *config.RepoInfo, result string, err error)
+	onPullDone  func(repo *config.RepoInfo, result string, err error, notify bool)
 	updateStore *db.Store
 }
 
@@ -37,7 +37,7 @@ type Config struct {
 	ConfigPath  string
 	Storage     *config.StorageManager
 	OnPullStart func(repo *config.RepoInfo)
-	OnPullDone  func(repo *config.RepoInfo, result string, err error)
+	OnPullDone  func(repo *config.RepoInfo, result string, err error, notify bool)
 	UpdateStore *db.Store
 }
 
@@ -113,7 +113,7 @@ func (d *Daemon) IsRunning() bool {
 func (d *Daemon) run() {
 	defer d.wg.Done()
 
-	d.pullAllRepos()
+	d.pullAllRepos(false)
 
 	for {
 		interval := d.currentInterval()
@@ -121,7 +121,7 @@ func (d *Daemon) run() {
 		timer := time.NewTimer(interval)
 		select {
 		case <-timer.C:
-			d.pullAllRepos()
+			d.pullAllRepos(true)
 		case <-d.stopChan:
 			if !timer.Stop() {
 				select {
@@ -143,7 +143,7 @@ func (d *Daemon) currentInterval() time.Duration {
 	return d.interval
 }
 
-func (d *Daemon) pullAllRepos() {
+func (d *Daemon) pullAllRepos(notify bool) {
 	startedAt := time.Now()
 	web.SetDaemonRunStarted(startedAt)
 	defer func() {
@@ -169,13 +169,13 @@ func (d *Daemon) pullAllRepos() {
 		wg.Add(1)
 		go func(repo *config.RepoInfo) {
 			defer wg.Done()
-			d.pullRepo(repo)
+			d.pullRepo(repo, notify)
 		}(&repos[i])
 	}
 	wg.Wait()
 }
 
-func (d *Daemon) pullRepo(repo *config.RepoInfo) {
+func (d *Daemon) pullRepo(repo *config.RepoInfo, notify bool) {
 	web.SetDaemonRepoRunning(repo.Name, true)
 	defer web.SetDaemonRepoRunning(repo.Name, false)
 
@@ -202,7 +202,7 @@ func (d *Daemon) pullRepo(repo *config.RepoInfo) {
 	}
 
 	if d.onPullDone != nil {
-		d.onPullDone(repo, result, err)
+		d.onPullDone(repo, result, err, notify)
 	}
 
 	if err == nil {
@@ -321,13 +321,15 @@ func DaemonCommandHandler(cmd *cobra.Command, args []string) {
 		OnPullStart: func(repo *config.RepoInfo) {
 			slog.Info("Pulling repository", slog.String("repo", repo.Name))
 		},
-		OnPullDone: func(repo *config.RepoInfo, result string, err error) {
+		OnPullDone: func(repo *config.RepoInfo, result string, err error, notify bool) {
 			if err != nil {
 				slog.Warn("Failed to pull", slog.String("repo", repo.Name), slog.String("err", err.Error()))
-				notifyDaemonPullError(repo, err)
+				if notify {
+					notifyDaemonPullError(repo, err)
+				}
 			} else {
 				slog.Info("Successfully pulled", slog.String("repo", repo.Name))
-				if !strings.Contains(result, "up to date") {
+				if notify && repo.NotificationsEnabled() && !strings.Contains(result, "up to date") {
 					notifyURL := "http://localhost:9009/repo?path=" + url.QueryEscape(repo.Path)
 					go func() {
 						if notifyErr := notifications.OSNotifyURL(config.AppName, fmt.Sprintf("Pulled: %s", repo.Name), result, notifyURL); notifyErr != nil {
@@ -367,6 +369,9 @@ func DaemonCommandHandler(cmd *cobra.Command, args []string) {
 }
 
 func notifyDaemonPullError(repo *config.RepoInfo, pullErr error) {
+	if !repo.NotificationsEnabled() {
+		return
+	}
 	key := repo.Path + "\x00" + pullErr.Error()
 	now := time.Now()
 

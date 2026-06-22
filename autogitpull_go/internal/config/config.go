@@ -28,6 +28,11 @@ type RepoInfo struct {
 	AddedAt       time.Time `json:"added_at"`
 	LastSync      time.Time `json:"last_sync"`
 	Paused        bool      `json:"paused,omitempty"`
+	Notify        *bool     `json:"notify,omitempty"`
+}
+
+func (r RepoInfo) NotificationsEnabled() bool {
+	return r.Notify == nil || *r.Notify
 }
 
 func (c Config) HistoryRetention() time.Duration {
