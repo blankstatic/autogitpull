@@ -68,10 +68,6 @@ func (sm *StorageManager) Save() error {
 	return sm.saveConfig(db, cfg)
 }
 
-func (sm *StorageManager) ConfigPath() string {
-	return sm.dbPath
-}
-
 func (sm *StorageManager) AddRepo(path string) error {
 	name := filepath.Base(path)
 

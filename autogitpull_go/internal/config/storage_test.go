@@ -1,11 +1,14 @@
 package config
 
 import (
+	"database/sql"
 	"encoding/json"
 	"os"
 	"path/filepath"
 	"testing"
 	"time"
+
+	_ "github.com/mattn/go-sqlite3"
 )
 
 func TestLoadCreatesDefaultConfig(t *testing.T) {
@@ -149,6 +152,77 @@ func TestLoadMigratesLegacyConfigJSON(t *testing.T) {
 	}
 	if got := sm.GetConfig().PullIntervalMinutes; got != 7 {
 		t.Fatalf("expected migrated pull interval 7, got %d", got)
+	}
+}
+
+func TestLoadMigratesLegacyConfigIntoExistingUpdatesDatabase(t *testing.T) {
+	dir := t.TempDir()
+	configPath := filepath.Join(dir, "config.json")
+	dbPath := filepath.Join(dir, UpdatesDBFilename)
+
+	oldDB, err := sql.Open("sqlite3", dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := oldDB.Exec(`
+		CREATE TABLE updates (id INTEGER PRIMARY KEY, repo_path TEXT NOT NULL);
+		INSERT INTO updates (repo_path) VALUES ('/repo/history');
+	`); err != nil {
+		t.Fatal(err)
+	}
+	if err := oldDB.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	notify := false
+	legacy := Config{
+		Repositories: []RepoInfo{{
+			Path:          "/repo/legacy",
+			Name:          "legacy",
+			DefaultBranch: "main",
+			AddedAt:       time.Now(),
+			LastSync:      time.Now(),
+			Paused:        true,
+			Notify:        &notify,
+		}},
+		PullIntervalMinutes:  7,
+		HistoryRetentionDays: 30,
+	}
+	data, err := json.Marshal(legacy)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(configPath, data, 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	sm := NewStorageManager(configPath)
+	if err := sm.Load(); err != nil {
+		t.Fatal(err)
+	}
+
+	repo, err := sm.GetRepo("/repo/legacy")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !repo.Paused || repo.NotificationsEnabled() {
+		t.Fatalf("expected paused repo with muted notifications, got %+v", repo)
+	}
+	if got := sm.GetConfig().HistoryRetentionDays; got != 30 {
+		t.Fatalf("expected migrated retention 30, got %d", got)
+	}
+
+	checkDB, err := sql.Open("sqlite3", dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer checkDB.Close()
+	var historyCount int
+	if err := checkDB.QueryRow(`SELECT COUNT(*) FROM updates WHERE repo_path = '/repo/history'`).Scan(&historyCount); err != nil {
+		t.Fatal(err)
+	}
+	if historyCount != 1 {
+		t.Fatalf("expected existing update history to survive migration, got %d rows", historyCount)
 	}
 }
 

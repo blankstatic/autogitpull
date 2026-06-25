@@ -12,10 +12,6 @@ var InfoIcon []byte
 //go:embed assets/warning.png
 var WarningIcon []byte
 
-func OSNotify(appName, title, body string) error {
-	return OSNotifyURL(appName, title, body, "")
-}
-
 func OSNotifyURL(appName, title, body, openURL string) error {
 	if err := customNotify(title, body, openURL); err == nil {
 		return nil

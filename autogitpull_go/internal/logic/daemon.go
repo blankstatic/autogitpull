@@ -33,7 +33,6 @@ type Daemon struct {
 
 type Config struct {
 	Interval    time.Duration
-	ConfigPath  string
 	Storage     *config.StorageManager
 	OnPullStart func(repo *config.RepoInfo)
 	OnPullDone  func(repo *config.RepoInfo, result string, err error, notify bool)
@@ -47,7 +46,11 @@ func NewDaemon(cfg Config) (*Daemon, error) {
 
 	storage := cfg.Storage
 	if storage == nil {
-		storage = config.NewStorageManager(cfg.ConfigPath)
+		configPath, err := config.GetConfigPath()
+		if err != nil {
+			return nil, err
+		}
+		storage = config.NewStorageManager(configPath)
 		if err := storage.Load(); err != nil {
 			return nil, err
 		}
@@ -309,7 +312,6 @@ func DaemonCommandHandler(cmd *cobra.Command, args []string) {
 
 	d, err := NewDaemon(Config{
 		Interval:    interval,
-		ConfigPath:  configPath,
 		Storage:     storage,
 		UpdateStore: updateStore,
 		OnPullStart: func(repo *config.RepoInfo) {
