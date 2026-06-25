@@ -530,10 +530,6 @@ func handleUnregisterRepo(path string) error {
 		return err
 	}
 
-	if !isSilentlyLocal {
-		notifyAsync("Unregister", path, "")
-	}
-
 	return nil
 }
 

@@ -213,7 +213,6 @@ func (s *Server) index(w http.ResponseWriter, r *http.Request) {
 		"Pagination":    newPagination(r.URL.Path, filterQueryValues(filter), page, totalUpdates),
 		"EventFilter":   newEventFilter(r.URL.Path, nil, filter),
 		"DBPath":        dbPath,
-		"ConfigPath":    s.storage.ConfigPath(),
 		"ServiceStatus": serviceStatus,
 		"ServiceLabel":  serviceLabel,
 		"AppVersion":    versionpkg.AppVersion,
@@ -1210,6 +1209,8 @@ var baseCSS = template.CSS(`
 	.badge.service-running { background: #dafbe1; border-color: #aceebb; color: #116329; }
 	.badge.service-stopped { background: #ffebe9; border-color: #ffcecb; color: var(--danger); }
 	.badge.service-loaded { background: #ddf4ff; border-color: #b6e3ff; color: var(--accent); }
+	.changed-icon { display: inline-flex; align-items: center; justify-content: center; width: 24px; height: 24px; color: #116329; font-size: 16px; font-weight: 800; }
+	.changed-icon.empty { color: var(--muted); font-weight: 600; }
 	.time { white-space: nowrap; }
 	.time-detail { color: var(--muted); font-size: 12px; margin-top: 2px; white-space: nowrap; }
 	.empty { color: var(--muted); padding: 18px; }
@@ -1244,12 +1245,6 @@ var templateFuncs = template.FuncMap{
 		default:
 			return ""
 		}
-	},
-	"changedText": func(changed bool) string {
-		if changed {
-			return "yes"
-		}
-		return "no"
 	},
 	"formatTime": func(t time.Time) string {
 		if t.IsZero() {
@@ -1323,7 +1318,7 @@ var indexTemplate = template.Must(template.New("index").Funcs(templateFuncs).Par
 {{range .Updates}}<tr><td><div class="time">{{humanTime .StartedAt}}</div><div class="time-detail">{{formatTime .StartedAt}}</div></td><td><a href="/repo?path={{.RepoPath | urlquery}}">{{.RepoName}}</a><div class="path" title="{{.RepoPath}}">{{compactPath .RepoPath}}</div></td><td><span class="badge {{statusClass .Status}}">{{.Status}}</span></td><td><pre>{{if .Error}}{{.Error}}{{else}}{{.Result | firstLine}}{{end}}</pre></td></tr>{{end}}
 </table>{{template "pagination" .Pagination}}{{else}}<div class="empty">No updates match this filter.</div>{{end}}</section>
 </div>
-</main><footer>version {{.AppVersion}} · config <span class="path">{{compactPath .ConfigPath}}</span> · db <span class="path">{{compactPath .DBPath}}</span> · service {{.ServiceLabel}}</footer><script>
+</main><footer>version {{.AppVersion}}</footer><script>
 (function(){
   const search = document.getElementById('repo-search');
   const list = document.getElementById('repo-list');
@@ -1400,7 +1395,7 @@ var repoTemplate = template.Must(template.New("repo").Funcs(templateFuncs).Parse
 <section class="panel" id="changes"><div class="panel-head"><h2><a class="panel-title" href="#changes">Current local changes</a></h2></div><div class="panel-body">{{if .ChangedFiles}}<table><tr><th>Status</th><th>File</th></tr>{{range .ChangedFiles}}<tr><td><span class="badge paused">{{.Status}}</span></td><td><span class="path">{{.Path}}</span></td></tr>{{end}}</table>{{else}}<div class="empty">No uncommitted changes</div>{{end}}</div></section>
 <section class="panel" id="updates"><div class="panel-head"><h2><a class="panel-title" href="#updates">Updates</a></h2><div class="filter">{{range .EventFilter.Options}}<a class="{{.Class}}" href="{{.URL}}">{{.Label}}</a>{{end}}</div></div>
 {{if .Updates}}<table><tr><th>Time</th><th>Status</th><th>Changed</th><th>Result</th></tr>
-{{range .Updates}}<tr><td><div class="time">{{humanTime .StartedAt}}</div><div class="time-detail">{{formatTime .StartedAt}}</div></td><td><span class="badge {{statusClass .Status}}">{{.Status}}</span>{{if .SkipReason}}<div class="time-detail">{{skipReasonLabel .SkipReason}}</div>{{end}}</td><td>{{changedText .Changed}}</td><td><pre>{{if .Error}}{{.Error}}{{else}}{{.Result}}{{end}}</pre></td></tr>{{end}}
+{{range .Updates}}<tr><td><div class="time">{{humanTime .StartedAt}}</div><div class="time-detail">{{formatTime .StartedAt}}</div></td><td><span class="badge {{statusClass .Status}}">{{.Status}}</span>{{if .SkipReason}}<div class="time-detail">{{skipReasonLabel .SkipReason}}</div>{{end}}</td><td>{{if .Changed}}<span class="changed-icon" title="Changed" aria-label="Changed">&#10003;</span>{{else}}<span class="changed-icon empty" title="No changes" aria-label="No changes">-</span>{{end}}</td><td><pre>{{if .Error}}{{.Error}}{{else}}{{.Result}}{{end}}</pre></td></tr>{{end}}
 </table>{{template "pagination" .Pagination}}{{else}}<div class="empty">No updates match this filter.</div>{{end}}</section>
 </main><script>document.querySelectorAll('form').forEach(form => form.addEventListener('submit', () => { const b = document.activeElement; if (b && b.tagName === 'BUTTON') b.textContent = 'Working...'; }));</script></body></html>
 

@@ -6,7 +6,6 @@ import (
 	"net/url"
 	"os"
 	"os/signal"
-	"strings"
 	"sync"
 	"syscall"
 	"time"
@@ -40,11 +39,6 @@ type Config struct {
 	OnPullDone  func(repo *config.RepoInfo, result string, err error, notify bool)
 	UpdateStore *db.Store
 }
-
-var daemonErrorNotifications = struct {
-	sync.Mutex
-	lastSent map[string]time.Time
-}{lastSent: map[string]time.Time{}}
 
 func NewDaemon(cfg Config) (*Daemon, error) {
 	if cfg.Interval <= 0 {
@@ -324,12 +318,9 @@ func DaemonCommandHandler(cmd *cobra.Command, args []string) {
 		OnPullDone: func(repo *config.RepoInfo, result string, err error, notify bool) {
 			if err != nil {
 				slog.Warn("Failed to pull", slog.String("repo", repo.Name), slog.String("err", err.Error()))
-				if notify {
-					notifyDaemonPullError(repo, err)
-				}
 			} else {
 				slog.Info("Successfully pulled", slog.String("repo", repo.Name))
-				if notify && repo.NotificationsEnabled() && !strings.Contains(result, "up to date") {
+				if notify && repo.NotificationsEnabled() && db.IsChangedPullResult(result) {
 					notifyURL := "http://localhost:9009/repo?path=" + url.QueryEscape(repo.Path)
 					go func() {
 						if notifyErr := notifications.OSNotifyURL(config.AppName, fmt.Sprintf("Pulled: %s", repo.Name), result, notifyURL); notifyErr != nil {
@@ -366,28 +357,4 @@ func DaemonCommandHandler(cmd *cobra.Command, args []string) {
 	d.Stop()
 	slog.Warn("Daemon stopped")
 
-}
-
-func notifyDaemonPullError(repo *config.RepoInfo, pullErr error) {
-	if !repo.NotificationsEnabled() {
-		return
-	}
-	key := repo.Path + "\x00" + pullErr.Error()
-	now := time.Now()
-
-	daemonErrorNotifications.Lock()
-	lastSent := daemonErrorNotifications.lastSent[key]
-	if !lastSent.IsZero() && now.Sub(lastSent) < time.Hour {
-		daemonErrorNotifications.Unlock()
-		return
-	}
-	daemonErrorNotifications.lastSent[key] = now
-	daemonErrorNotifications.Unlock()
-
-	notifyURL := "http://localhost:9009/repo?path=" + url.QueryEscape(repo.Path)
-	go func() {
-		if notifyErr := notifications.OSNotifyURL(config.AppName, fmt.Sprintf("%s pull failed", repo.Name), pullErr.Error(), notifyURL); notifyErr != nil {
-			slog.Error("failed to send pull error notification", slog.String("repo", repo.Name), slog.String("err", notifyErr.Error()))
-		}
-	}()
 }

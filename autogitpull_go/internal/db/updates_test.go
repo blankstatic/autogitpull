@@ -34,6 +34,18 @@ func TestStoreRecordsUpdate(t *testing.T) {
 	}
 }
 
+func TestIsChangedPullResult(t *testing.T) {
+	if !IsChangedPullResult("Updating abc..def\nFast-forward") {
+		t.Fatal("expected pull result with output to be changed")
+	}
+	if IsChangedPullResult("Already up to date.") {
+		t.Fatal("expected up-to-date result not to be changed")
+	}
+	if IsChangedPullResult("   ") {
+		t.Fatal("expected blank result not to be changed")
+	}
+}
+
 func TestStoreRecordsError(t *testing.T) {
 	store, err := Open(filepath.Join(t.TempDir(), "updates.sqlite"))
 	if err != nil {

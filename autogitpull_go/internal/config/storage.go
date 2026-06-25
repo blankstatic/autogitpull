@@ -1,118 +1,75 @@
 package config
 
 import (
+	"database/sql"
 	"encoding/json"
 	"fmt"
 	"os"
 	"path/filepath"
+	"strconv"
 	"sync"
 	"time"
+
+	_ "github.com/mattn/go-sqlite3"
 
 	"github.com/blankstatic/autogitpull/autogitpull_go/pkg/git"
 )
 
 type StorageManager struct {
-	configPath string
-	config     *Config
-	mu         sync.RWMutex
+	dbPath           string
+	legacyConfigPath string
+	mu               sync.Mutex
 }
 
 func NewStorageManager(configPath string) *StorageManager {
 	return &StorageManager{
-		configPath: configPath,
-		config:     &Config{},
+		dbPath:           storageDBPath(configPath),
+		legacyConfigPath: configPath,
 	}
+}
+
+func storageDBPath(configPath string) string {
+	if filepath.Base(configPath) == ConfigFilename {
+		return filepath.Join(filepath.Dir(configPath), UpdatesDBFilename)
+	}
+	return configPath
 }
 
 func (sm *StorageManager) Load() error {
-	data, err := os.ReadFile(sm.configPath)
-	if err != nil {
-		if os.IsNotExist(err) {
-			return sm.createDefaultConfig()
-		}
-		return err
-	}
-
-	var cfg Config
-	if err := json.Unmarshal(data, &cfg); err != nil {
-		return err
-	}
-	if cfg.Repositories == nil {
-		cfg.Repositories = []RepoInfo{}
-	}
-	if cfg.PullIntervalMinutes <= 0 {
-		cfg.PullIntervalMinutes = DefaultPullIntervalMinutes
-	}
-	if cfg.HistoryRetentionDays <= 0 {
-		cfg.HistoryRetentionDays = DefaultHistoryRetentionDays
-	}
-
 	sm.mu.Lock()
-	sm.config = &cfg
-	sm.mu.Unlock()
-	return nil
+	defer sm.mu.Unlock()
+
+	db, err := sm.open()
+	if err != nil {
+		return err
+	}
+	defer db.Close()
+
+	if err := sm.ensureDefaults(db); err != nil {
+		return err
+	}
+	return sm.migrateLegacyConfig(db)
 }
 
 func (sm *StorageManager) Save() error {
-	sm.mu.RLock()
-	cfg := cloneConfig(sm.config)
-	sm.mu.RUnlock()
+	sm.mu.Lock()
+	defer sm.mu.Unlock()
 
-	return sm.saveConfig(cfg)
+	db, err := sm.open()
+	if err != nil {
+		return err
+	}
+	defer db.Close()
+
+	cfg, err := sm.loadConfig(db)
+	if err != nil {
+		return err
+	}
+	return sm.saveConfig(db, cfg)
 }
 
 func (sm *StorageManager) ConfigPath() string {
-	return sm.configPath
-}
-
-func (sm *StorageManager) saveConfig(cfg *Config) error {
-	data, err := json.MarshalIndent(cfg, "", "  ")
-	if err != nil {
-		return err
-	}
-
-	dir := filepath.Dir(sm.configPath)
-	if err := os.MkdirAll(dir, 0755); err != nil {
-		return err
-	}
-
-	tmp, err := os.CreateTemp(dir, filepath.Base(sm.configPath)+".tmp-*")
-	if err != nil {
-		return err
-	}
-	tmpPath := tmp.Name()
-	defer os.Remove(tmpPath)
-
-	if _, err := tmp.Write(data); err != nil {
-		_ = tmp.Close()
-		return err
-	}
-	if err := tmp.Sync(); err != nil {
-		_ = tmp.Close()
-		return err
-	}
-	if err := tmp.Close(); err != nil {
-		return err
-	}
-	if err := os.Chmod(tmpPath, 0644); err != nil {
-		return err
-	}
-	return os.Rename(tmpPath, sm.configPath)
-}
-
-func (sm *StorageManager) createDefaultConfig() error {
-	cfg := &Config{
-		Repositories:         []RepoInfo{},
-		PullIntervalMinutes:  DefaultPullIntervalMinutes,
-		HistoryRetentionDays: DefaultHistoryRetentionDays,
-	}
-	if err := sm.saveConfig(cfg); err != nil {
-		return err
-	}
-	sm.mu.Lock()
-	sm.config = cfg
-	sm.mu.Unlock()
-	return nil
+	return sm.dbPath
 }
 
 func (sm *StorageManager) AddRepo(path string) error {
@@ -123,7 +80,7 @@ func (sm *StorageManager) AddRepo(path string) error {
 		return fmt.Errorf("remote default branch not detected: %s", path)
 	}
 
-	newRepo := RepoInfo{
+	repo := RepoInfo{
 		Path:          path,
 		Name:          name,
 		DefaultBranch: defaultBranch,
@@ -134,17 +91,26 @@ func (sm *StorageManager) AddRepo(path string) error {
 	sm.mu.Lock()
 	defer sm.mu.Unlock()
 
-	cfg := cloneConfig(sm.config)
-	for _, repo := range cfg.Repositories {
-		if repo.Path == path {
-			return fmt.Errorf("repo already added: %s", path)
-		}
-	}
-	cfg.Repositories = append(cfg.Repositories, newRepo)
-	if err := sm.saveConfig(cfg); err != nil {
+	db, err := sm.open()
+	if err != nil {
 		return err
 	}
-	sm.config = cfg
+	defer db.Close()
+
+	res, err := db.Exec(`
+		INSERT OR IGNORE INTO repositories (path, name, default_branch, added_at, last_sync, paused, notify)
+		VALUES (?, ?, ?, ?, ?, 0, NULL)
+	`, repo.Path, repo.Name, repo.DefaultBranch, formatDBTime(repo.AddedAt), formatDBTime(repo.LastSync))
+	if err != nil {
+		return err
+	}
+	affected, err := res.RowsAffected()
+	if err != nil {
+		return err
+	}
+	if affected == 0 {
+		return fmt.Errorf("repo already added: %s", path)
+	}
 	return nil
 }
 
@@ -152,164 +118,427 @@ func (sm *StorageManager) RemoveRepo(path string) error {
 	sm.mu.Lock()
 	defer sm.mu.Unlock()
 
-	cfg := cloneConfig(sm.config)
-
-	for i, repo := range cfg.Repositories {
-		if repo.Path == path {
-			cfg.Repositories = append(cfg.Repositories[:i],
-				cfg.Repositories[i+1:]...)
-			if err := sm.saveConfig(cfg); err != nil {
-				return err
-			}
-			sm.config = cfg
-			return nil
-		}
+	db, err := sm.open()
+	if err != nil {
+		return err
 	}
-	return fmt.Errorf("repository not found: %s", path)
+	defer db.Close()
+
+	res, err := db.Exec(`DELETE FROM repositories WHERE path = ?`, path)
+	if err != nil {
+		return err
+	}
+	affected, err := res.RowsAffected()
+	if err != nil {
+		return err
+	}
+	if affected == 0 {
+		return fmt.Errorf("repository not found: %s", path)
+	}
+	return nil
 }
 
 func (sm *StorageManager) UpdateRepo(path string, updates map[string]interface{}) error {
 	sm.mu.Lock()
 	defer sm.mu.Unlock()
 
-	cfg := cloneConfig(sm.config)
-
-	for i, repo := range cfg.Repositories {
-		if repo.Path == path {
-			if name, ok := updates["name"].(string); ok {
-				cfg.Repositories[i].Name = name
-			}
-			cfg.Repositories[i].LastSync = time.Now()
-			if err := sm.saveConfig(cfg); err != nil {
-				return err
-			}
-			sm.config = cfg
-			return nil
-		}
+	db, err := sm.open()
+	if err != nil {
+		return err
 	}
-	return fmt.Errorf("repository not found: %s", path)
+	defer db.Close()
+
+	name, rename := updates["name"].(string)
+	var res sql.Result
+	if rename {
+		res, err = db.Exec(`UPDATE repositories SET name = ?, last_sync = ? WHERE path = ?`, name, formatDBTime(time.Now()), path)
+	} else {
+		res, err = db.Exec(`UPDATE repositories SET last_sync = ? WHERE path = ?`, formatDBTime(time.Now()), path)
+	}
+	if err != nil {
+		return err
+	}
+	return requireAffected(res, path)
 }
 
 func (sm *StorageManager) GetConfig() Config {
-	sm.mu.RLock()
-	defer sm.mu.RUnlock()
-	return *cloneConfig(sm.config)
+	sm.mu.Lock()
+	defer sm.mu.Unlock()
+
+	db, err := sm.open()
+	if err != nil {
+		return defaultConfig()
+	}
+	defer db.Close()
+
+	cfg, err := sm.loadConfig(db)
+	if err != nil {
+		return defaultConfig()
+	}
+	return *cfg
 }
 
 func (sm *StorageManager) SetPullIntervalMinutes(minutes int) error {
 	if minutes <= 0 {
 		return fmt.Errorf("pull interval must be positive")
 	}
-
-	sm.mu.Lock()
-	defer sm.mu.Unlock()
-
-	cfg := cloneConfig(sm.config)
-	cfg.PullIntervalMinutes = minutes
-	if err := sm.saveConfig(cfg); err != nil {
-		return err
-	}
-	sm.config = cfg
-	return nil
+	return sm.setSetting("pull_interval_minutes", strconv.Itoa(minutes))
 }
 
 func (sm *StorageManager) SetHistoryRetentionDays(days int) error {
 	if days <= 0 {
 		return fmt.Errorf("history retention must be positive")
 	}
-
-	sm.mu.Lock()
-	defer sm.mu.Unlock()
-
-	cfg := cloneConfig(sm.config)
-	cfg.HistoryRetentionDays = days
-	if err := sm.saveConfig(cfg); err != nil {
-		return err
-	}
-	sm.config = cfg
-	return nil
+	return sm.setSetting("history_retention_days", strconv.Itoa(days))
 }
 
 func (sm *StorageManager) SetRepoPaused(path string, paused bool) error {
 	sm.mu.Lock()
 	defer sm.mu.Unlock()
 
-	cfg := cloneConfig(sm.config)
-	for i, repo := range cfg.Repositories {
-		if repo.Path == path {
-			cfg.Repositories[i].Paused = paused
-			if err := sm.saveConfig(cfg); err != nil {
-				return err
-			}
-			sm.config = cfg
-			return nil
-		}
+	db, err := sm.open()
+	if err != nil {
+		return err
 	}
-	return fmt.Errorf("repository not found: %s", path)
+	defer db.Close()
+
+	res, err := db.Exec(`UPDATE repositories SET paused = ? WHERE path = ?`, boolToInt(paused), path)
+	if err != nil {
+		return err
+	}
+	return requireAffected(res, path)
 }
 
 func (sm *StorageManager) SetRepoNotify(path string, notify bool) error {
 	sm.mu.Lock()
 	defer sm.mu.Unlock()
 
-	cfg := cloneConfig(sm.config)
-	for i, repo := range cfg.Repositories {
-		if repo.Path == path {
-			cfg.Repositories[i].Notify = boolPtr(notify)
-			if err := sm.saveConfig(cfg); err != nil {
-				return err
-			}
-			sm.config = cfg
-			return nil
-		}
+	db, err := sm.open()
+	if err != nil {
+		return err
 	}
-	return fmt.Errorf("repository not found: %s", path)
+	defer db.Close()
+
+	res, err := db.Exec(`UPDATE repositories SET notify = ? WHERE path = ?`, boolToInt(notify), path)
+	if err != nil {
+		return err
+	}
+	return requireAffected(res, path)
 }
 
 func (sm *StorageManager) UpdateLastSync(path string) error {
 	sm.mu.Lock()
 	defer sm.mu.Unlock()
 
-	cfg := cloneConfig(sm.config)
-
-	for i, repo := range cfg.Repositories {
-		if repo.Path == path {
-			cfg.Repositories[i].LastSync = time.Now()
-			if err := sm.saveConfig(cfg); err != nil {
-				return err
-			}
-			sm.config = cfg
-			return nil
-		}
+	db, err := sm.open()
+	if err != nil {
+		return err
 	}
-	return fmt.Errorf("repository not found: %s", path)
+	defer db.Close()
+
+	res, err := db.Exec(`UPDATE repositories SET last_sync = ? WHERE path = ?`, formatDBTime(time.Now()), path)
+	if err != nil {
+		return err
+	}
+	return requireAffected(res, path)
 }
 
 func (sm *StorageManager) GetRepo(path string) (*RepoInfo, error) {
-	sm.mu.RLock()
-	defer sm.mu.RUnlock()
+	sm.mu.Lock()
+	defer sm.mu.Unlock()
 
-	for _, repo := range sm.config.Repositories {
-		if repo.Path == path {
-			repoCopy := repo
-			return &repoCopy, nil
-		}
+	db, err := sm.open()
+	if err != nil {
+		return nil, err
 	}
-	return nil, fmt.Errorf("repository not found: %s", path)
+	defer db.Close()
+
+	repo, err := scanRepo(db.QueryRow(`
+		SELECT path, name, default_branch, added_at, last_sync, paused, notify
+		FROM repositories
+		WHERE path = ?
+	`, path))
+	if err == sql.ErrNoRows {
+		return nil, fmt.Errorf("repository not found: %s", path)
+	}
+	return repo, err
 }
 
 func (sm *StorageManager) GetAllRepos() []RepoInfo {
-	sm.mu.RLock()
-	defer sm.mu.RUnlock()
+	sm.mu.Lock()
+	defer sm.mu.Unlock()
 
-	repos := make([]RepoInfo, len(sm.config.Repositories))
-	copy(repos, sm.config.Repositories)
+	db, err := sm.open()
+	if err != nil {
+		return []RepoInfo{}
+	}
+	defer db.Close()
+
+	repos, err := sm.loadRepos(db)
+	if err != nil {
+		return []RepoInfo{}
+	}
 	return repos
+}
+
+func (sm *StorageManager) setSetting(key, value string) error {
+	sm.mu.Lock()
+	defer sm.mu.Unlock()
+
+	db, err := sm.open()
+	if err != nil {
+		return err
+	}
+	defer db.Close()
+
+	_, err = db.Exec(`
+		INSERT INTO settings (key, value) VALUES (?, ?)
+		ON CONFLICT(key) DO UPDATE SET value = excluded.value
+	`, key, value)
+	return err
+}
+
+func (sm *StorageManager) open() (*sql.DB, error) {
+	if err := os.MkdirAll(filepath.Dir(sm.dbPath), 0755); err != nil {
+		return nil, err
+	}
+	db, err := sql.Open("sqlite3", sm.dbPath)
+	if err != nil {
+		return nil, err
+	}
+	db.SetMaxOpenConns(1)
+	if _, err := db.Exec("PRAGMA busy_timeout = 5000"); err != nil {
+		_ = db.Close()
+		return nil, err
+	}
+	if err := sm.migrate(db); err != nil {
+		_ = db.Close()
+		return nil, err
+	}
+	return db, nil
+}
+
+func (sm *StorageManager) migrate(db *sql.DB) error {
+	_, err := db.Exec(`
+		CREATE TABLE IF NOT EXISTS repositories (
+			path TEXT PRIMARY KEY,
+			name TEXT NOT NULL,
+			default_branch TEXT NOT NULL,
+			added_at TEXT NOT NULL,
+			last_sync TEXT NOT NULL,
+			paused INTEGER NOT NULL DEFAULT 0,
+			notify INTEGER NULL
+		);
+		CREATE TABLE IF NOT EXISTS settings (
+			key TEXT PRIMARY KEY,
+			value TEXT NOT NULL
+		);
+	`)
+	return err
+}
+
+func (sm *StorageManager) ensureDefaults(db *sql.DB) error {
+	if err := sm.ensureSetting(db, "pull_interval_minutes", strconv.Itoa(DefaultPullIntervalMinutes)); err != nil {
+		return err
+	}
+	return sm.ensureSetting(db, "history_retention_days", strconv.Itoa(DefaultHistoryRetentionDays))
+}
+
+func (sm *StorageManager) ensureSetting(db *sql.DB, key, value string) error {
+	_, err := db.Exec(`INSERT OR IGNORE INTO settings (key, value) VALUES (?, ?)`, key, value)
+	return err
+}
+
+func (sm *StorageManager) migrateLegacyConfig(db *sql.DB) error {
+	if filepath.Base(sm.legacyConfigPath) != ConfigFilename {
+		return nil
+	}
+	migrated, err := sm.hasSetting(db, "legacy_config_migrated")
+	if err != nil {
+		return err
+	}
+	if migrated {
+		return nil
+	}
+	data, err := os.ReadFile(sm.legacyConfigPath)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return sm.markLegacyConfigMigrated(db)
+		}
+		return err
+	}
+
+	var count int
+	if err := db.QueryRow(`SELECT COUNT(*) FROM repositories`).Scan(&count); err != nil {
+		return err
+	}
+	if count > 0 {
+		return sm.markLegacyConfigMigrated(db)
+	}
+
+	var cfg Config
+	if err := json.Unmarshal(data, &cfg); err != nil {
+		return err
+	}
+	cfg = *cloneConfig(&cfg)
+	if err := sm.saveConfig(db, &cfg); err != nil {
+		return err
+	}
+	return sm.markLegacyConfigMigrated(db)
+}
+
+func (sm *StorageManager) hasSetting(db *sql.DB, key string) (bool, error) {
+	var value string
+	err := db.QueryRow(`SELECT value FROM settings WHERE key = ?`, key).Scan(&value)
+	if err == sql.ErrNoRows {
+		return false, nil
+	}
+	return err == nil, err
+}
+
+func (sm *StorageManager) markLegacyConfigMigrated(db *sql.DB) error {
+	_, err := db.Exec(`INSERT OR IGNORE INTO settings (key, value) VALUES ('legacy_config_migrated', '1')`)
+	return err
+}
+
+func (sm *StorageManager) saveConfig(db *sql.DB, cfg *Config) error {
+	tx, err := db.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+
+	if _, err := tx.Exec(`DELETE FROM repositories`); err != nil {
+		return err
+	}
+	for _, repo := range cfg.Repositories {
+		notify := any(nil)
+		if repo.Notify != nil {
+			notify = boolToInt(*repo.Notify)
+		}
+		if _, err := tx.Exec(`
+			INSERT INTO repositories (path, name, default_branch, added_at, last_sync, paused, notify)
+			VALUES (?, ?, ?, ?, ?, ?, ?)
+		`, repo.Path, repo.Name, repo.DefaultBranch, formatDBTime(repo.AddedAt), formatDBTime(repo.LastSync), boolToInt(repo.Paused), notify); err != nil {
+			return err
+		}
+	}
+
+	if _, err := tx.Exec(`
+		INSERT INTO settings (key, value) VALUES ('pull_interval_minutes', ?)
+		ON CONFLICT(key) DO UPDATE SET value = excluded.value
+	`, strconv.Itoa(cfg.PullIntervalMinutes)); err != nil {
+		return err
+	}
+	if _, err := tx.Exec(`
+		INSERT INTO settings (key, value) VALUES ('history_retention_days', ?)
+		ON CONFLICT(key) DO UPDATE SET value = excluded.value
+	`, strconv.Itoa(cfg.HistoryRetentionDays)); err != nil {
+		return err
+	}
+	return tx.Commit()
+}
+
+func (sm *StorageManager) loadConfig(db *sql.DB) (*Config, error) {
+	if err := sm.ensureDefaults(db); err != nil {
+		return nil, err
+	}
+	repos, err := sm.loadRepos(db)
+	if err != nil {
+		return nil, err
+	}
+	pullInterval, err := sm.intSetting(db, "pull_interval_minutes", DefaultPullIntervalMinutes)
+	if err != nil {
+		return nil, err
+	}
+	retention, err := sm.intSetting(db, "history_retention_days", DefaultHistoryRetentionDays)
+	if err != nil {
+		return nil, err
+	}
+	return &Config{Repositories: repos, PullIntervalMinutes: pullInterval, HistoryRetentionDays: retention}, nil
+}
+
+func (sm *StorageManager) loadRepos(db *sql.DB) ([]RepoInfo, error) {
+	rows, err := db.Query(`
+		SELECT path, name, default_branch, added_at, last_sync, paused, notify
+		FROM repositories
+		ORDER BY lower(name), path
+	`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var repos []RepoInfo
+	for rows.Next() {
+		repo, err := scanRepo(rows)
+		if err != nil {
+			return nil, err
+		}
+		repos = append(repos, *repo)
+	}
+	if repos == nil {
+		repos = []RepoInfo{}
+	}
+	return repos, rows.Err()
+}
+
+func (sm *StorageManager) intSetting(db *sql.DB, key string, fallback int) (int, error) {
+	var value string
+	if err := db.QueryRow(`SELECT value FROM settings WHERE key = ?`, key).Scan(&value); err != nil {
+		if err == sql.ErrNoRows {
+			return fallback, nil
+		}
+		return 0, err
+	}
+	parsed, err := strconv.Atoi(value)
+	if err != nil || parsed <= 0 {
+		return fallback, nil
+	}
+	return parsed, nil
+}
+
+type repoScanner interface {
+	Scan(dest ...any) error
+}
+
+func scanRepo(scanner repoScanner) (*RepoInfo, error) {
+	var repo RepoInfo
+	var addedAt, lastSync string
+	var paused int
+	var notify sql.NullInt64
+	if err := scanner.Scan(&repo.Path, &repo.Name, &repo.DefaultBranch, &addedAt, &lastSync, &paused, &notify); err != nil {
+		return nil, err
+	}
+	repo.AddedAt = parseDBTime(addedAt)
+	repo.LastSync = parseDBTime(lastSync)
+	repo.Paused = paused != 0
+	if notify.Valid {
+		notifyValue := notify.Int64 != 0
+		repo.Notify = &notifyValue
+	}
+	return &repo, nil
+}
+
+func requireAffected(res sql.Result, path string) error {
+	affected, err := res.RowsAffected()
+	if err != nil {
+		return err
+	}
+	if affected == 0 {
+		return fmt.Errorf("repository not found: %s", path)
+	}
+	return nil
+}
+
+func defaultConfig() Config {
+	return Config{Repositories: []RepoInfo{}, PullIntervalMinutes: DefaultPullIntervalMinutes, HistoryRetentionDays: DefaultHistoryRetentionDays}
 }
 
 func cloneConfig(cfg *Config) *Config {
 	if cfg == nil {
-		return &Config{Repositories: []RepoInfo{}, PullIntervalMinutes: DefaultPullIntervalMinutes, HistoryRetentionDays: DefaultHistoryRetentionDays}
+		defaultCfg := defaultConfig()
+		return &defaultCfg
 	}
 	repos := make([]RepoInfo, len(cfg.Repositories))
 	copy(repos, cfg.Repositories)
@@ -328,6 +557,28 @@ func cloneConfig(cfg *Config) *Config {
 		historyRetentionDays = DefaultHistoryRetentionDays
 	}
 	return &Config{Repositories: repos, PullIntervalMinutes: pullIntervalMinutes, HistoryRetentionDays: historyRetentionDays}
+}
+
+func boolToInt(v bool) int {
+	if v {
+		return 1
+	}
+	return 0
+}
+
+func formatDBTime(t time.Time) string {
+	if t.IsZero() {
+		t = time.Now()
+	}
+	return t.UTC().Format(time.RFC3339Nano)
+}
+
+func parseDBTime(value string) time.Time {
+	t, err := time.Parse(time.RFC3339Nano, value)
+	if err == nil {
+		return t
+	}
+	return time.Time{}
 }
 
 func boolPtr(v bool) *bool {
