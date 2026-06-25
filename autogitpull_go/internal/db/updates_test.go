@@ -18,7 +18,7 @@ func TestStoreRecordsUpdate(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := store.FinishUpdate(id, "pulled changes", nil); err != nil {
+	if err := store.FinishUpdateWithRevisions(id, "pulled changes", nil, "abc", "def"); err != nil {
 		t.Fatal(err)
 	}
 
@@ -31,6 +31,9 @@ func TestStoreRecordsUpdate(t *testing.T) {
 	}
 	if updates[0].RepoName != "repo" || updates[0].Status != "success" || !updates[0].Changed {
 		t.Fatalf("unexpected update: %+v", updates[0])
+	}
+	if updates[0].BeforeRev != "abc" || updates[0].AfterRev != "def" {
+		t.Fatalf("unexpected update revisions: %+v", updates[0])
 	}
 }
 
@@ -247,6 +250,33 @@ func TestLatestUpdatesByRepoAndDeleteBefore(t *testing.T) {
 	}
 	if total != 2 {
 		t.Fatalf("expected 2 remaining rows, got %d", total)
+	}
+}
+
+func TestPluginResultRoundTrip(t *testing.T) {
+	store, err := Open(filepath.Join(t.TempDir(), "updates.sqlite"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+
+	id, err := store.BeginUpdate("/repo/path", "repo")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.SavePluginResult(id, "ai_summary", "pending", "context", ""); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.SavePluginResult(id, "ai_summary", "success", "summary", ""); err != nil {
+		t.Fatal(err)
+	}
+
+	results, err := store.PluginResultsByUpdate(id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(results) != 2 || results[0].PluginID != "ai_summary" || results[1].Status != "success" || results[1].Result != "summary" {
+		t.Fatalf("unexpected plugin results: %+v", results)
 	}
 }
 

@@ -69,6 +69,37 @@ func GitPull(path string) (string, error) {
 	return exc.CommandExec(ctx, DefaultPullTimeoutSec, path, "git", "pull", "origin")
 }
 
+func GitHead(path string) (string, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), DefaultPullTimeoutSec)
+	defer cancel()
+
+	output, err := exc.CommandExec(ctx, DefaultPullTimeoutSec, path, "git", "rev-parse", "HEAD")
+	if err != nil {
+		return "", err
+	}
+	return strings.TrimSpace(output), nil
+}
+
+func GitChangedLog(path, fromRev, toRev string) (string, error) {
+	if fromRev == "" || toRev == "" || fromRev == toRev {
+		return "", nil
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), DefaultPullTimeoutSec)
+	defer cancel()
+
+	return exc.CommandExec(ctx, DefaultPullTimeoutSec, path, "git", "--no-pager", "log", "--stat", "--oneline", fromRev+".."+toRev)
+}
+
+func GitDiffStat(path, fromRev, toRev string) (string, error) {
+	if fromRev == "" || toRev == "" || fromRev == toRev {
+		return "", nil
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), DefaultPullTimeoutSec)
+	defer cancel()
+
+	return exc.CommandExec(ctx, DefaultPullTimeoutSec, path, "git", "--no-pager", "diff", "--stat", fromRev+".."+toRev)
+}
+
 func GitGetUncommitedChanges(path string) (string, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), DefaultPullTimeoutSec)
 	defer cancel()

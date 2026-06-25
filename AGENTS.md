@@ -13,7 +13,10 @@
 - Daemon pull flow is in `autogitpull_go/internal/logic/daemon.go`.
 - Change-processing plugins live in `autogitpull_go/internal/plugins`.
 - Plugins run after a successful pull has been recorded. By default they run only when the saved `db.Update.Changed` is true; plugins may opt into no-change runs with `RunOnNoChange`.
-- Plugin state is stored in `plugin_settings` via `config.StorageManager`.
+- Plugin state is stored in `plugin_settings` via `config.StorageManager`; repo-scoped plugin selection is generic, uses plugin config `repo_scope` plus `selected_repos`, and must be editable from `/plugins`.
+- Plugin outputs are append-only and stored in `plugin_results` via `db.Store`; AI summary architecture should use saved `Update.BeforeRev`/`AfterRev` ranges, not ad hoc ORIG_HEAD assumptions.
+- Built-in `ai_summary` plugin is disabled by default; it uses saved `Update.BeforeRev`/`AfterRev` ranges, can call a custom-named OpenAI-compatible Responses or Chat Completions API with configured URL/key/model, has a `/plugins` Test button that sends `hello`, and can run manually, globally, from `/update`, or through the generic selected-repos plugin scope.
+- Web change details live at `/update?id=...`; notifications should deep-link there, and the page should show pull text plus all AI summaries with a regenerate button.
 - Web plugin UI is a separate `/plugins` page, linked from the main dashboard and repo pages.
 - `web.New` calls `plugins.EnsureDefaults(storage)` so built-in plugin defaults are persisted.
 - Notifications are implemented as the built-in `notifications` plugin, default enabled with `title_prefix=Pulled`; do not call `pkg/notifications` directly from web, TUI, or daemon flows.

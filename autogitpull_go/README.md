@@ -19,6 +19,7 @@ you work.
 - Starts a local dashboard at `http://localhost:9009` while the daemon runs.
 - Runs change-processing plugins after recorded pulls.
 - Sends macOS notifications through the built-in Notifications plugin.
+- Can store plugin output, including prepared AI-summary context, per update.
 - Can be installed as a macOS `launchd` service.
 
 The safety rule is intentionally simple: `autogitpull` only pulls when the repo
@@ -239,12 +240,32 @@ can opt into no-change runs. The built-in Notifications plugin is enabled by
 default with `title_prefix=Pulled` and also runs for manual web and TUI pulls
 that complete without new changes.
 
+The built-in AI Summary plugin is disabled by default. When enabled, it uses the
+saved `before_rev` and `after_rev` range to collect `git log --stat` and
+`git diff --stat` context, then stores the generated summary in plugin results.
+Configure a provider name, API key, model, API type, and API URL on the plugin
+settings page. Any OpenAI-compatible provider can use either Responses API or
+Chat Completions by changing the API type and URL. Use the AI Summary `Test`
+button on the plugin settings page to send `hello` and verify the configured
+provider response. Each generated summary is stored as a separate plugin result,
+so a change can have multiple AI summaries.
+It can be run manually from a repo page, scoped to selected repositories through
+the generic repo plugin controls, or run globally for all changed updates from
+the plugin settings page. The plugin settings page lets every plugin switch
+between all repositories and selected repositories, and shows the selected
+repository list for repo-scoped plugins.
+
+Each recorded update has a change details page at `/update?id=<id>`. It shows
+the pull output or error, all AI summaries for that update, and a button to
+generate another summary. Pull notifications deep-link to this change page.
+
 Plugin settings are stored in the `plugin_settings` table in
 `~/.autogitpull/updates.sqlite`.
 
 ## Storage
 
-Repositories, settings, plugin settings, and update history are stored in SQLite:
+Repositories, settings, plugin settings, update history, and plugin results are
+stored in SQLite:
 
 ```sh
 ~/.autogitpull/updates.sqlite
@@ -272,7 +293,8 @@ For every registered repository, `autogitpull` does this:
 4. Runs `git pull origin` only when the branch matches and the working tree is
    clean.
 5. Records the result in the update history database.
-6. Runs enabled plugins from the saved update record.
+6. Stores the pre-pull and post-pull revisions when available.
+7. Runs enabled plugins from the saved update record.
 
 Common skip cases:
 

@@ -3,10 +3,9 @@ package logic
 import (
 	"fmt"
 	"log/slog"
-	"net/url"
 	"os"
 	"os/signal"
-	"strings"
+	"strconv"
 	"sync"
 	"syscall"
 	"time"
@@ -190,11 +189,11 @@ func (d *Daemon) pullRepo(repo *config.RepoInfo, notify bool) {
 		d.onPullStart(repo)
 	}
 
-	result, err := d.performPull(repo)
+	result, beforeRev, afterRev, err := d.performPull(repo)
 	web.AddDaemonRunResult(updateStatus(err))
 
 	if d.updateStore != nil && updateID > 0 {
-		if recordErr := d.updateStore.FinishUpdate(updateID, result, err); recordErr != nil {
+		if recordErr := d.updateStore.FinishUpdateWithRevisions(updateID, result, err, beforeRev, afterRev); recordErr != nil {
 			slog.Error("failed to record update result", slog.String("repo", repo.Name), slog.String("err", recordErr.Error()))
 		} else if err == nil {
 			d.runPluginsAfterChange(repo, updateID, notify)
@@ -224,17 +223,14 @@ func (d *Daemon) runPluginsAfterChange(repo *config.RepoInfo, updateID int64, no
 	plugins.RunAfterChange(plugins.Context{
 		Repo:      repo,
 		Update:    update,
+		Store:     d.updateStore,
 		Notify:    notify,
 		Source:    "daemon",
 		Dashboard: "http://localhost:9009",
-		OpenURL:   "http://localhost:9009/repo?path=" + urlQueryEscape(repo.Path),
+		OpenURL:   "http://localhost:9009/update?id=" + strconv.FormatInt(update.ID, 10),
 		AppName:   config.AppName,
 		Logger:    slog.Default(),
 	}, d.storage.GetPluginStates())
-}
-
-func urlQueryEscape(s string) string {
-	return strings.ReplaceAll(url.QueryEscape(s), "%2F", "/")
 }
 
 func updateStatus(err error) string {
@@ -247,30 +243,32 @@ func updateStatus(err error) string {
 	return "error"
 }
 
-func (d *Daemon) performPull(repo *config.RepoInfo) (string, error) {
+func (d *Daemon) performPull(repo *config.RepoInfo) (result, beforeRev, afterRev string, err error) {
 	currentBranch, err := git.GetCurrentBranch(repo.Path)
 	if err != nil {
-		return "", fmt.Errorf("get current branch: %w", err)
+		return "", "", "", fmt.Errorf("get current branch: %w", err)
 	}
 
 	if currentBranch != repo.DefaultBranch {
-		return "", fmt.Errorf("current branch %s is not default branch %s", currentBranch, repo.DefaultBranch)
+		return "", "", "", fmt.Errorf("current branch %s is not default branch %s", currentBranch, repo.DefaultBranch)
 	}
 
 	hasChanges, err := git.GitHasUncommitedChanges(repo.Path)
 	if err != nil {
-		return "", fmt.Errorf("check changes: %w", err)
+		return "", "", "", fmt.Errorf("check changes: %w", err)
 	}
 	if hasChanges {
-		return "", fmt.Errorf("repository has uncommitted changes")
+		return "", "", "", fmt.Errorf("repository has uncommitted changes")
 	}
 
-	result, err := git.GitPull(repo.Path)
+	beforeRev, _ = git.GitHead(repo.Path)
+	result, err = git.GitPull(repo.Path)
+	afterRev, _ = git.GitHead(repo.Path)
 	if err != nil {
-		return result, fmt.Errorf("git pull: %w", err)
+		return result, beforeRev, afterRev, fmt.Errorf("git pull: %w", err)
 	}
 
-	return result, nil
+	return result, beforeRev, afterRev, nil
 }
 
 func (d *Daemon) UpdateInterval(newInterval time.Duration) {

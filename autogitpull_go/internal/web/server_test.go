@@ -7,6 +7,7 @@ import (
 	"net/http/httptest"
 	"net/url"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -15,6 +16,7 @@ import (
 
 	"github.com/blankstatic/autogitpull/autogitpull_go/internal/config"
 	"github.com/blankstatic/autogitpull/autogitpull_go/internal/db"
+	"github.com/blankstatic/autogitpull/autogitpull_go/internal/plugins"
 )
 
 func TestNewActivitySummaryCountsOnlyProvidedChangedTimes(t *testing.T) {
@@ -154,6 +156,17 @@ func TestPluginsPageRendersBuiltInPlugins(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer store.Close()
+	if err := storage.SetPluginState(config.PluginState{
+		ID:      plugins.NotificationsID,
+		Enabled: true,
+		Config: map[string]string{
+			"title_prefix":                 "Pulled",
+			plugins.RepoScopeConfigKey:     "selected",
+			plugins.SelectedReposConfigKey: `["/Users/dmitry/proj/autogitpull_source"]`,
+		},
+	}); err != nil {
+		t.Fatal(err)
+	}
 
 	server := New(store, storage)
 	rec := httptest.NewRecorder()
@@ -165,6 +178,12 @@ func TestPluginsPageRendersBuiltInPlugins(t *testing.T) {
 	}
 	if !strings.Contains(rec.Body.String(), "Notifications") {
 		t.Fatalf("expected notifications plugin in response")
+	}
+	if !strings.Contains(rec.Body.String(), `action="/plugins/test-ai-summary"`) || !strings.Contains(rec.Body.String(), ">Test</button>") {
+		t.Fatalf("expected AI summary test button in response")
+	}
+	if !strings.Contains(rec.Body.String(), "plugin-repo-path") || !strings.Contains(rec.Body.String(), `title="/Users/dmitry/proj/autogitpull_source"`) {
+		t.Fatalf("expected selected repo path to render in wrapping container")
 	}
 }
 
@@ -267,6 +286,7 @@ func TestSavePluginUpdatesPluginState(t *testing.T) {
 		"id":                  {"notifications"},
 		"enabled":             {"1"},
 		"config_title_prefix": {"Changed"},
+		"config_repo_scope":   {"global"},
 	}
 	rec := httptest.NewRecorder()
 	req := httptest.NewRequest("POST", "/plugins/save", strings.NewReader(form.Encode()))
@@ -279,6 +299,245 @@ func TestSavePluginUpdatesPluginState(t *testing.T) {
 	state := storage.GetPluginStates()["notifications"]
 	if !state.Enabled || state.Config["title_prefix"] != "Changed" {
 		t.Fatalf("unexpected plugin state: %+v", state)
+	}
+	if state.Config[plugins.RepoScopeConfigKey] != "global" {
+		t.Fatalf("expected global repo scope, got %+v", state.Config)
+	}
+}
+
+func TestSavePluginCanRestoreNotificationsGlobalScope(t *testing.T) {
+	dir := t.TempDir()
+	storage := config.NewStorageManager(filepath.Join(dir, "config.json"))
+	if err := storage.Load(); err != nil {
+		t.Fatal(err)
+	}
+	store, err := db.Open(filepath.Join(dir, "updates.sqlite"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+
+	if err := storage.SetPluginState(config.PluginState{
+		ID:      plugins.NotificationsID,
+		Enabled: true,
+		Config: map[string]string{
+			"title_prefix":                 "Pulled",
+			plugins.RepoScopeConfigKey:     "selected",
+			plugins.SelectedReposConfigKey: `["/repo/a"]`,
+		},
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	server := New(store, storage)
+	form := url.Values{
+		"id":                  {plugins.NotificationsID},
+		"enabled":             {"1"},
+		"config_title_prefix": {"Pulled"},
+		"config_repo_scope":   {"global"},
+	}
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest("POST", "/plugins/save", strings.NewReader(form.Encode()))
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	server.mux.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusSeeOther {
+		t.Fatalf("expected redirect, got %d: %s", rec.Code, rec.Body.String())
+	}
+	state := storage.GetPluginStates()[plugins.NotificationsID]
+	if state.Config[plugins.RepoScopeConfigKey] != "global" {
+		t.Fatalf("expected global scope, got %+v", state.Config)
+	}
+	if !plugins.EnabledForRepo(storage.GetPluginStates(), plugins.NotificationsID, "/repo/b") {
+		t.Fatalf("expected notifications to apply globally after save")
+	}
+}
+
+func TestSavePluginPreservesHiddenConfig(t *testing.T) {
+	dir := t.TempDir()
+	storage := config.NewStorageManager(filepath.Join(dir, "config.json"))
+	if err := storage.Load(); err != nil {
+		t.Fatal(err)
+	}
+	store, err := db.Open(filepath.Join(dir, "updates.sqlite"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+
+	if err := storage.SetPluginState(config.PluginState{
+		ID:      plugins.AISummaryID,
+		Enabled: true,
+		Config: map[string]string{
+			plugins.SelectedReposConfigKey: `["/repo/a"]`,
+			"provider":                     "Local proxy",
+			"api_type":                     "chat_completions",
+		},
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	server := New(store, storage)
+	form := url.Values{
+		"id":                {plugins.AISummaryID},
+		"enabled":           {"1"},
+		"config_provider":   {"Local proxy"},
+		"config_api_type":   {"chat_completions"},
+		"config_url":        {"http://litellm.local"},
+		"config_token":      {"secret"},
+		"config_model":      {"gpt-test"},
+		"config_repo_scope": {"selected"},
+	}
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest("POST", "/plugins/save", strings.NewReader(form.Encode()))
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	server.mux.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusSeeOther {
+		t.Fatalf("expected redirect, got %d: %s", rec.Code, rec.Body.String())
+	}
+	state := storage.GetPluginStates()[plugins.AISummaryID]
+	if state.Config[plugins.SelectedReposConfigKey] != `["/repo/a"]` {
+		t.Fatalf("expected hidden repo config to be preserved, got %+v", state.Config)
+	}
+	if state.Config["url"] != "http://litellm.local" {
+		t.Fatalf("expected visible config to be updated, got %+v", state.Config)
+	}
+}
+
+func TestToggleRepoPlugin(t *testing.T) {
+	dir := t.TempDir()
+	storage := config.NewStorageManager(filepath.Join(dir, "config.json"))
+	if err := storage.Load(); err != nil {
+		t.Fatal(err)
+	}
+	store, err := db.Open(filepath.Join(dir, "updates.sqlite"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	seedRepo(t, dir, "/repo/ai", "ai")
+
+	server := New(store, storage)
+	form := url.Values{"path": {"/repo/ai"}, "plugin_id": {plugins.AISummaryID}, "enabled": {"1"}}
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest("POST", "/repo/plugin-toggle", strings.NewReader(form.Encode()))
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	server.mux.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusSeeOther {
+		t.Fatalf("expected redirect, got %d: %s", rec.Code, rec.Body.String())
+	}
+	states := storage.GetPluginStates()
+	if !plugins.EnabledForRepo(states, plugins.AISummaryID, "/repo/ai") {
+		t.Fatalf("expected AI summary enabled for repo: %+v", states[plugins.AISummaryID])
+	}
+
+	form.Set("enabled", "0")
+	rec = httptest.NewRecorder()
+	req = httptest.NewRequest("POST", "/repo/plugin-toggle", strings.NewReader(form.Encode()))
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	server.mux.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusSeeOther {
+		t.Fatalf("expected redirect, got %d: %s", rec.Code, rec.Body.String())
+	}
+	if plugins.EnabledForRepo(storage.GetPluginStates(), plugins.AISummaryID, "/repo/ai") {
+		t.Fatalf("expected AI summary disabled for repo")
+	}
+}
+
+func TestAISummaryTestEndpoint(t *testing.T) {
+	oldClient := plugins.AISummaryHTTPClientForTest()
+	defer plugins.SetAISummaryHTTPClientForTest(oldClient)
+
+	provider := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/v1/responses" {
+			t.Fatalf("unexpected provider path: %s", r.URL.Path)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"output_text":"hello back"}`))
+	}))
+	defer provider.Close()
+	plugins.SetAISummaryHTTPClientForTest(provider.Client())
+
+	dir := t.TempDir()
+	storage := config.NewStorageManager(filepath.Join(dir, "config.json"))
+	if err := storage.Load(); err != nil {
+		t.Fatal(err)
+	}
+	store, err := db.Open(filepath.Join(dir, "updates.sqlite"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	if err := storage.SetPluginState(config.PluginState{
+		ID:      plugins.AISummaryID,
+		Enabled: true,
+		Config: map[string]string{
+			"provider": "OpenAI account",
+			"api_type": "responses",
+			"url":      provider.URL + "/v1",
+			"token":    "test-key",
+			"model":    "gpt-test",
+		},
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	server := New(store, storage)
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest("POST", "/plugins/test-ai-summary", nil)
+	server.mux.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusSeeOther {
+		t.Fatalf("expected redirect, got %d: %s", rec.Code, rec.Body.String())
+	}
+	location := rec.Header().Get("Location")
+	if !strings.Contains(location, "AI+summary+test%3A+hello+back") {
+		t.Fatalf("expected test response in flash, got %q", location)
+	}
+}
+
+func TestUpdatePageShowsChangeAndAISummaries(t *testing.T) {
+	dir := t.TempDir()
+	storage := config.NewStorageManager(filepath.Join(dir, "config.json"))
+	if err := storage.Load(); err != nil {
+		t.Fatal(err)
+	}
+	store, err := db.Open(filepath.Join(dir, "updates.sqlite"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+
+	updateID, err := store.BeginUpdate("/repo/change", "change")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.FinishUpdateWithRevisions(updateID, "Fast-forward\n file.go | 2 +", nil, "abc", "def"); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.SavePluginResult(updateID, plugins.AISummaryID, "success", "first summary", ""); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.SavePluginResult(updateID, plugins.AISummaryID, "success", "second summary", ""); err != nil {
+		t.Fatal(err)
+	}
+
+	server := New(store, storage)
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest("GET", "/update?id="+strconv.FormatInt(updateID, 10), nil)
+	server.mux.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected status 200, got %d: %s", rec.Code, rec.Body.String())
+	}
+	body := rec.Body.String()
+	for _, want := range []string{"Fast-forward", "first summary", "second summary", "Generate again"} {
+		if !strings.Contains(body, want) {
+			t.Fatalf("expected update page to contain %q", want)
+		}
 	}
 }
 
@@ -359,5 +618,21 @@ func TestRepoCardsAttachLatestUpdate(t *testing.T) {
 	}
 	if cards[1].LastUpdate != nil {
 		t.Fatalf("expected no latest update on second card: %+v", cards[1])
+	}
+}
+
+func seedRepo(t *testing.T, dir, repoPath, repoName string) {
+	t.Helper()
+	externalDB, err := sql.Open("sqlite3", filepath.Join(dir, config.UpdatesDBFilename))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer externalDB.Close()
+	now := time.Now().UTC().Format(time.RFC3339Nano)
+	if _, err := externalDB.Exec(`
+		INSERT INTO repositories (path, name, default_branch, added_at, last_sync, paused, notify)
+		VALUES (?, ?, ?, ?, ?, 0, NULL)
+	`, repoPath, repoName, "main", now, now); err != nil {
+		t.Fatal(err)
 	}
 }

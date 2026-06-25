@@ -21,8 +21,20 @@ type Update struct {
 	Error      string
 	SkipReason string
 	Changed    bool
+	BeforeRev  string
+	AfterRev   string
 	StartedAt  time.Time
 	FinishedAt time.Time
+}
+
+type PluginResult struct {
+	ID        int64
+	UpdateID  int64
+	PluginID  string
+	Status    string
+	Result    string
+	Error     string
+	CreatedAt time.Time
 }
 
 type UpdateFilter struct {
@@ -66,6 +78,10 @@ func (s *Store) BeginUpdate(repoPath, repoName string) (int64, error) {
 }
 
 func (s *Store) FinishUpdate(id int64, result string, pullErr error) error {
+	return s.FinishUpdateWithRevisions(id, result, pullErr, "", "")
+}
+
+func (s *Store) FinishUpdateWithRevisions(id int64, result string, pullErr error, beforeRev, afterRev string) error {
 	status := "success"
 	errText := ""
 	skipReason := ""
@@ -81,21 +97,21 @@ func (s *Store) FinishUpdate(id int64, result string, pullErr error) error {
 	changed := status == "success" && IsChangedPullResult(result)
 	_, err := s.db.Exec(`
 		UPDATE updates
-		SET status = ?, result = ?, error = ?, skip_reason = ?, changed = ?, finished_at = ?
+		SET status = ?, result = ?, error = ?, skip_reason = ?, changed = ?, before_rev = ?, after_rev = ?, finished_at = ?
 		WHERE id = ?
-	`, status, result, errText, skipReason, changed, time.Now().UTC(), id)
+	`, status, result, errText, skipReason, changed, beforeRev, afterRev, time.Now().UTC(), id)
 	return err
 }
 
 func (s *Store) GetUpdate(id int64) (Update, error) {
 	row := s.db.QueryRow(`
-		SELECT id, repo_path, repo_name, status, result, error, skip_reason, changed, started_at, finished_at
+		SELECT id, repo_path, repo_name, status, result, error, skip_reason, changed, before_rev, after_rev, started_at, finished_at
 		FROM updates
 		WHERE id = ?
 	`, id)
 	var update Update
 	var finishedAt sql.NullTime
-	if err := row.Scan(&update.ID, &update.RepoPath, &update.RepoName, &update.Status, &update.Result, &update.Error, &update.SkipReason, &update.Changed, &update.StartedAt, &finishedAt); err != nil {
+	if err := row.Scan(&update.ID, &update.RepoPath, &update.RepoName, &update.Status, &update.Result, &update.Error, &update.SkipReason, &update.Changed, &update.BeforeRev, &update.AfterRev, &update.StartedAt, &finishedAt); err != nil {
 		return Update{}, err
 	}
 	if finishedAt.Valid {
@@ -116,7 +132,7 @@ func (s *Store) RecentUpdatesPageFiltered(limit, offset int, filter UpdateFilter
 	where, args := updateFilterWhere(filter)
 	args = append(args, limit, offset)
 	rows, err := s.db.Query(`
-		SELECT id, repo_path, repo_name, status, result, error, skip_reason, changed, started_at, finished_at
+		SELECT id, repo_path, repo_name, status, result, error, skip_reason, changed, before_rev, after_rev, started_at, finished_at
 		FROM updates
 		`+where+`
 		ORDER BY id DESC
@@ -162,7 +178,7 @@ func (s *Store) RepoUpdatesPageFiltered(repoPath string, limit, offset int, filt
 	}
 	args = append(args, repoPath, limit, offset)
 	rows, err := s.db.Query(`
-		SELECT id, repo_path, repo_name, status, result, error, skip_reason, changed, started_at, finished_at
+		SELECT id, repo_path, repo_name, status, result, error, skip_reason, changed, before_rev, after_rev, started_at, finished_at
 		FROM updates
 		`+where+`
 		ORDER BY id DESC
@@ -193,7 +209,7 @@ func (s *Store) RepoChangedUpdateTimesSince(repoPath string, since time.Time) ([
 
 func (s *Store) LatestUpdatesByRepo() (map[string]Update, error) {
 	rows, err := s.db.Query(`
-		SELECT u.id, u.repo_path, u.repo_name, u.status, u.result, u.error, u.skip_reason, u.changed, u.started_at, u.finished_at
+		SELECT u.id, u.repo_path, u.repo_name, u.status, u.result, u.error, u.skip_reason, u.changed, u.before_rev, u.after_rev, u.started_at, u.finished_at
 		FROM updates u
 		INNER JOIN (
 			SELECT repo_path, MAX(id) AS id
@@ -223,6 +239,28 @@ func (s *Store) DeleteUpdatesBefore(before time.Time) (int64, error) {
 		return 0, err
 	}
 	return res.RowsAffected()
+}
+
+func (s *Store) SavePluginResult(updateID int64, pluginID, status, result, errText string) error {
+	_, err := s.db.Exec(`
+		INSERT INTO plugin_results (update_id, plugin_id, status, result, error, created_at)
+		VALUES (?, ?, ?, ?, ?, ?)
+	`, updateID, pluginID, status, result, errText, time.Now().UTC())
+	return err
+}
+
+func (s *Store) PluginResultsByUpdate(updateID int64) ([]PluginResult, error) {
+	rows, err := s.db.Query(`
+		SELECT id, update_id, plugin_id, status, result, error, created_at
+		FROM plugin_results
+		WHERE update_id = ?
+		ORDER BY plugin_id
+	`, updateID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	return scanPluginResults(rows)
 }
 
 func (s *Store) CountUpdates() (int, error) {
@@ -284,17 +322,38 @@ func (s *Store) migrate() error {
 			error TEXT NOT NULL DEFAULT '',
 			skip_reason TEXT NOT NULL DEFAULT '',
 			changed INTEGER NOT NULL DEFAULT 0,
+			before_rev TEXT NOT NULL DEFAULT '',
+			after_rev TEXT NOT NULL DEFAULT '',
 			started_at TIMESTAMP NOT NULL,
 			finished_at TIMESTAMP
+		);
+		CREATE TABLE IF NOT EXISTS plugin_results (
+			id INTEGER PRIMARY KEY AUTOINCREMENT,
+			update_id INTEGER NOT NULL,
+			plugin_id TEXT NOT NULL,
+			status TEXT NOT NULL,
+			result TEXT NOT NULL DEFAULT '',
+			error TEXT NOT NULL DEFAULT '',
+			created_at TIMESTAMP NOT NULL
 		);
 		CREATE INDEX IF NOT EXISTS idx_updates_repo_path_id ON updates(repo_path, id DESC);
 		CREATE INDEX IF NOT EXISTS idx_updates_id ON updates(id DESC);
 		CREATE INDEX IF NOT EXISTS idx_updates_changed_started_at ON updates(changed, started_at);
+		CREATE INDEX IF NOT EXISTS idx_plugin_results_update_id ON plugin_results(update_id);
 	`)
 	if err != nil {
 		return err
 	}
 	if _, err := s.db.Exec(`ALTER TABLE updates ADD COLUMN skip_reason TEXT NOT NULL DEFAULT ''`); err != nil && !strings.Contains(err.Error(), "duplicate column name") {
+		return err
+	}
+	if _, err := s.db.Exec(`ALTER TABLE updates ADD COLUMN before_rev TEXT NOT NULL DEFAULT ''`); err != nil && !strings.Contains(err.Error(), "duplicate column name") {
+		return err
+	}
+	if _, err := s.db.Exec(`ALTER TABLE updates ADD COLUMN after_rev TEXT NOT NULL DEFAULT ''`); err != nil && !strings.Contains(err.Error(), "duplicate column name") {
+		return err
+	}
+	if err := s.migratePluginResultsAppendOnly(); err != nil {
 		return err
 	}
 	_, err = s.db.Exec(`
@@ -303,12 +362,55 @@ func (s *Store) migrate() error {
 	return err
 }
 
+func (s *Store) migratePluginResultsAppendOnly() error {
+	var sqlText string
+	err := s.db.QueryRow(`SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'plugin_results'`).Scan(&sqlText)
+	if err != nil {
+		return err
+	}
+	if !strings.Contains(strings.ToUpper(sqlText), "UNIQUE") {
+		return nil
+	}
+	tx, err := s.db.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	if _, err := tx.Exec(`ALTER TABLE plugin_results RENAME TO plugin_results_old`); err != nil {
+		return err
+	}
+	if _, err := tx.Exec(`
+		CREATE TABLE plugin_results (
+			id INTEGER PRIMARY KEY AUTOINCREMENT,
+			update_id INTEGER NOT NULL,
+			plugin_id TEXT NOT NULL,
+			status TEXT NOT NULL,
+			result TEXT NOT NULL DEFAULT '',
+			error TEXT NOT NULL DEFAULT '',
+			created_at TIMESTAMP NOT NULL
+		)
+	`); err != nil {
+		return err
+	}
+	if _, err := tx.Exec(`
+		INSERT INTO plugin_results (id, update_id, plugin_id, status, result, error, created_at)
+		SELECT id, update_id, plugin_id, status, result, error, created_at
+		FROM plugin_results_old
+	`); err != nil {
+		return err
+	}
+	if _, err := tx.Exec(`DROP TABLE plugin_results_old`); err != nil {
+		return err
+	}
+	return tx.Commit()
+}
+
 func scanUpdates(rows *sql.Rows) ([]Update, error) {
 	var updates []Update
 	for rows.Next() {
 		var u Update
 		var finishedAt sql.NullTime
-		if err := rows.Scan(&u.ID, &u.RepoPath, &u.RepoName, &u.Status, &u.Result, &u.Error, &u.SkipReason, &u.Changed, &u.StartedAt, &finishedAt); err != nil {
+		if err := rows.Scan(&u.ID, &u.RepoPath, &u.RepoName, &u.Status, &u.Result, &u.Error, &u.SkipReason, &u.Changed, &u.BeforeRev, &u.AfterRev, &u.StartedAt, &finishedAt); err != nil {
 			return nil, err
 		}
 		if finishedAt.Valid {
@@ -317,6 +419,18 @@ func scanUpdates(rows *sql.Rows) ([]Update, error) {
 		updates = append(updates, u)
 	}
 	return updates, rows.Err()
+}
+
+func scanPluginResults(rows *sql.Rows) ([]PluginResult, error) {
+	var results []PluginResult
+	for rows.Next() {
+		var result PluginResult
+		if err := rows.Scan(&result.ID, &result.UpdateID, &result.PluginID, &result.Status, &result.Result, &result.Error, &result.CreatedAt); err != nil {
+			return nil, err
+		}
+		results = append(results, result)
+	}
+	return results, rows.Err()
 }
 
 func scanTimes(rows *sql.Rows) ([]time.Time, error) {

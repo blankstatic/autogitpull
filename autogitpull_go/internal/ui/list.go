@@ -3,9 +3,9 @@ package ui
 import (
 	"fmt"
 	"log/slog"
-	"net/url"
 	"os"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -536,6 +536,8 @@ func handleUnregisterRepo(path string) error {
 func handlePullRepo(repo *config.RepoInfo, modelRef *model) error {
 	var handleError error
 	var pullResult string
+	var beforeRev string
+	var afterRev string
 	var updateStore *db.Store
 	var updateID int64
 
@@ -559,7 +561,7 @@ func handlePullRepo(repo *config.RepoInfo, modelRef *model) error {
 
 	defer func() {
 		if updateStore != nil && updateID > 0 {
-			if err := updateStore.FinishUpdate(updateID, pullResult, handleError); err != nil {
+			if err := updateStore.FinishUpdateWithRevisions(updateID, pullResult, handleError, beforeRev, afterRev); err != nil {
 				slog.Error("failed to record update result", slog.String("repo", repo.Name), slog.String("err", err.Error()))
 			} else if handleError == nil {
 				runPluginsAfterPull(repo, updateStore, updateID)
@@ -626,7 +628,9 @@ func handlePullRepo(repo *config.RepoInfo, modelRef *model) error {
 
 	modelRef.sendStatusUpdate(repo.Path, "Pulling...")
 
+	beforeRev, _ = git.GitHead(repo.Path)
 	pullResult, handleError = git.GitPull(repo.Path)
+	afterRev, _ = git.GitHead(repo.Path)
 	if handleError != nil {
 		modelRef.sendStatusUpdate(repo.Path, "Pull failed")
 	} else {
@@ -656,10 +660,11 @@ func runPluginsAfterPull(repo *config.RepoInfo, updateStore *db.Store, updateID 
 	plugins.RunAfterChange(plugins.Context{
 		Repo:      repo,
 		Update:    update,
+		Store:     updateStore,
 		Notify:    true,
 		Source:    "tui_manual",
 		Dashboard: "http://localhost:9009",
-		OpenURL:   "http://localhost:9009/repo?path=" + url.QueryEscape(repo.Path),
+		OpenURL:   "http://localhost:9009/update?id=" + strconv.FormatInt(update.ID, 10),
 		AppName:   config.AppName,
 		Logger:    slog.Default(),
 	}, storage.GetPluginStates())
