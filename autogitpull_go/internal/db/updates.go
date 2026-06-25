@@ -78,7 +78,7 @@ func (s *Store) FinishUpdate(id int64, result string, pullErr error) error {
 		}
 	}
 
-	changed := status == "success" && result != "" && !isUpToDate(result)
+	changed := status == "success" && IsChangedPullResult(result)
 	_, err := s.db.Exec(`
 		UPDATE updates
 		SET status = ?, result = ?, error = ?, skip_reason = ?, changed = ?, finished_at = ?
@@ -320,6 +320,10 @@ func isUpToDate(result string) bool {
 
 func IsSkippedPullError(errText string) bool {
 	return SkipReasonFromPullError(errText) != ""
+}
+
+func IsChangedPullResult(result string) bool {
+	return strings.TrimSpace(result) != "" && !isUpToDate(result)
 }
 
 func SkipReasonFromPullError(errText string) string {

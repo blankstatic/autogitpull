@@ -9,7 +9,7 @@ you work.
 
 ## What It Does
 
-- Registers Git repositories in `~/.autogitpull/config.json`.
+- Registers Git repositories in `~/.autogitpull/updates.sqlite`.
 - Detects each repository's remote default branch.
 - Pulls repositories every 30 minutes when the daemon is running.
 - Skips repositories that are not on their default branch.
@@ -218,34 +218,18 @@ The dashboard shows:
 
 Notification clicks open the related repository page in this dashboard.
 
-## Configuration
+## Storage
 
-Config file:
-
-```sh
-~/.autogitpull/config.json
-```
-
-Update history database:
+Repositories, settings, and update history are stored in SQLite:
 
 ```sh
 ~/.autogitpull/updates.sqlite
 ```
 
-Example config:
+On upgrade, an existing legacy config is migrated automatically:
 
-```json
-{
-  "repositories": [
-    {
-      "path": "/Users/me/work/project",
-      "name": "project",
-      "default_branch": "main",
-      "added_at": "2026-06-13T12:00:00Z",
-      "last_sync": "2026-06-13T12:00:00Z"
-    }
-  ]
-}
+```sh
+~/.autogitpull/config.json
 ```
 
 `register` and `discover` only add repositories where the remote default branch

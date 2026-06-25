@@ -3,13 +3,10 @@ package logic
 import (
 	"github.com/blankstatic/autogitpull/autogitpull_go/internal/config"
 	"github.com/blankstatic/autogitpull/autogitpull_go/pkg/git"
-	"github.com/blankstatic/autogitpull/autogitpull_go/pkg/notifications"
 	"github.com/spf13/cobra"
 )
 
 func RegisterCommandHandler(cmd *cobra.Command, args []string) {
-	isSilently := GetIsSilentlyValue(cmd)
-
 	configPath, err := config.GetConfigPath()
 	if err != nil {
 		panic(err)
@@ -29,10 +26,6 @@ func RegisterCommandHandler(cmd *cobra.Command, args []string) {
 		err = storage.AddRepo(path)
 		if err != nil {
 			return err
-		}
-
-		if !isSilently {
-			notifications.OSNotify(config.AppName, "Register", path)
 		}
 
 		return nil

@@ -1,11 +1,16 @@
 package web
 
 import (
+	"database/sql"
 	"errors"
 	"net/http/httptest"
 	"net/url"
+	"path/filepath"
+	"strings"
 	"testing"
 	"time"
+
+	_ "github.com/mattn/go-sqlite3"
 
 	"github.com/blankstatic/autogitpull/autogitpull_go/internal/config"
 	"github.com/blankstatic/autogitpull/autogitpull_go/internal/db"
@@ -59,6 +64,45 @@ func TestEventFilterDefaultsToChanges(t *testing.T) {
 
 	if got := eventFilterFromRequest(req); got != eventFilterChanges {
 		t.Fatalf("expected default filter %q, got %q", eventFilterChanges, got)
+	}
+}
+
+func TestIndexReadsReposAddedToDatabaseByAnotherProcess(t *testing.T) {
+	dir := t.TempDir()
+	configPath := filepath.Join(dir, "config.json")
+	storage := config.NewStorageManager(configPath)
+	if err := storage.Load(); err != nil {
+		t.Fatal(err)
+	}
+	store, err := db.Open(filepath.Join(dir, "updates.sqlite"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+
+	externalDB, err := sql.Open("sqlite3", filepath.Join(dir, config.UpdatesDBFilename))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer externalDB.Close()
+	now := time.Now().UTC().Format(time.RFC3339Nano)
+	if _, err := externalDB.Exec(`
+		INSERT INTO repositories (path, name, default_branch, added_at, last_sync, paused, notify)
+		VALUES (?, ?, ?, ?, ?, 0, NULL)
+	`, "/repo/from-cli", "from-cli", "main", now, now); err != nil {
+		t.Fatal(err)
+	}
+
+	server := New(store, storage)
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest("GET", "/", nil)
+	server.mux.ServeHTTP(rec, req)
+
+	if rec.Code != 200 {
+		t.Fatalf("expected status 200, got %d: %s", rec.Code, rec.Body.String())
+	}
+	if !strings.Contains(rec.Body.String(), "from-cli") {
+		t.Fatalf("expected externally added repo in index response")
 	}
 }
 

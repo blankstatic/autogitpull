@@ -11,6 +11,7 @@ const (
 	AppName                     = "autogitpull"
 	AppDataDir                  = ".autogitpull"
 	ConfigFilename              = "config.json"
+	UpdatesDBFilename           = "updates.sqlite"
 	DefaultPullIntervalMinutes  = 30
 	DefaultHistoryRetentionDays = 365
 )
@@ -62,5 +63,5 @@ func GetUpdatesDBPath() (string, error) {
 	if err != nil {
 		return "", err
 	}
-	return filepath.Join(homeDir, AppDataDir, "updates.sqlite"), nil
+	return filepath.Join(homeDir, AppDataDir, UpdatesDBFilename), nil
 }

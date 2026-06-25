@@ -6,7 +6,6 @@ import (
 	"net/url"
 	"os"
 	"os/signal"
-	"strings"
 	"sync"
 	"syscall"
 	"time"
@@ -34,17 +33,11 @@ type Daemon struct {
 
 type Config struct {
 	Interval    time.Duration
-	ConfigPath  string
 	Storage     *config.StorageManager
 	OnPullStart func(repo *config.RepoInfo)
 	OnPullDone  func(repo *config.RepoInfo, result string, err error, notify bool)
 	UpdateStore *db.Store
 }
-
-var daemonErrorNotifications = struct {
-	sync.Mutex
-	lastSent map[string]time.Time
-}{lastSent: map[string]time.Time{}}
 
 func NewDaemon(cfg Config) (*Daemon, error) {
 	if cfg.Interval <= 0 {
@@ -53,7 +46,11 @@ func NewDaemon(cfg Config) (*Daemon, error) {
 
 	storage := cfg.Storage
 	if storage == nil {
-		storage = config.NewStorageManager(cfg.ConfigPath)
+		configPath, err := config.GetConfigPath()
+		if err != nil {
+			return nil, err
+		}
+		storage = config.NewStorageManager(configPath)
 		if err := storage.Load(); err != nil {
 			return nil, err
 		}
@@ -315,7 +312,6 @@ func DaemonCommandHandler(cmd *cobra.Command, args []string) {
 
 	d, err := NewDaemon(Config{
 		Interval:    interval,
-		ConfigPath:  configPath,
 		Storage:     storage,
 		UpdateStore: updateStore,
 		OnPullStart: func(repo *config.RepoInfo) {
@@ -324,12 +320,9 @@ func DaemonCommandHandler(cmd *cobra.Command, args []string) {
 		OnPullDone: func(repo *config.RepoInfo, result string, err error, notify bool) {
 			if err != nil {
 				slog.Warn("Failed to pull", slog.String("repo", repo.Name), slog.String("err", err.Error()))
-				if notify {
-					notifyDaemonPullError(repo, err)
-				}
 			} else {
 				slog.Info("Successfully pulled", slog.String("repo", repo.Name))
-				if notify && repo.NotificationsEnabled() && !strings.Contains(result, "up to date") {
+				if notify && repo.NotificationsEnabled() && db.IsChangedPullResult(result) {
 					notifyURL := "http://localhost:9009/repo?path=" + url.QueryEscape(repo.Path)
 					go func() {
 						if notifyErr := notifications.OSNotifyURL(config.AppName, fmt.Sprintf("Pulled: %s", repo.Name), result, notifyURL); notifyErr != nil {
@@ -366,28 +359,4 @@ func DaemonCommandHandler(cmd *cobra.Command, args []string) {
 	d.Stop()
 	slog.Warn("Daemon stopped")
 
-}
-
-func notifyDaemonPullError(repo *config.RepoInfo, pullErr error) {
-	if !repo.NotificationsEnabled() {
-		return
-	}
-	key := repo.Path + "\x00" + pullErr.Error()
-	now := time.Now()
-
-	daemonErrorNotifications.Lock()
-	lastSent := daemonErrorNotifications.lastSent[key]
-	if !lastSent.IsZero() && now.Sub(lastSent) < time.Hour {
-		daemonErrorNotifications.Unlock()
-		return
-	}
-	daemonErrorNotifications.lastSent[key] = now
-	daemonErrorNotifications.Unlock()
-
-	notifyURL := "http://localhost:9009/repo?path=" + url.QueryEscape(repo.Path)
-	go func() {
-		if notifyErr := notifications.OSNotifyURL(config.AppName, fmt.Sprintf("%s pull failed", repo.Name), pullErr.Error(), notifyURL); notifyErr != nil {
-			slog.Error("failed to send pull error notification", slog.String("repo", repo.Name), slog.String("err", notifyErr.Error()))
-		}
-	}()
 }
