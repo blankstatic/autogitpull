@@ -4,7 +4,9 @@ import (
 	"errors"
 	"net/http"
 	"net/http/httptest"
+	"path/filepath"
 	"testing"
+	"time"
 
 	"github.com/blankstatic/autogitpull/autogitpull_go/internal/config"
 	"github.com/blankstatic/autogitpull/autogitpull_go/internal/db"
@@ -64,6 +66,66 @@ func TestNotificationsPluginAllowsManualSourcesWithoutChanges(t *testing.T) {
 				t.Fatalf("unexpected default config: %+v", def.DefaultConfig)
 			}
 		})
+	}
+}
+
+func TestNotificationsPluginStoresResult(t *testing.T) {
+	oldNotify := notifyURL
+	done := make(chan string, 1)
+	notifyURL = func(_, _, _, openURL string) error {
+		done <- openURL
+		return nil
+	}
+	defer func() { notifyURL = oldNotify }()
+
+	store, err := db.Open(filepath.Join(t.TempDir(), "updates.sqlite"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	updateID, err := store.BeginUpdate("/repo/a", "a")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.FinishUpdate(updateID, "Already up to date.", nil); err != nil {
+		t.Fatal(err)
+	}
+	update, err := store.GetUpdate(updateID)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	notificationPlugin().Run(Context{
+		Repo:    &config.RepoInfo{Path: "/repo/a", Name: "a"},
+		Update:  update,
+		Store:   store,
+		Notify:  true,
+		Source:  "web_manual",
+		OpenURL: "http://localhost:9009/update?id=1",
+	})
+
+	select {
+	case got := <-done:
+		if got != "http://localhost:9009/update?id=1" {
+			t.Fatalf("unexpected notification URL: %q", got)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("notification was not sent")
+	}
+	var results []db.PluginResult
+	deadline := time.Now().Add(time.Second)
+	for time.Now().Before(deadline) {
+		results, err = store.PluginResultsByUpdate(updateID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(results) > 0 {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if len(results) != 1 || results[0].PluginID != NotificationsID || results[0].Status != "success" {
+		t.Fatalf("unexpected notification result: %+v", results)
 	}
 }
 

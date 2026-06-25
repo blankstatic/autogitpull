@@ -515,13 +515,18 @@ func TestUpdatePageShowsChangeAndAISummaries(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := store.FinishUpdateWithRevisions(updateID, "Fast-forward\n file.go | 2 +", nil, "abc", "def"); err != nil {
+	beforeRev := "118e9c5b1a2572ac41acc8cf9a2c7dd65d0309a7"
+	afterRev := "228e9c5b1a2572ac41acc8cf9a2c7dd65d0309a8"
+	if err := store.FinishUpdateWithRevisions(updateID, "Fast-forward\n file.go | 2 +", nil, beforeRev, afterRev); err != nil {
 		t.Fatal(err)
 	}
 	if err := store.SavePluginResult(updateID, plugins.AISummaryID, "success", "first summary", ""); err != nil {
 		t.Fatal(err)
 	}
 	if err := store.SavePluginResult(updateID, plugins.AISummaryID, "success", "second summary", ""); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.SavePluginResult(updateID, plugins.NotificationsID, "success", "http://localhost:9009/update?id=1", ""); err != nil {
 		t.Fatal(err)
 	}
 
@@ -534,10 +539,13 @@ func TestUpdatePageShowsChangeAndAISummaries(t *testing.T) {
 		t.Fatalf("expected status 200, got %d: %s", rec.Code, rec.Body.String())
 	}
 	body := rec.Body.String()
-	for _, want := range []string{"Fast-forward", "first summary", "second summary", "Generate again"} {
+	for _, want := range []string{"Fast-forward", "first summary", "second summary", "Generate again", "Plugin results", "notifications"} {
 		if !strings.Contains(body, want) {
 			t.Fatalf("expected update page to contain %q", want)
 		}
+	}
+	if !strings.Contains(body, "118e9c5b1a25") || !strings.Contains(body, `title="118e9c5b1a2572ac41acc8cf9a2c7dd65d0309a7"`) {
+		t.Fatalf("expected compact revision hash with full hash title")
 	}
 }
 

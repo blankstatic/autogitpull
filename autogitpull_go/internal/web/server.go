@@ -448,9 +448,10 @@ func (s *Server) update(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	renderTemplate(w, updateTemplate, map[string]any{
-		"Update":      update,
-		"AISummaries": aiSummaryResults(results),
-		"Flash":       flashFromRequest(r),
+		"Update":        update,
+		"AISummaries":   aiSummaryResults(results),
+		"PluginResults": results,
+		"Flash":         flashFromRequest(r),
 	})
 }
 
@@ -1487,6 +1488,7 @@ var baseCSS = template.CSS(`
 	.metric-label { color: var(--muted); font-size: 11px; font-weight: 650; text-transform: uppercase; letter-spacing: .04em; }
 	.metric-value { margin-top: 4px; font-size: 20px; font-weight: 650; color: var(--text); }
 	.metric-detail { margin-top: 4px; color: var(--muted); font-size: 12px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+	.metric-hash { display: inline-block; max-width: 100%; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; overflow: hidden; text-overflow: ellipsis; vertical-align: bottom; }
 	.panel { background: var(--panel); border: 1px solid var(--border-muted); border-radius: 8px; overflow: hidden; box-shadow: var(--shadow); }
 	.panel:hover { border-color: #d0d7de; }
 	.panel-head { padding: 13px 16px; border-bottom: 1px solid var(--border-muted); background: var(--panel); display: flex; justify-content: space-between; gap: 14px; align-items: center; }
@@ -1615,6 +1617,12 @@ var templateFuncs = template.FuncMap{
 	"join":          strings.Join,
 	"humanNumber":   humanizeNumber,
 	"updateURL":     updateURL,
+	"shortHash": func(hash string) string {
+		if len(hash) <= 12 {
+			return hash
+		}
+		return hash[:12]
+	},
 	"skipReasonLabel": func(reason string) string {
 		switch reason {
 		case "dirty_worktree":
@@ -1780,11 +1788,14 @@ var updateTemplate = template.Must(template.New("update").Funcs(templateFuncs).P
 	<div class="metric"><div class="metric-label">Status</div><div class="metric-value"><span class="badge {{statusClass .Update.Status}}">{{.Update.Status}}</span></div></div>
 	<div class="metric"><div class="metric-label">Changed</div><div class="metric-value">{{if .Update.Changed}}<span class="badge success">yes</span>{{else}}<span class="badge paused">no</span>{{end}}</div></div>
 	<div class="metric"><div class="metric-label">Started</div><div class="metric-value">{{humanTime .Update.StartedAt}}</div><div class="metric-detail">{{formatTime .Update.StartedAt}}</div></div>
-	<div class="metric"><div class="metric-label">Revision range</div><div class="metric-value">{{if .Update.BeforeRev}}{{.Update.BeforeRev}}{{else}}-{{end}}</div><div class="metric-detail">{{if .Update.AfterRev}}{{.Update.AfterRev}}{{else}}-{{end}}</div></div>
+	<div class="metric"><div class="metric-label">Revision range</div><div class="metric-value">{{if .Update.BeforeRev}}<span class="metric-hash" title="{{.Update.BeforeRev}}">{{shortHash .Update.BeforeRev}}</span>{{else}}-{{end}}</div><div class="metric-detail">{{if .Update.AfterRev}}<span class="metric-hash" title="{{.Update.AfterRev}}">{{shortHash .Update.AfterRev}}</span>{{else}}-{{end}}</div></div>
 </section>
 <section class="panel" id="change"><div class="panel-head"><h2><a class="panel-title" href="#change">Change</a></h2></div><div class="panel-body"><pre>{{if .Update.Error}}{{.Update.Error}}{{else}}{{.Update.Result}}{{end}}</pre></div></section>
 <section class="panel" id="ai-summary"><div class="panel-head"><h2><a class="panel-title" href="#ai-summary">AI summaries</a></h2><form class="action-form" method="post" action="/update/ai-summary"><input type="hidden" name="id" value="{{.Update.ID}}"><button class="button primary" type="submit">Generate again</button></form></div><div class="panel-body">
 {{if .AISummaries}}{{range .AISummaries}}<div class="repo" style="box-shadow:none;margin-bottom:12px"><div class="repo-title"><strong>{{humanTime .CreatedAt}}</strong><span class="badge {{statusClass .Status}}">{{.Status}}</span></div>{{if .Error}}<pre>{{.Error}}</pre>{{end}}{{if .Result}}<pre>{{.Result}}</pre>{{end}}</div>{{end}}{{else}}<div class="empty">No AI summaries yet.</div>{{end}}
+</div></section>
+<section class="panel" id="plugin-results"><div class="panel-head"><h2><a class="panel-title" href="#plugin-results">Plugin results</a></h2></div><div class="panel-body">
+{{if .PluginResults}}<table><tr><th>Time</th><th>Plugin</th><th>Status</th><th>Result</th></tr>{{range .PluginResults}}<tr><td><div class="time">{{humanTime .CreatedAt}}</div><div class="time-detail">{{formatTime .CreatedAt}}</div></td><td>{{.PluginID}}</td><td><span class="badge {{statusClass .Status}}">{{.Status}}</span></td><td><pre>{{if .Error}}{{.Error}}{{else}}{{.Result}}{{end}}</pre></td></tr>{{end}}</table>{{else}}<div class="empty">No plugin results yet.</div>{{end}}
 </div></section>
 </main><script>document.querySelectorAll('form').forEach(form => form.addEventListener('submit', () => { const b = document.activeElement; if (b && b.tagName === 'BUTTON') b.textContent = 'Working...'; }));</script></body></html>`))
 
