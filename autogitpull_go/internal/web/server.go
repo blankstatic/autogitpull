@@ -172,6 +172,7 @@ func (s *Server) routes() {
 	s.mux.HandleFunc("/repo/unregister", s.unregisterRepo)
 	s.mux.HandleFunc("/repos/bulk", s.bulkRepos)
 	s.mux.HandleFunc("/settings", s.settings)
+	s.mux.HandleFunc("/status", s.status)
 	s.mux.HandleFunc("/plugins", s.plugins)
 	s.mux.HandleFunc("/plugins/save", s.savePlugin)
 	s.mux.HandleFunc("/favicon.ico", s.icon)
@@ -201,10 +202,6 @@ func (s *Server) index(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
-	dbPath, _ := config.GetUpdatesDBPath()
-	serviceStatus := getServiceStatus()
-	cfg := s.storage.GetConfig()
-	pluginSummary := newPluginSummary(s.storage.GetPluginStates())
 	activity, err := s.activity("")
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
@@ -221,14 +218,20 @@ func (s *Server) index(w http.ResponseWriter, r *http.Request) {
 		"TotalUpdates":  totalUpdates,
 		"Pagination":    newPagination(r.URL.Path, filterQueryValues(filter), page, totalUpdates),
 		"EventFilter":   newEventFilter(r.URL.Path, nil, filter),
-		"DBPath":        dbPath,
-		"ServiceStatus": serviceStatus,
-		"ServiceLabel":  serviceLabel,
-		"PluginSummary": pluginSummary,
+		"PluginSummary": newPluginSummary(s.storage.GetPluginStates()),
 		"AppVersion":    versionpkg.AppVersion,
-		"PullInterval":  cfg.PullIntervalMinutes,
-		"RetentionDays": cfg.HistoryRetentionDays,
+		"Flash":         flashFromRequest(r),
+	})
+}
+
+func (s *Server) status(w http.ResponseWriter, r *http.Request) {
+	dbPath, _ := config.GetUpdatesDBPath()
+	renderTemplate(w, statusTemplate, map[string]any{
+		"DBPath":        dbPath,
+		"ServiceStatus": getServiceStatus(),
+		"ServiceLabel":  serviceLabel,
 		"DaemonStatus":  GetDaemonStatus(),
+		"PluginSummary": newPluginSummary(s.storage.GetPluginStates()),
 		"Flash":         flashFromRequest(r),
 	})
 }
@@ -1363,29 +1366,14 @@ const activityTemplate = `{{define "activity"}}<div class="activity-wrap"><div c
 
 var indexTemplate = template.Must(template.New("index").Funcs(templateFuncs).Parse(`
 <!doctype html><html><head><meta charset="utf-8"><title>autogitpull</title><link rel="icon" type="image/png" href="/favicon.ico"><style>` + string(baseCSS) + `</style></head>
-<body><header><div class="header-inner"><a class="brand" href="/"><img class="brand-icon" src="/assets/app-icon.png" alt=""><h1>autogitpull</h1></a><div class="actions"><a class="button" href="/plugins">Plugins</a><a class="button" href="/settings">Settings</a></div></div></header><main>
+<body><header><div class="header-inner"><a class="brand" href="/"><img class="brand-icon" src="/assets/app-icon.png" alt=""><h1>autogitpull</h1></a><div class="actions"><a class="button" href="/status">Status</a><a class="button" href="/plugins">Plugins</a><a class="button" href="/settings">Settings</a></div></div></header><main>
 {{if .Flash.Text}}<div class="flash {{.Flash.Class}}">{{.Flash.Text}}</div>{{end}}
 <section class="summary">
 	<div class="metric"><div class="metric-label">Repositories</div><div class="metric-value">{{humanNumber .RepoCount}}</div></div>
 	<div class="metric"><div class="metric-label">Recent events</div><div class="metric-value">{{humanNumber .TotalUpdates}}</div></div>
-	<div class="metric"><div class="metric-label">Service</div><div class="metric-value"><span class="badge {{serviceStatusClass .ServiceStatus}}">{{.ServiceStatus}}</span></div><div class="metric-detail">{{.ServiceLabel}}</div></div>
-	<div class="metric"><div class="metric-label">Database</div><div class="path" title="{{.DBPath}}">{{compactPath .DBPath}}</div></div>
+	<div class="metric"><div class="metric-label">Plugins</div><div class="metric-value">{{humanNumber .PluginSummary.Enabled}}/{{humanNumber .PluginSummary.Total}}</div><div class="metric-detail"><a href="/plugins">Configure plugins</a></div></div>
 </section>
 <div class="grid">
-<section class="panel" id="plugins"><div class="panel-head"><h2><a class="panel-title" href="/plugins">Plugins</a></h2><a class="button" href="/plugins">Configure</a></div><div class="panel-body">
-<div class="summary">
-	<div class="metric"><div class="metric-label">Available</div><div class="metric-value">{{humanNumber .PluginSummary.Total}}</div></div>
-	<div class="metric"><div class="metric-label">Enabled</div><div class="metric-value">{{humanNumber .PluginSummary.Enabled}}</div><div class="metric-detail">Run after changed pulls</div></div>
-</div>
-</div></section>
-<section class="panel" id="daemon"><div class="panel-head"><h2><a class="panel-title" href="#daemon">Daemon</a></h2></div><div class="panel-body">
-<div class="summary">
-	<div class="metric"><div class="metric-label">Next run</div><div class="metric-value">{{humanTime .DaemonStatus.NextRunAt}}</div><div class="metric-detail">{{formatTime .DaemonStatus.NextRunAt}}</div></div>
-	<div class="metric"><div class="metric-label">Last run</div><div class="metric-value">{{if .DaemonStatus.LastRunDuration}}{{humanDuration .DaemonStatus.LastRunDuration}}{{else}}-{{end}}</div><div class="metric-detail">{{formatTime .DaemonStatus.LastRunStarted}}</div></div>
-	<div class="metric"><div class="metric-label">Pulling now</div><div class="metric-value">{{humanNumber (len .DaemonStatus.RunningRepos)}}</div><div class="metric-detail">{{if .DaemonStatus.RunningRepos}}{{join .DaemonStatus.RunningRepos ", "}}{{else}}Idle{{end}}</div></div>
-	<div class="metric"><div class="metric-label">Last run result</div><div class="metric-value">{{humanNumber .DaemonStatus.Checked}}</div><div class="metric-detail">ok {{humanNumber .DaemonStatus.Success}} · skipped {{humanNumber .DaemonStatus.Skipped}} · error {{humanNumber .DaemonStatus.Error}}</div></div>
-</div>
-</div></section>
 <section class="panel" id="activity"><div class="panel-head"><h2><a class="panel-title" href="#activity">Activity</a></h2></div><div class="panel-body">
 {{template "activity" .Activity}}
 </div></section>
@@ -1511,6 +1499,25 @@ var settingsTemplate = template.Must(template.New("settings").Funcs(templateFunc
 </form>
 </div></section>
 </main><script>document.querySelectorAll('form').forEach(form => form.addEventListener('submit', () => { const b = document.activeElement; if (b && b.tagName === 'BUTTON') b.textContent = 'Saving...'; }));</script></body></html>`))
+
+var statusTemplate = template.Must(template.New("status").Funcs(templateFuncs).Parse(`
+<!doctype html><html><head><meta charset="utf-8"><title>Status - autogitpull</title><link rel="icon" type="image/png" href="/favicon.ico"><style>` + string(baseCSS) + `</style></head>
+<body><header><div class="header-inner"><a class="brand" href="/"><img class="brand-icon" src="/assets/app-icon.png" alt=""><h1>Status</h1></a><a class="badge" href="/">Back</a></div></header><main class="grid">
+{{if .Flash.Text}}<div class="flash {{.Flash.Class}}">{{.Flash.Text}}</div>{{end}}
+<section class="summary">
+	<div class="metric"><div class="metric-label">Service</div><div class="metric-value"><span class="badge {{serviceStatusClass .ServiceStatus}}">{{.ServiceStatus}}</span></div><div class="metric-detail">{{.ServiceLabel}}</div></div>
+	<div class="metric"><div class="metric-label">Database</div><div class="path" title="{{.DBPath}}">{{compactPath .DBPath}}</div></div>
+	<div class="metric"><div class="metric-label">Plugins</div><div class="metric-value">{{humanNumber .PluginSummary.Enabled}}/{{humanNumber .PluginSummary.Total}}</div><div class="metric-detail"><a href="/plugins">Configure plugins</a></div></div>
+</section>
+<section class="panel" id="daemon"><div class="panel-head"><h2><a class="panel-title" href="#daemon">Daemon</a></h2></div><div class="panel-body">
+<div class="summary">
+	<div class="metric"><div class="metric-label">Next run</div><div class="metric-value">{{humanTime .DaemonStatus.NextRunAt}}</div><div class="metric-detail">{{formatTime .DaemonStatus.NextRunAt}}</div></div>
+	<div class="metric"><div class="metric-label">Last run</div><div class="metric-value">{{if .DaemonStatus.LastRunDuration}}{{humanDuration .DaemonStatus.LastRunDuration}}{{else}}-{{end}}</div><div class="metric-detail">{{formatTime .DaemonStatus.LastRunStarted}}</div></div>
+	<div class="metric"><div class="metric-label">Pulling now</div><div class="metric-value">{{humanNumber (len .DaemonStatus.RunningRepos)}}</div><div class="metric-detail">{{if .DaemonStatus.RunningRepos}}{{join .DaemonStatus.RunningRepos ", "}}{{else}}Idle{{end}}</div></div>
+	<div class="metric"><div class="metric-label">Last run result</div><div class="metric-value">{{humanNumber .DaemonStatus.Checked}}</div><div class="metric-detail">ok {{humanNumber .DaemonStatus.Success}} · skipped {{humanNumber .DaemonStatus.Skipped}} · error {{humanNumber .DaemonStatus.Error}}</div></div>
+</div>
+</div></section>
+</main></body></html>`))
 
 var unregisterTemplate = template.Must(template.New("unregister").Funcs(templateFuncs).Parse(`
 <!doctype html><html><head><meta charset="utf-8"><title>Unregister {{.Repo.Name}} - autogitpull</title><link rel="icon" type="image/png" href="/favicon.ico"><style>` + string(baseCSS) + `</style></head>

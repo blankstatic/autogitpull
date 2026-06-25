@@ -105,6 +105,42 @@ func TestIndexReadsReposAddedToDatabaseByAnotherProcess(t *testing.T) {
 	if !strings.Contains(rec.Body.String(), "from-cli") {
 		t.Fatalf("expected externally added repo in index response")
 	}
+	for _, unwanted := range []string{"Service", "Database", `id="daemon"`} {
+		if strings.Contains(rec.Body.String(), unwanted) {
+			t.Fatalf("expected %q to live off the main dashboard", unwanted)
+		}
+	}
+	if !strings.Contains(rec.Body.String(), "Configure plugins") {
+		t.Fatalf("expected plugin summary on main dashboard")
+	}
+}
+
+func TestStatusPageRendersServiceDatabaseAndDaemon(t *testing.T) {
+	dir := t.TempDir()
+	storage := config.NewStorageManager(filepath.Join(dir, "config.json"))
+	if err := storage.Load(); err != nil {
+		t.Fatal(err)
+	}
+	store, err := db.Open(filepath.Join(dir, "updates.sqlite"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+
+	server := New(store, storage)
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest("GET", "/status", nil)
+	server.mux.ServeHTTP(rec, req)
+
+	if rec.Code != 200 {
+		t.Fatalf("expected status 200, got %d: %s", rec.Code, rec.Body.String())
+	}
+	body := rec.Body.String()
+	for _, want := range []string{"Service", "Database", "Plugins", "Daemon"} {
+		if !strings.Contains(body, want) {
+			t.Fatalf("expected status page to contain %q", want)
+		}
+	}
 }
 
 func TestPluginsPageRendersBuiltInPlugins(t *testing.T) {

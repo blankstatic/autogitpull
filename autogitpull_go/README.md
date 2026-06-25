@@ -17,7 +17,8 @@ you work.
 - Records update history in `~/.autogitpull/updates.sqlite`.
 - Shows registered repositories in a terminal UI.
 - Starts a local dashboard at `http://localhost:9009` while the daemon runs.
-- Sends macOS notifications when a pull brings new changes.
+- Runs change-processing plugins after recorded pulls.
+- Sends macOS notifications through the built-in Notifications plugin.
 - Can be installed as a macOS `launchd` service.
 
 The safety rule is intentionally simple: `autogitpull` only pulls when the repo
@@ -209,18 +210,41 @@ http://localhost:9009
 The dashboard shows:
 
 - registered repositories;
-- last sync time;
-- update history;
-- skipped pulls;
-- failed pulls;
 - changed update activity for the last year;
+- update history;
+- skipped and failed pulls;
+- a compact plugin summary;
 - per-repository details and current local changes.
+
+Additional dashboard pages:
+
+- `/status` shows service state, database path, plugin summary, and daemon run
+  status.
+- `/settings` configures daemon pull interval and history retention.
+- `/plugins` enables and configures change-processing plugins.
 
 Notification clicks open the related repository page in this dashboard.
 
+## Plugins
+
+Plugins run from the shared pull/update pipeline used by the web dashboard, the
+terminal UI, and the daemon:
+
+1. A pull is recorded with `db.Store.FinishUpdate`.
+2. The saved `db.Update` is loaded.
+3. `plugins.RunAfterChange` runs enabled plugins.
+
+By default, plugins run only when the saved update has `changed = true`. A plugin
+can opt into no-change runs. The built-in Notifications plugin is enabled by
+default with `title_prefix=Pulled` and also runs for manual web and TUI pulls
+that complete without new changes.
+
+Plugin settings are stored in the `plugin_settings` table in
+`~/.autogitpull/updates.sqlite`.
+
 ## Storage
 
-Repositories, settings, and update history are stored in SQLite:
+Repositories, settings, plugin settings, and update history are stored in SQLite:
 
 ```sh
 ~/.autogitpull/updates.sqlite
@@ -248,6 +272,7 @@ For every registered repository, `autogitpull` does this:
 4. Runs `git pull origin` only when the branch matches and the working tree is
    clean.
 5. Records the result in the update history database.
+6. Runs enabled plugins from the saved update record.
 
 Common skip cases:
 
@@ -260,8 +285,10 @@ This avoids pulling into feature branches or overwriting active local work.
 
 ## Notifications
 
-On macOS, `autogitpull` sends notifications for registration actions and for
-successful pulls that bring changes.
+On macOS, `autogitpull` sends notifications for registration actions. Pull
+notifications are handled by the built-in Notifications plugin. It sends
+notifications for changed daemon/web/TUI pulls, and also for successful manual
+web/TUI pulls even when there are no new changes.
 
 By default it looks for:
 

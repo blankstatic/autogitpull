@@ -4,6 +4,8 @@
 - Go code lives in `autogitpull_go`.
 - Config and repo state are stored in the shared SQLite DB at `~/.autogitpull/updates.sqlite`.
 - Web UI is in `autogitpull_go/internal/web/server.go`; templates are embedded Go template strings in that file.
+- Main web dashboard should contain only activity, repositories, updates, and the compact plugins summary/link. Put everything else on separate pages.
+- Web service/database/daemon details live on the separate `/status` page; keep those details off the main dashboard.
 - Web daemon settings live on the separate `/settings` page; keep interval/retention out of the main dashboard header.
 - Web, TUI, and daemon must use one shared system for pull/update side effects: record via `db.Store.FinishUpdate`, load the saved `db.Update`, then call `plugins.RunAfterChange` with a source such as `web_manual`, `web_bulk`, `tui_manual`, or `daemon`.
 - Historically some functionality was duplicated between web and TUI; avoid new duplicate side-effect logic and keep web/TUI/daemon behavior aligned through shared packages.
@@ -17,3 +19,4 @@
 - Notifications are implemented as the built-in `notifications` plugin, default enabled with `title_prefix=Pulled`; do not call `pkg/notifications` directly from web, TUI, or daemon flows.
 - Manual web and TUI pull notifications should fire through the notifications plugin even when the pull has no new changes; other plugins remain changed-only unless they opt into no-change runs.
 - Before finishing code changes, run `go test ./...` from `autogitpull_go`.
+- Keep project memory and docs current: update `AGENTS.md` and `autogitpull_go/README.md` when dashboard pages, plugin behavior, storage, pull flow, TUI/web/daemon alignment, or user-facing commands change.
