@@ -298,3 +298,5 @@ autogitpull-macos-arm64
 ```
 
 The installer expects the release asset to use that exact name.
+
+<test commit>
