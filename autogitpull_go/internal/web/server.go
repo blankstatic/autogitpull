@@ -17,10 +17,10 @@ import (
 
 	"github.com/blankstatic/autogitpull/autogitpull_go/internal/config"
 	"github.com/blankstatic/autogitpull/autogitpull_go/internal/db"
+	"github.com/blankstatic/autogitpull/autogitpull_go/internal/plugins"
 	servicepkg "github.com/blankstatic/autogitpull/autogitpull_go/internal/service"
 	versionpkg "github.com/blankstatic/autogitpull/autogitpull_go/internal/version"
 	"github.com/blankstatic/autogitpull/autogitpull_go/pkg/git"
-	"github.com/blankstatic/autogitpull/autogitpull_go/pkg/notifications"
 )
 
 const Addr = ":9009"
@@ -43,6 +43,11 @@ type Server struct {
 type RepoCard struct {
 	Repo       config.RepoInfo
 	LastUpdate *db.Update
+}
+
+type PluginSummary struct {
+	Total   int
+	Enabled int
 }
 
 type ChangedFile struct {
@@ -138,6 +143,7 @@ func GetDaemonStatus() DaemonStatus {
 }
 
 func New(store *db.Store, storage *config.StorageManager) *Server {
+	plugins.EnsureDefaults(storage)
 	s := &Server{
 		store:   store,
 		storage: storage,
@@ -166,6 +172,8 @@ func (s *Server) routes() {
 	s.mux.HandleFunc("/repo/unregister", s.unregisterRepo)
 	s.mux.HandleFunc("/repos/bulk", s.bulkRepos)
 	s.mux.HandleFunc("/settings", s.settings)
+	s.mux.HandleFunc("/plugins", s.plugins)
+	s.mux.HandleFunc("/plugins/save", s.savePlugin)
 	s.mux.HandleFunc("/favicon.ico", s.icon)
 	s.mux.HandleFunc("/assets/app-icon.png", s.icon)
 }
@@ -196,6 +204,7 @@ func (s *Server) index(w http.ResponseWriter, r *http.Request) {
 	dbPath, _ := config.GetUpdatesDBPath()
 	serviceStatus := getServiceStatus()
 	cfg := s.storage.GetConfig()
+	pluginSummary := newPluginSummary(s.storage.GetPluginStates())
 	activity, err := s.activity("")
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
@@ -215,6 +224,7 @@ func (s *Server) index(w http.ResponseWriter, r *http.Request) {
 		"DBPath":        dbPath,
 		"ServiceStatus": serviceStatus,
 		"ServiceLabel":  serviceLabel,
+		"PluginSummary": pluginSummary,
 		"AppVersion":    versionpkg.AppVersion,
 		"PullInterval":  cfg.PullIntervalMinutes,
 		"RetentionDays": cfg.HistoryRetentionDays,
@@ -303,15 +313,13 @@ func (s *Server) pullRepo(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
-	notifyURL := "http://localhost" + Addr + repoURL(repo.Path, "")
 	if pullErr != nil {
-		notifyPull(repo, fmt.Sprintf("%s pull failed", repo.Name), pullErr.Error(), notifyURL)
 		http.Redirect(w, r, repoURLWithFlash(repoPath, eventFilterAll, pullFlashText(pullErr), pullFlashType(pullErr)), http.StatusSeeOther)
 		return
 	}
 	if pullErr == nil {
 		_ = s.storage.UpdateLastSync(repo.Path)
-		notifyPull(repo, fmt.Sprintf("%s pull", repo.Name), result, notifyURL)
+		s.runPluginsAfterChange(repo, updateID, true, "web_manual")
 	}
 	http.Redirect(w, r, repoURLWithFlash(repoPath, eventFilterAll, "Pulled successfully", "success"), http.StatusSeeOther)
 }
@@ -357,6 +365,15 @@ func (s *Server) notifyRepo(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) settings(w http.ResponseWriter, r *http.Request) {
+	if r.Method == http.MethodGet {
+		cfg := s.storage.GetConfig()
+		renderTemplate(w, settingsTemplate, map[string]any{
+			"PullInterval":  cfg.PullIntervalMinutes,
+			"RetentionDays": cfg.HistoryRetentionDays,
+			"Flash":         flashFromRequest(r),
+		})
+		return
+	}
 	if r.Method != http.MethodPost {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 		return
@@ -383,7 +400,36 @@ func (s *Server) settings(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
-	http.Redirect(w, r, flashURL("/", "Settings saved", "success"), http.StatusSeeOther)
+	http.Redirect(w, r, flashURL("/settings", "Settings saved", "success"), http.StatusSeeOther)
+}
+
+func (s *Server) plugins(w http.ResponseWriter, r *http.Request) {
+	renderTemplate(w, pluginsTemplate, map[string]any{
+		"Plugins": plugins.Views(s.storage.GetPluginStates()),
+		"Flash":   flashFromRequest(r),
+	})
+}
+
+func (s *Server) savePlugin(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	id := r.FormValue("id")
+	def, err := plugins.ValidateID(id)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+	state := config.PluginState{ID: id, Enabled: r.FormValue("enabled") == "1", Config: map[string]string{}}
+	for _, field := range def.Fields {
+		state.Config[field.Key] = strings.TrimSpace(r.FormValue("config_" + field.Key))
+	}
+	if err := s.storage.SetPluginState(state); err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	http.Redirect(w, r, flashURL("/plugins", "Plugin saved", "success"), http.StatusSeeOther)
 }
 
 func (s *Server) bulkRepos(w http.ResponseWriter, r *http.Request) {
@@ -458,6 +504,7 @@ func (s *Server) pullRepoRecord(repo *config.RepoInfo) {
 	}
 	if pullErr == nil {
 		_ = s.storage.UpdateLastSync(repo.Path)
+		s.runPluginsAfterChange(repo, updateID, true, "web_bulk")
 	}
 }
 
@@ -535,6 +582,17 @@ func repoCards(repos []config.RepoInfo, latest map[string]db.Update) []RepoCard 
 		cards = append(cards, card)
 	}
 	return cards
+}
+
+func newPluginSummary(states map[string]config.PluginState) PluginSummary {
+	views := plugins.Views(states)
+	summary := PluginSummary{Total: len(views)}
+	for _, view := range views {
+		if view.Enabled {
+			summary.Enabled++
+		}
+	}
+	return summary
 }
 
 func redirectRepo(w http.ResponseWriter, r *http.Request, repoPath string) {
@@ -625,22 +683,30 @@ func openTargetLabel(target string) string {
 	}
 }
 
-func notifyPull(repo *config.RepoInfo, title, body, notifyURL string) {
-	if !repo.NotificationsEnabled() {
-		return
-	}
-	go func() {
-		if notifyErr := notifications.OSNotifyURL(config.AppName, title, body, notifyURL); notifyErr != nil {
-			slog.Error("failed to send pull notification", slog.String("repo", repo.Name), slog.String("err", notifyErr.Error()))
-		}
-	}()
-}
-
 func pullFlashText(pullErr error) string {
 	if db.IsSkippedPullError(pullErr.Error()) {
 		return "Pull skipped: " + pullErr.Error()
 	}
 	return "Pull failed: " + pullErr.Error()
+}
+
+func (s *Server) runPluginsAfterChange(repo *config.RepoInfo, updateID int64, notify bool, source string) {
+	update, err := s.store.GetUpdate(updateID)
+	if err != nil {
+		slog.Error("failed to load update for plugins", slog.String("repo", repo.Name), slog.String("err", err.Error()))
+		return
+	}
+	openURL := "http://localhost" + Addr + repoURL(repo.Path, "")
+	plugins.RunAfterChange(plugins.Context{
+		Repo:      repo,
+		Update:    update,
+		Notify:    notify,
+		Source:    source,
+		Dashboard: "http://localhost" + Addr,
+		OpenURL:   openURL,
+		AppName:   config.AppName,
+		Logger:    slog.Default(),
+	}, s.storage.GetPluginStates())
 }
 
 func pullFlashType(pullErr error) string {
@@ -1186,6 +1252,7 @@ var baseCSS = template.CSS(`
 	.select-all { display: inline-flex; align-items: center; gap: 6px; color: var(--muted); font-size: 12px; font-weight: 600; user-select: none; }
 	.button:disabled { opacity: .52; cursor: not-allowed; background: var(--subtle); box-shadow: none; }
 	.input { width: 76px; min-height: 28px; padding: 4px 8px; border: 1px solid var(--border); border-radius: 8px; background: #ffffff; color: var(--text); font: inherit; box-shadow: inset 0 1px 0 rgba(0, 0, 0, .03); }
+	.input.wide { width: min(360px, 100%); }
 	.input:focus, .button:focus-visible, .page-link:focus-visible, .filter-link:focus-visible, a.repo:focus-visible { outline: 2px solid rgba(9, 105, 218, .35); outline-offset: 2px; }
 	.input.confirm { width: 220px; }
 	.repo-list { display: grid; grid-template-columns: repeat(auto-fill, minmax(320px, 1fr)); gap: 14px; }
@@ -1284,13 +1351,19 @@ var templateFuncs = template.FuncMap{
 		return s
 	},
 	"compactPath": compactPath,
+	"configValue": func(values map[string]string, key string) string {
+		if values == nil {
+			return ""
+		}
+		return values[key]
+	},
 }
 
 const activityTemplate = `{{define "activity"}}<div class="activity-wrap"><div class="activity-grid" aria-label="Changed update activity from {{.Start}} to {{.End}}">{{range .Cells}}<span class="activity-cell" data-level="{{.Level}}" data-title="{{.Title}}" aria-label="{{.Title}}" tabindex="0"></span>{{end}}</div></div><div class="activity-meta"><div>{{humanNumber .Total}} changed updates in the last year</div><div class="activity-legend"><span>Less</span><span class="activity-cell" data-level="0"></span><span class="activity-cell" data-level="1"></span><span class="activity-cell" data-level="2"></span><span class="activity-cell" data-level="3"></span><span class="activity-cell" data-level="4"></span><span>More</span></div></div>{{end}}`
 
 var indexTemplate = template.Must(template.New("index").Funcs(templateFuncs).Parse(`
 <!doctype html><html><head><meta charset="utf-8"><title>autogitpull</title><link rel="icon" type="image/png" href="/favicon.ico"><style>` + string(baseCSS) + `</style></head>
-<body><header><div class="header-inner"><a class="brand" href="/"><img class="brand-icon" src="/assets/app-icon.png" alt=""><h1>autogitpull</h1></a><form class="action-form" method="post" action="/settings"><span class="badge paused">Interval</span><input class="input" type="number" min="1" name="pull_interval_minutes" value="{{.PullInterval}}" aria-label="Pull interval minutes"><span class="badge paused">Retention</span><input class="input" type="number" min="1" name="history_retention_days" value="{{.RetentionDays}}" aria-label="History retention days"><button class="button" type="submit">Save</button></form></div></header><main>
+<body><header><div class="header-inner"><a class="brand" href="/"><img class="brand-icon" src="/assets/app-icon.png" alt=""><h1>autogitpull</h1></a><div class="actions"><a class="button" href="/plugins">Plugins</a><a class="button" href="/settings">Settings</a></div></div></header><main>
 {{if .Flash.Text}}<div class="flash {{.Flash.Class}}">{{.Flash.Text}}</div>{{end}}
 <section class="summary">
 	<div class="metric"><div class="metric-label">Repositories</div><div class="metric-value">{{humanNumber .RepoCount}}</div></div>
@@ -1299,6 +1372,12 @@ var indexTemplate = template.Must(template.New("index").Funcs(templateFuncs).Par
 	<div class="metric"><div class="metric-label">Database</div><div class="path" title="{{.DBPath}}">{{compactPath .DBPath}}</div></div>
 </section>
 <div class="grid">
+<section class="panel" id="plugins"><div class="panel-head"><h2><a class="panel-title" href="/plugins">Plugins</a></h2><a class="button" href="/plugins">Configure</a></div><div class="panel-body">
+<div class="summary">
+	<div class="metric"><div class="metric-label">Available</div><div class="metric-value">{{humanNumber .PluginSummary.Total}}</div></div>
+	<div class="metric"><div class="metric-label">Enabled</div><div class="metric-value">{{humanNumber .PluginSummary.Enabled}}</div><div class="metric-detail">Run after changed pulls</div></div>
+</div>
+</div></section>
 <section class="panel" id="daemon"><div class="panel-head"><h2><a class="panel-title" href="#daemon">Daemon</a></h2></div><div class="panel-body">
 <div class="summary">
 	<div class="metric"><div class="metric-label">Next run</div><div class="metric-value">{{humanTime .DaemonStatus.NextRunAt}}</div><div class="metric-detail">{{formatTime .DaemonStatus.NextRunAt}}</div></div>
@@ -1380,7 +1459,7 @@ var indexTemplate = template.Must(template.New("index").Funcs(templateFuncs).Par
 
 var repoTemplate = template.Must(template.New("repo").Funcs(templateFuncs).Parse(`
 <!doctype html><html><head><meta charset="utf-8"><title>{{.Repo.Name}} - autogitpull</title><link rel="icon" type="image/png" href="/favicon.ico"><style>` + string(baseCSS) + `</style></head>
-<body><header><div class="header-inner"><a class="brand" href="/"><img class="brand-icon" src="/assets/app-icon.png" alt=""><div class="header-title"><h1>{{.Repo.Name}}</h1><div class="header-path" title="{{.Repo.Path}}">{{compactPath .Repo.Path}}</div></div></a><div class="actions"><form class="action-form" method="post" action="/repo/pull"><input type="hidden" name="path" value="{{.Repo.Path}}"><button class="button primary" type="submit">Pull now</button></form><form class="action-form" method="post" action="/repo/open"><input type="hidden" name="path" value="{{.Repo.Path}}"><input type="hidden" name="target" value="finder"><button class="button" type="submit">Finder</button></form><form class="action-form" method="post" action="/repo/open"><input type="hidden" name="path" value="{{.Repo.Path}}"><input type="hidden" name="target" value="terminal"><button class="button" type="submit">Terminal</button></form><form class="action-form" method="post" action="/repo/open"><input type="hidden" name="path" value="{{.Repo.Path}}"><input type="hidden" name="target" value="code"><button class="button" type="submit">VS Code</button></form><form class="action-form" method="post" action="/repo/notify"><input type="hidden" name="path" value="{{.Repo.Path}}">{{if .Repo.NotificationsEnabled}}<input type="hidden" name="notify" value="0"><button class="button quiet" type="submit">Mute notifications</button>{{else}}<input type="hidden" name="notify" value="1"><button class="button quiet" type="submit">Enable notifications</button>{{end}}</form><form class="action-form" method="post" action="/repo/pause"><input type="hidden" name="path" value="{{.Repo.Path}}">{{if .Repo.Paused}}<input type="hidden" name="paused" value="0"><button class="button" type="submit">Resume auto-pull</button>{{else}}<input type="hidden" name="paused" value="1"><button class="button warn" type="submit">Pause auto-pull</button>{{end}}</form><a class="button danger" href="/repo/unregister?path={{.Repo.Path | urlquery}}">Unregister</a><a class="badge" href="/">Back</a></div></div></header><main class="grid">
+<body><header><div class="header-inner"><a class="brand" href="/"><img class="brand-icon" src="/assets/app-icon.png" alt=""><div class="header-title"><h1>{{.Repo.Name}}</h1><div class="header-path" title="{{.Repo.Path}}">{{compactPath .Repo.Path}}</div></div></a><div class="actions"><form class="action-form" method="post" action="/repo/pull"><input type="hidden" name="path" value="{{.Repo.Path}}"><button class="button primary" type="submit">Pull now</button></form><form class="action-form" method="post" action="/repo/open"><input type="hidden" name="path" value="{{.Repo.Path}}"><input type="hidden" name="target" value="finder"><button class="button" type="submit">Finder</button></form><form class="action-form" method="post" action="/repo/open"><input type="hidden" name="path" value="{{.Repo.Path}}"><input type="hidden" name="target" value="terminal"><button class="button" type="submit">Terminal</button></form><form class="action-form" method="post" action="/repo/open"><input type="hidden" name="path" value="{{.Repo.Path}}"><input type="hidden" name="target" value="code"><button class="button" type="submit">VS Code</button></form><form class="action-form" method="post" action="/repo/notify"><input type="hidden" name="path" value="{{.Repo.Path}}">{{if .Repo.NotificationsEnabled}}<input type="hidden" name="notify" value="0"><button class="button quiet" type="submit">Mute notifications</button>{{else}}<input type="hidden" name="notify" value="1"><button class="button quiet" type="submit">Enable notifications</button>{{end}}</form><form class="action-form" method="post" action="/repo/pause"><input type="hidden" name="path" value="{{.Repo.Path}}">{{if .Repo.Paused}}<input type="hidden" name="paused" value="0"><button class="button" type="submit">Resume auto-pull</button>{{else}}<input type="hidden" name="paused" value="1"><button class="button warn" type="submit">Pause auto-pull</button>{{end}}</form><a class="button" href="/plugins">Plugins</a><a class="button danger" href="/repo/unregister?path={{.Repo.Path | urlquery}}">Unregister</a><a class="badge" href="/">Back</a></div></div></header><main class="grid">
 {{if .Flash.Text}}<div class="flash {{.Flash.Class}}">{{.Flash.Text}}</div>{{end}}
 <section class="summary">
 	<div class="metric"><div class="metric-label">Default branch</div><div class="metric-value">{{.Repo.DefaultBranch}}</div></div>
@@ -1400,6 +1479,38 @@ var repoTemplate = template.Must(template.New("repo").Funcs(templateFuncs).Parse
 </main><script>document.querySelectorAll('form').forEach(form => form.addEventListener('submit', () => { const b = document.activeElement; if (b && b.tagName === 'BUTTON') b.textContent = 'Working...'; }));</script></body></html>
 
 {{define "pagination"}}<div class="pagination"><div class="pagination-info">{{if .Total}}Showing {{humanNumber .From}}-{{humanNumber .To}} of {{humanNumber .Total}} · page {{humanNumber .Page}} of {{humanNumber .TotalPages}}{{else}}No records{{end}}</div><div class="pagination-actions">{{if .HasPrev}}<a class="page-link" href="{{.PrevURL}}">Prev</a>{{else}}<span class="page-link disabled">Prev</span>{{end}}{{if .HasNext}}<a class="page-link" href="{{.NextURL}}">Next</a>{{else}}<span class="page-link disabled">Next</span>{{end}}</div></div>{{end}}` + activityTemplate))
+
+var pluginsTemplate = template.Must(template.New("plugins").Funcs(templateFuncs).Parse(`
+<!doctype html><html><head><meta charset="utf-8"><title>Plugins - autogitpull</title><link rel="icon" type="image/png" href="/favicon.ico"><style>` + string(baseCSS) + `</style></head>
+<body><header><div class="header-inner"><a class="brand" href="/"><img class="brand-icon" src="/assets/app-icon.png" alt=""><h1>Plugins</h1></a><a class="badge" href="/">Back</a></div></header><main class="grid">
+{{if .Flash.Text}}<div class="flash {{.Flash.Class}}">{{.Flash.Text}}</div>{{end}}
+<section class="panel"><div class="panel-head"><h2>Change plugins</h2></div><div class="panel-body">
+{{if .Plugins}}<div class="repo-list">{{range .Plugins}}{{$plugin := .}}<form class="repo" method="post" action="/plugins/save">
+	<input type="hidden" name="id" value="{{.ID}}">
+	<div class="repo-title"><strong>{{.Name}}</strong>{{if .Enabled}}<span class="badge success">enabled</span>{{else}}<span class="badge paused">disabled</span>{{end}}</div>
+	<div class="time-detail">{{.Description}}</div>
+	<div class="toolbar" style="margin-top:12px;margin-bottom:0"><div class="toolbar-group">
+		<label class="select-all"><input type="checkbox" name="enabled" value="1" {{if .Enabled}}checked{{end}}> Enabled</label>
+		{{range .Fields}}<label class="action-form"><span class="badge paused">{{.Label}}</span><input class="input wide" name="config_{{.Key}}" value="{{configValue $plugin.Config .Key}}"></label>{{end}}
+	</div><button class="button primary" type="submit">Save</button></div>
+</form>{{end}}</div>{{else}}<div class="empty">No plugins available.</div>{{end}}
+</div></section>
+</main><script>document.querySelectorAll('form').forEach(form => form.addEventListener('submit', () => { const b = document.activeElement; if (b && b.tagName === 'BUTTON') b.textContent = 'Saving...'; }));</script></body></html>`))
+
+var settingsTemplate = template.Must(template.New("settings").Funcs(templateFuncs).Parse(`
+<!doctype html><html><head><meta charset="utf-8"><title>Settings - autogitpull</title><link rel="icon" type="image/png" href="/favicon.ico"><style>` + string(baseCSS) + `</style></head>
+<body><header><div class="header-inner"><a class="brand" href="/"><img class="brand-icon" src="/assets/app-icon.png" alt=""><h1>Settings</h1></a><a class="badge" href="/">Back</a></div></header><main class="grid">
+{{if .Flash.Text}}<div class="flash {{.Flash.Class}}">{{.Flash.Text}}</div>{{end}}
+<section class="panel"><div class="panel-head"><h2>Daemon settings</h2></div><div class="panel-body">
+<form class="grid" method="post" action="/settings">
+	<div class="summary">
+		<div class="metric"><div class="metric-label">Pull interval</div><div class="metric-value"><input class="input" type="number" min="1" name="pull_interval_minutes" value="{{.PullInterval}}" aria-label="Pull interval minutes"></div><div class="metric-detail">minutes between daemon pulls</div></div>
+		<div class="metric"><div class="metric-label">History retention</div><div class="metric-value"><input class="input" type="number" min="1" name="history_retention_days" value="{{.RetentionDays}}" aria-label="History retention days"></div><div class="metric-detail">days to keep update history</div></div>
+	</div>
+	<div class="actions"><button class="button primary" type="submit">Save</button><a class="button" href="/">Cancel</a></div>
+</form>
+</div></section>
+</main><script>document.querySelectorAll('form').forEach(form => form.addEventListener('submit', () => { const b = document.activeElement; if (b && b.tagName === 'BUTTON') b.textContent = 'Saving...'; }));</script></body></html>`))
 
 var unregisterTemplate = template.Must(template.New("unregister").Funcs(templateFuncs).Parse(`
 <!doctype html><html><head><meta charset="utf-8"><title>Unregister {{.Repo.Name}} - autogitpull</title><link rel="icon" type="image/png" href="/favicon.ico"><style>` + string(baseCSS) + `</style></head>

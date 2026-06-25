@@ -3,6 +3,7 @@ package web
 import (
 	"database/sql"
 	"errors"
+	"net/http"
 	"net/http/httptest"
 	"net/url"
 	"path/filepath"
@@ -103,6 +104,145 @@ func TestIndexReadsReposAddedToDatabaseByAnotherProcess(t *testing.T) {
 	}
 	if !strings.Contains(rec.Body.String(), "from-cli") {
 		t.Fatalf("expected externally added repo in index response")
+	}
+}
+
+func TestPluginsPageRendersBuiltInPlugins(t *testing.T) {
+	dir := t.TempDir()
+	storage := config.NewStorageManager(filepath.Join(dir, "config.json"))
+	if err := storage.Load(); err != nil {
+		t.Fatal(err)
+	}
+	store, err := db.Open(filepath.Join(dir, "updates.sqlite"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+
+	server := New(store, storage)
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest("GET", "/plugins", nil)
+	server.mux.ServeHTTP(rec, req)
+
+	if rec.Code != 200 {
+		t.Fatalf("expected status 200, got %d: %s", rec.Code, rec.Body.String())
+	}
+	if !strings.Contains(rec.Body.String(), "Notifications") {
+		t.Fatalf("expected notifications plugin in response")
+	}
+}
+
+func TestSettingsPageRendersDaemonSettings(t *testing.T) {
+	dir := t.TempDir()
+	storage := config.NewStorageManager(filepath.Join(dir, "config.json"))
+	if err := storage.Load(); err != nil {
+		t.Fatal(err)
+	}
+	store, err := db.Open(filepath.Join(dir, "updates.sqlite"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+
+	server := New(store, storage)
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest("GET", "/settings", nil)
+	server.mux.ServeHTTP(rec, req)
+
+	if rec.Code != 200 {
+		t.Fatalf("expected status 200, got %d: %s", rec.Code, rec.Body.String())
+	}
+	if !strings.Contains(rec.Body.String(), `name="pull_interval_minutes"`) || !strings.Contains(rec.Body.String(), `name="history_retention_days"`) {
+		t.Fatalf("expected settings form in response")
+	}
+}
+
+func TestSettingsPostSavesDaemonSettings(t *testing.T) {
+	dir := t.TempDir()
+	storage := config.NewStorageManager(filepath.Join(dir, "config.json"))
+	if err := storage.Load(); err != nil {
+		t.Fatal(err)
+	}
+	store, err := db.Open(filepath.Join(dir, "updates.sqlite"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+
+	server := New(store, storage)
+	form := url.Values{
+		"pull_interval_minutes":  {"11"},
+		"history_retention_days": {"22"},
+	}
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest("POST", "/settings", strings.NewReader(form.Encode()))
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	server.mux.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusSeeOther {
+		t.Fatalf("expected redirect, got %d: %s", rec.Code, rec.Body.String())
+	}
+	if location := rec.Header().Get("Location"); !strings.HasPrefix(location, "/settings?") {
+		t.Fatalf("expected redirect to settings, got %q", location)
+	}
+	cfg := storage.GetConfig()
+	if cfg.PullIntervalMinutes != 11 || cfg.HistoryRetentionDays != 22 {
+		t.Fatalf("unexpected saved settings: %+v", cfg)
+	}
+}
+
+func TestNewStoresDefaultNotificationPluginEnabled(t *testing.T) {
+	dir := t.TempDir()
+	storage := config.NewStorageManager(filepath.Join(dir, "config.json"))
+	if err := storage.Load(); err != nil {
+		t.Fatal(err)
+	}
+	store, err := db.Open(filepath.Join(dir, "updates.sqlite"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+
+	_ = New(store, storage)
+
+	state := storage.GetPluginStates()["notifications"]
+	if state.ID != "notifications" || !state.Enabled {
+		t.Fatalf("expected enabled notifications default, got %+v", state)
+	}
+	if state.Config["title_prefix"] != "Pulled" {
+		t.Fatalf("expected default title prefix, got %+v", state.Config)
+	}
+}
+
+func TestSavePluginUpdatesPluginState(t *testing.T) {
+	dir := t.TempDir()
+	storage := config.NewStorageManager(filepath.Join(dir, "config.json"))
+	if err := storage.Load(); err != nil {
+		t.Fatal(err)
+	}
+	store, err := db.Open(filepath.Join(dir, "updates.sqlite"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+
+	server := New(store, storage)
+	form := url.Values{
+		"id":                  {"notifications"},
+		"enabled":             {"1"},
+		"config_title_prefix": {"Changed"},
+	}
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest("POST", "/plugins/save", strings.NewReader(form.Encode()))
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	server.mux.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusSeeOther {
+		t.Fatalf("expected redirect, got %d: %s", rec.Code, rec.Body.String())
+	}
+	state := storage.GetPluginStates()["notifications"]
+	if !state.Enabled || state.Config["title_prefix"] != "Changed" {
+		t.Fatalf("unexpected plugin state: %+v", state)
 	}
 }
 

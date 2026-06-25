@@ -87,6 +87,23 @@ func (s *Store) FinishUpdate(id int64, result string, pullErr error) error {
 	return err
 }
 
+func (s *Store) GetUpdate(id int64) (Update, error) {
+	row := s.db.QueryRow(`
+		SELECT id, repo_path, repo_name, status, result, error, skip_reason, changed, started_at, finished_at
+		FROM updates
+		WHERE id = ?
+	`, id)
+	var update Update
+	var finishedAt sql.NullTime
+	if err := row.Scan(&update.ID, &update.RepoPath, &update.RepoName, &update.Status, &update.Result, &update.Error, &update.SkipReason, &update.Changed, &update.StartedAt, &finishedAt); err != nil {
+		return Update{}, err
+	}
+	if finishedAt.Valid {
+		update.FinishedAt = finishedAt.Time
+	}
+	return update, nil
+}
+
 func (s *Store) RecentUpdates(limit int) ([]Update, error) {
 	return s.RecentUpdatesPage(limit, 0)
 }

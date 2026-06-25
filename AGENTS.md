@@ -1,0 +1,19 @@
+# Project Memory
+
+- Keep answers concise.
+- Go code lives in `autogitpull_go`.
+- Config and repo state are stored in the shared SQLite DB at `~/.autogitpull/updates.sqlite`.
+- Web UI is in `autogitpull_go/internal/web/server.go`; templates are embedded Go template strings in that file.
+- Web daemon settings live on the separate `/settings` page; keep interval/retention out of the main dashboard header.
+- Web, TUI, and daemon must use one shared system for pull/update side effects: record via `db.Store.FinishUpdate`, load the saved `db.Update`, then call `plugins.RunAfterChange` with a source such as `web_manual`, `web_bulk`, `tui_manual`, or `daemon`.
+- Historically some functionality was duplicated between web and TUI; avoid new duplicate side-effect logic and keep web/TUI/daemon behavior aligned through shared packages.
+- Pull history is in `autogitpull_go/internal/db/updates.go`.
+- Daemon pull flow is in `autogitpull_go/internal/logic/daemon.go`.
+- Change-processing plugins live in `autogitpull_go/internal/plugins`.
+- Plugins run after a successful pull has been recorded. By default they run only when the saved `db.Update.Changed` is true; plugins may opt into no-change runs with `RunOnNoChange`.
+- Plugin state is stored in `plugin_settings` via `config.StorageManager`.
+- Web plugin UI is a separate `/plugins` page, linked from the main dashboard and repo pages.
+- `web.New` calls `plugins.EnsureDefaults(storage)` so built-in plugin defaults are persisted.
+- Notifications are implemented as the built-in `notifications` plugin, default enabled with `title_prefix=Pulled`; do not call `pkg/notifications` directly from web, TUI, or daemon flows.
+- Manual web and TUI pull notifications should fire through the notifications plugin even when the pull has no new changes; other plugins remain changed-only unless they opt into no-change runs.
+- Before finishing code changes, run `go test ./...` from `autogitpull_go`.

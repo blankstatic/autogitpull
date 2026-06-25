@@ -22,6 +22,12 @@ type Config struct {
 	HistoryRetentionDays int        `json:"history_retention_days,omitempty"`
 }
 
+type PluginState struct {
+	ID      string            `json:"id"`
+	Enabled bool              `json:"enabled"`
+	Config  map[string]string `json:"config,omitempty"`
+}
+
 type RepoInfo struct {
 	Path          string    `json:"path"`
 	Name          string    `json:"name"`

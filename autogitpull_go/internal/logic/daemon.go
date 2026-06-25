@@ -6,16 +6,17 @@ import (
 	"net/url"
 	"os"
 	"os/signal"
+	"strings"
 	"sync"
 	"syscall"
 	"time"
 
 	"github.com/blankstatic/autogitpull/autogitpull_go/internal/config"
 	"github.com/blankstatic/autogitpull/autogitpull_go/internal/db"
+	"github.com/blankstatic/autogitpull/autogitpull_go/internal/plugins"
 	"github.com/blankstatic/autogitpull/autogitpull_go/internal/web"
 	"github.com/blankstatic/autogitpull/autogitpull_go/pkg/fs"
 	"github.com/blankstatic/autogitpull/autogitpull_go/pkg/git"
-	"github.com/blankstatic/autogitpull/autogitpull_go/pkg/notifications"
 	"github.com/spf13/cobra"
 )
 
@@ -195,6 +196,8 @@ func (d *Daemon) pullRepo(repo *config.RepoInfo, notify bool) {
 	if d.updateStore != nil && updateID > 0 {
 		if recordErr := d.updateStore.FinishUpdate(updateID, result, err); recordErr != nil {
 			slog.Error("failed to record update result", slog.String("repo", repo.Name), slog.String("err", recordErr.Error()))
+		} else if err == nil {
+			d.runPluginsAfterChange(repo, updateID, notify)
 		}
 	}
 
@@ -207,6 +210,31 @@ func (d *Daemon) pullRepo(repo *config.RepoInfo, notify bool) {
 			slog.Error("failed to update last sync", slog.String("repo", repo.Name), slog.String("err", syncErr.Error()))
 		}
 	}
+}
+
+func (d *Daemon) runPluginsAfterChange(repo *config.RepoInfo, updateID int64, notify bool) {
+	if d.updateStore == nil || d.storage == nil {
+		return
+	}
+	update, err := d.updateStore.GetUpdate(updateID)
+	if err != nil {
+		slog.Error("failed to load update for plugins", slog.String("repo", repo.Name), slog.String("err", err.Error()))
+		return
+	}
+	plugins.RunAfterChange(plugins.Context{
+		Repo:      repo,
+		Update:    update,
+		Notify:    notify,
+		Source:    "daemon",
+		Dashboard: "http://localhost:9009",
+		OpenURL:   "http://localhost:9009/repo?path=" + urlQueryEscape(repo.Path),
+		AppName:   config.AppName,
+		Logger:    slog.Default(),
+	}, d.storage.GetPluginStates())
+}
+
+func urlQueryEscape(s string) string {
+	return strings.ReplaceAll(url.QueryEscape(s), "%2F", "/")
 }
 
 func updateStatus(err error) string {
@@ -322,14 +350,6 @@ func DaemonCommandHandler(cmd *cobra.Command, args []string) {
 				slog.Warn("Failed to pull", slog.String("repo", repo.Name), slog.String("err", err.Error()))
 			} else {
 				slog.Info("Successfully pulled", slog.String("repo", repo.Name))
-				if notify && repo.NotificationsEnabled() && db.IsChangedPullResult(result) {
-					notifyURL := "http://localhost:9009/repo?path=" + url.QueryEscape(repo.Path)
-					go func() {
-						if notifyErr := notifications.OSNotifyURL(config.AppName, fmt.Sprintf("Pulled: %s", repo.Name), result, notifyURL); notifyErr != nil {
-							slog.Error("failed to send pull notification", slog.String("repo", repo.Name), slog.String("err", notifyErr.Error()))
-						}
-					}()
-				}
 			}
 		},
 	})
