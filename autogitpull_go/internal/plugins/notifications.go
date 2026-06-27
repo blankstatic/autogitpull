@@ -24,8 +24,16 @@ func notificationPlugin() Definition {
 			{Key: "title_prefix", Label: "Title prefix", Type: "text"},
 		},
 		Run: func(ctx Context) error {
-			if !ctx.Notify || ctx.Repo == nil || !ctx.Repo.NotificationsEnabled() {
-				saveNotificationResult(ctx, "skipped", "", "notifications disabled")
+			if !ctx.Notify {
+				saveNotificationResult(ctx, "skipped", "", "notification dispatch disabled")
+				return nil
+			}
+			if ctx.Repo == nil {
+				saveNotificationResult(ctx, "skipped", "", "missing repo")
+				return nil
+			}
+			if !ctx.Repo.NotificationsEnabled() {
+				saveNotificationResult(ctx, "skipped", "", "repo notifications muted")
 				return nil
 			}
 			if !ctx.Update.Changed && ctx.Source != "web_manual" && ctx.Source != "tui_manual" {
@@ -37,14 +45,12 @@ func notificationPlugin() Definition {
 				prefix = "Pulled"
 			}
 			title := fmt.Sprintf("%s: %s", prefix, ctx.Repo.Name)
-			go func() {
-				if err := notifyURL(ctx.AppName, title, ctx.Update.Result, ctx.OpenURL); err != nil {
-					saveNotificationResult(ctx, "error", ctx.OpenURL, err.Error())
-					ctx.Logger.Error("failed to send pull notification", "repo", ctx.Repo.Name, "err", err.Error())
-					return
-				}
-				saveNotificationResult(ctx, "success", ctx.OpenURL, "")
-			}()
+			if err := notifyURL(ctx.AppName, title, ctx.Update.Result, ctx.OpenURL); err != nil {
+				saveNotificationResult(ctx, "error", ctx.OpenURL, err.Error())
+				ctx.Logger.Error("failed to send pull notification", "repo", ctx.Repo.Name, "err", err.Error())
+				return nil
+			}
+			saveNotificationResult(ctx, "success", ctx.OpenURL, "")
 			return nil
 		},
 	}

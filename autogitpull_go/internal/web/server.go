@@ -425,10 +425,10 @@ func (s *Server) runRepoAISummary(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if err != nil {
-		http.Error(w, err.Error(), http.StatusInternalServerError)
+		http.Redirect(w, r, updateURLWithFlashFragment(updates[0].ID, "AI summary failed; see plugin results below", "skipped", "plugin-results"), http.StatusSeeOther)
 		return
 	}
-	http.Redirect(w, r, updateURLWithFlash(updates[0].ID, "AI summary generated", "success"), http.StatusSeeOther)
+	http.Redirect(w, r, updateURLWithFlashFragment(updates[0].ID, "AI summary generated", "success", "ai-summary"), http.StatusSeeOther)
 }
 
 func (s *Server) update(w http.ResponseWriter, r *http.Request) {
@@ -485,14 +485,14 @@ func (s *Server) runUpdateAISummary(w http.ResponseWriter, r *http.Request) {
 		Logger:    slog.Default(),
 	}, s.storage.GetPluginStates())
 	if errors.Is(err, plugins.ErrPluginDisabled) {
-		http.Redirect(w, r, updateURLWithFlash(update.ID, "AI summary plugin is disabled", "skipped"), http.StatusSeeOther)
+		http.Redirect(w, r, updateURLWithFlashFragment(update.ID, "AI summary plugin is disabled", "skipped", "ai-summary"), http.StatusSeeOther)
 		return
 	}
 	if err != nil {
-		http.Redirect(w, r, updateURLWithFlash(update.ID, "AI summary failed: "+err.Error(), "skipped"), http.StatusSeeOther)
+		http.Redirect(w, r, updateURLWithFlashFragment(update.ID, "AI summary failed; see plugin results below", "skipped", "plugin-results"), http.StatusSeeOther)
 		return
 	}
-	http.Redirect(w, r, updateURLWithFlash(update.ID, "AI summary generated", "success"), http.StatusSeeOther)
+	http.Redirect(w, r, updateURLWithFlashFragment(update.ID, "AI summary generated", "success", "ai-summary"), http.StatusSeeOther)
 }
 
 func (s *Server) pauseRepo(w http.ResponseWriter, r *http.Request) {
@@ -848,6 +848,17 @@ func aiSummaryResults(results []db.PluginResult) []db.PluginResult {
 	return out
 }
 
+func pluginResultMessage(result db.PluginResult) string {
+	message := result.Result
+	if result.Error != "" {
+		message = result.Error
+	}
+	if result.PluginID == plugins.NotificationsID && message == "notifications disabled" {
+		return "notification dispatch disabled (legacy result; restart daemon/web if this repeats)"
+	}
+	return message
+}
+
 func redirectRepo(w http.ResponseWriter, r *http.Request, repoPath string) {
 	http.Redirect(w, r, repoURL(repoPath, ""), http.StatusSeeOther)
 }
@@ -883,6 +894,10 @@ func updateURL(id int64) string {
 }
 
 func updateURLWithFlash(id int64, flash, flashType string) string {
+	return updateURLWithFlashFragment(id, flash, flashType, "")
+}
+
+func updateURLWithFlashFragment(id int64, flash, flashType, fragment string) string {
 	values := url.Values{}
 	values.Set("id", strconv.FormatInt(id, 10))
 	if flash != "" {
@@ -891,7 +906,11 @@ func updateURLWithFlash(id int64, flash, flashType string) string {
 			values.Set("flash_type", flashType)
 		}
 	}
-	return "/update?" + queryValues(values)
+	out := "/update?" + queryValues(values)
+	if fragment != "" {
+		out += "#" + url.QueryEscape(fragment)
+	}
+	return out
 }
 
 func queryWithPath(values url.Values, repoPath string) string {
@@ -1489,6 +1508,12 @@ var baseCSS = template.CSS(`
 	.metric-value { margin-top: 4px; font-size: 20px; font-weight: 650; color: var(--text); }
 	.metric-detail { margin-top: 4px; color: var(--muted); font-size: 12px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 	.metric-hash { display: inline-block; max-width: 100%; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; overflow: hidden; text-overflow: ellipsis; vertical-align: bottom; }
+	.change-identity { display: grid; grid-template-columns: minmax(180px, 1.1fr) minmax(120px, .5fr) minmax(220px, 1.6fr); gap: 14px; margin-bottom: 18px; }
+	.change-field { min-width: 0; background: var(--panel); border: 1px solid var(--border-muted); border-radius: 8px; padding: 14px 15px; box-shadow: var(--shadow); }
+	.change-field-value { margin-top: 4px; font-size: 18px; font-weight: 650; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+	.revision-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 12px; }
+	.revision-item { min-width: 0; border: 1px solid var(--border-muted); border-radius: 8px; padding: 11px 12px; background: var(--subtle); }
+	.revision-hash { display: block; margin-top: 4px; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-weight: 650; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 	.panel { background: var(--panel); border: 1px solid var(--border-muted); border-radius: 8px; overflow: hidden; box-shadow: var(--shadow); }
 	.panel:hover { border-color: #d0d7de; }
 	.panel-head { padding: 13px 16px; border-bottom: 1px solid var(--border-muted); background: var(--panel); display: flex; justify-content: space-between; gap: 14px; align-items: center; }
@@ -1551,6 +1576,9 @@ var baseCSS = template.CSS(`
 	th { color: var(--muted); font-size: 11px; background: var(--subtle); font-weight: 650; text-transform: uppercase; letter-spacing: .04em; }
 	tr:hover td { background: var(--subtle); }
 	td pre { margin: 0; max-height: 160px; }
+	.update-preview { max-height: 12.5em; white-space: pre-wrap; }
+	.update-preview-link { display: block; color: inherit; }
+	.update-preview-link:hover { color: inherit; text-decoration: none; }
 	pre { white-space: pre-wrap; background: var(--subtle); border: 1px solid var(--border-muted); border-radius: 8px; padding: 10px 12px; overflow: auto; font: 12px/1.45 ui-monospace, SFMono-Regular, Menlo, monospace; color: var(--text); }
 	.badge { display: inline-flex; align-items: center; min-height: 22px; padding: 2px 8px; border: 1px solid transparent; border-radius: 999px; background: #eaeef2; color: var(--text); font-size: 12px; font-weight: 600; white-space: nowrap; }
 	.badge.success { background: #dafbe1; border-color: #aceebb; color: #116329; }
@@ -1574,6 +1602,8 @@ var baseCSS = template.CSS(`
 		.header-inner { display: grid; align-items: start; }
 		.action-form { width: 100%; }
 		.summary { grid-template-columns: 1fr; }
+		.change-identity { grid-template-columns: 1fr; }
+		.revision-grid { grid-template-columns: 1fr; }
 		.repo-list { grid-template-columns: 1fr; }
 		.activity-meta { align-items: flex-start; flex-direction: column; }
 		th:nth-child(4), td:nth-child(4) { display: none; }
@@ -1635,8 +1665,9 @@ var templateFuncs = template.FuncMap{
 			return reason
 		}
 	},
-	"firstLine":   firstLine,
-	"compactPath": compactPath,
+	"firstLine":           firstLine,
+	"compactPath":         compactPath,
+	"pluginResultMessage": pluginResultMessage,
 	"configValue": func(values map[string]string, key string) string {
 		if values == nil {
 			return ""
@@ -1673,7 +1704,7 @@ var indexTemplate = template.Must(template.New("index").Funcs(templateFuncs).Par
 </div></section>
 <section class="panel" id="updates"><div class="panel-head"><h2><a class="panel-title" href="#updates">Recent updates</a></h2><div class="filter">{{range .EventFilter.Options}}<a class="{{.Class}}" href="{{.URL}}">{{.Label}}</a>{{end}}</div></div>
 {{if .Updates}}<table><tr><th>Time</th><th>Repo</th><th>Status</th><th>Result</th></tr>
-{{range .Updates}}<tr><td><a href="{{updateURL .ID}}"><div class="time">{{humanTime .StartedAt}}</div><div class="time-detail">{{formatTime .StartedAt}}</div></a></td><td><a href="/repo?path={{.RepoPath | urlquery}}">{{.RepoName}}</a><div class="path" title="{{.RepoPath}}">{{compactPath .RepoPath}}</div></td><td><span class="badge {{statusClass .Status}}">{{.Status}}</span></td><td><a href="{{updateURL .ID}}"><pre>{{if .Error}}{{.Error}}{{else}}{{.Result | firstLine}}{{end}}</pre></a></td></tr>{{end}}
+{{range .Updates}}<tr><td><a href="{{updateURL .ID}}"><div class="time">{{humanTime .StartedAt}}</div><div class="time-detail">{{formatTime .StartedAt}}</div></a></td><td><a href="/repo?path={{.RepoPath | urlquery}}">{{.RepoName}}</a><div class="path" title="{{.RepoPath}}">{{compactPath .RepoPath}}</div></td><td><span class="badge {{statusClass .Status}}">{{.Status}}</span></td><td><a class="update-preview-link" href="{{updateURL .ID}}"><pre class="update-preview">{{if .Error}}{{.Error}}{{else}}{{.Result}}{{end}}</pre></a></td></tr>{{end}}
 </table>{{template "pagination" .Pagination}}{{else}}<div class="empty">No updates match this filter.</div>{{end}}</section>
 </div>
 </main><footer>version {{.AppVersion}}</footer><script>
@@ -1784,18 +1815,27 @@ var updateTemplate = template.Must(template.New("update").Funcs(templateFuncs).P
 <!doctype html><html><head><meta charset="utf-8"><title>Change {{.Update.ID}} - autogitpull</title><link rel="icon" type="image/png" href="/favicon.ico"><style>` + string(baseCSS) + `</style></head>
 <body><header><div class="header-inner"><a class="brand" href="/"><img class="brand-icon" src="/assets/app-icon.png" alt=""><div class="header-title"><h1>Change {{.Update.ID}}</h1><div class="header-path" title="{{.Update.RepoPath}}">{{.Update.RepoName}} · {{compactPath .Update.RepoPath}}</div></div></a><div class="actions"><a class="button" href="/repo?path={{.Update.RepoPath | urlquery}}">Repository</a><a class="badge" href="/">Back</a></div></div></header><main class="grid">
 {{if .Flash.Text}}<div class="flash {{.Flash.Class}}">{{.Flash.Text}}</div>{{end}}
+<section class="change-identity" aria-label="Change identity">
+	<div class="change-field"><div class="metric-label">Repo</div><div class="change-field-value" title="{{.Update.RepoName}}">{{.Update.RepoName}}</div></div>
+	<div class="change-field"><div class="metric-label">Change ID</div><div class="change-field-value">#{{.Update.ID}}</div></div>
+	<div class="change-field"><div class="metric-label">Path</div><div class="change-field-value path" title="{{.Update.RepoPath}}">{{compactPath .Update.RepoPath}}</div></div>
+</section>
 <section class="summary">
 	<div class="metric"><div class="metric-label">Status</div><div class="metric-value"><span class="badge {{statusClass .Update.Status}}">{{.Update.Status}}</span></div></div>
 	<div class="metric"><div class="metric-label">Changed</div><div class="metric-value">{{if .Update.Changed}}<span class="badge success">yes</span>{{else}}<span class="badge paused">no</span>{{end}}</div></div>
 	<div class="metric"><div class="metric-label">Started</div><div class="metric-value">{{humanTime .Update.StartedAt}}</div><div class="metric-detail">{{formatTime .Update.StartedAt}}</div></div>
-	<div class="metric"><div class="metric-label">Revision range</div><div class="metric-value">{{if .Update.BeforeRev}}<span class="metric-hash" title="{{.Update.BeforeRev}}">{{shortHash .Update.BeforeRev}}</span>{{else}}-{{end}}</div><div class="metric-detail">{{if .Update.AfterRev}}<span class="metric-hash" title="{{.Update.AfterRev}}">{{shortHash .Update.AfterRev}}</span>{{else}}-{{end}}</div></div>
+	<div class="metric"><div class="metric-label">Finished</div><div class="metric-value">{{humanTime .Update.FinishedAt}}</div><div class="metric-detail">{{formatTime .Update.FinishedAt}}</div></div>
 </section>
+<section class="panel" id="revisions"><div class="panel-head"><h2><a class="panel-title" href="#revisions">Revision range</a></h2></div><div class="panel-body"><div class="revision-grid">
+	<div class="revision-item"><div class="metric-label">Before</div>{{if .Update.BeforeRev}}<span class="revision-hash" title="{{.Update.BeforeRev}}">{{shortHash .Update.BeforeRev}}</span>{{else}}<span class="revision-hash">-</span>{{end}}</div>
+	<div class="revision-item"><div class="metric-label">After</div>{{if .Update.AfterRev}}<span class="revision-hash" title="{{.Update.AfterRev}}">{{shortHash .Update.AfterRev}}</span>{{else}}<span class="revision-hash">-</span>{{end}}</div>
+</div></div></section>
 <section class="panel" id="change"><div class="panel-head"><h2><a class="panel-title" href="#change">Change</a></h2></div><div class="panel-body"><pre>{{if .Update.Error}}{{.Update.Error}}{{else}}{{.Update.Result}}{{end}}</pre></div></section>
 <section class="panel" id="ai-summary"><div class="panel-head"><h2><a class="panel-title" href="#ai-summary">AI summaries</a></h2><form class="action-form" method="post" action="/update/ai-summary"><input type="hidden" name="id" value="{{.Update.ID}}"><button class="button primary" type="submit">Generate again</button></form></div><div class="panel-body">
 {{if .AISummaries}}{{range .AISummaries}}<div class="repo" style="box-shadow:none;margin-bottom:12px"><div class="repo-title"><strong>{{humanTime .CreatedAt}}</strong><span class="badge {{statusClass .Status}}">{{.Status}}</span></div>{{if .Error}}<pre>{{.Error}}</pre>{{end}}{{if .Result}}<pre>{{.Result}}</pre>{{end}}</div>{{end}}{{else}}<div class="empty">No AI summaries yet.</div>{{end}}
 </div></section>
 <section class="panel" id="plugin-results"><div class="panel-head"><h2><a class="panel-title" href="#plugin-results">Plugin results</a></h2></div><div class="panel-body">
-{{if .PluginResults}}<table><tr><th>Time</th><th>Plugin</th><th>Status</th><th>Result</th></tr>{{range .PluginResults}}<tr><td><div class="time">{{humanTime .CreatedAt}}</div><div class="time-detail">{{formatTime .CreatedAt}}</div></td><td>{{.PluginID}}</td><td><span class="badge {{statusClass .Status}}">{{.Status}}</span></td><td><pre>{{if .Error}}{{.Error}}{{else}}{{.Result}}{{end}}</pre></td></tr>{{end}}</table>{{else}}<div class="empty">No plugin results yet.</div>{{end}}
+{{if .PluginResults}}<table><tr><th>Time</th><th>Plugin</th><th>Status</th><th>Result</th></tr>{{range .PluginResults}}<tr><td><div class="time">{{humanTime .CreatedAt}}</div><div class="time-detail">{{formatTime .CreatedAt}}</div></td><td>{{.PluginID}}</td><td><span class="badge {{statusClass .Status}}">{{.Status}}</span></td><td><pre>{{pluginResultMessage .}}</pre></td></tr>{{end}}</table>{{else}}<div class="empty">No plugin results yet.</div>{{end}}
 </div></section>
 </main><script>document.querySelectorAll('form').forEach(form => form.addEventListener('submit', () => { const b = document.activeElement; if (b && b.tagName === 'BUTTON') b.textContent = 'Working...'; }));</script></body></html>`))
 

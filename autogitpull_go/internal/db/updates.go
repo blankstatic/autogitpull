@@ -254,7 +254,7 @@ func (s *Store) PluginResultsByUpdate(updateID int64) ([]PluginResult, error) {
 		SELECT id, update_id, plugin_id, status, result, error, created_at
 		FROM plugin_results
 		WHERE update_id = ?
-		ORDER BY plugin_id
+		ORDER BY created_at DESC, id DESC
 	`, updateID)
 	if err != nil {
 		return nil, err

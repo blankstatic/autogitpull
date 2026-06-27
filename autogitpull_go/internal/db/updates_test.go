@@ -275,7 +275,7 @@ func TestPluginResultRoundTrip(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(results) != 2 || results[0].PluginID != "ai_summary" || results[1].Status != "success" || results[1].Result != "summary" {
+	if len(results) != 2 || results[0].PluginID != "ai_summary" || results[0].Status != "success" || results[0].Result != "summary" {
 		t.Fatalf("unexpected plugin results: %+v", results)
 	}
 }

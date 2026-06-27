@@ -247,8 +247,9 @@ Configure a provider name, API key, model, API type, and API URL on the plugin
 settings page. Any OpenAI-compatible provider can use either Responses API or
 Chat Completions by changing the API type and URL. Use the AI Summary `Test`
 button on the plugin settings page to send `hello` and verify the configured
-provider response. Each generated summary is stored as a separate plugin result,
-so a change can have multiple AI summaries.
+provider response. API URL, API key, and model must be filled before the plugin
+will call a provider. Each generated summary is stored as a separate plugin
+result, so a change can have multiple AI summaries.
 It can be run manually from a repo page, scoped to selected repositories through
 the generic repo plugin controls, or run globally for all changed updates from
 the plugin settings page. The plugin settings page lets every plugin switch
@@ -257,7 +258,9 @@ repository list for repo-scoped plugins.
 
 Each recorded update has a change details page at `/update?id=<id>`. It shows
 the pull output or error, all AI summaries for that update, and a button to
-generate another summary. Pull notifications deep-link to this change page.
+generate another summary. Pull notifications deep-link to this change page, and
+notification sent/skipped/error diagnostics are shown in that page's plugin
+results. Plugin results are shown newest first.
 
 Plugin settings are stored in the `plugin_settings` table in
 `~/.autogitpull/updates.sqlite`.

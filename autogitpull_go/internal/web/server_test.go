@@ -117,6 +117,40 @@ func TestIndexReadsReposAddedToDatabaseByAnotherProcess(t *testing.T) {
 	}
 }
 
+func TestIndexShowsMultilineRecentUpdatePreview(t *testing.T) {
+	dir := t.TempDir()
+	storage := config.NewStorageManager(filepath.Join(dir, "config.json"))
+	if err := storage.Load(); err != nil {
+		t.Fatal(err)
+	}
+	store, err := db.Open(filepath.Join(dir, "updates.sqlite"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	seedRepo(t, dir, "/repo/preview", "preview")
+	updateID, err := store.BeginUpdate("/repo/preview", "preview")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.FinishUpdate(updateID, "line one\nline two\nline three", nil); err != nil {
+		t.Fatal(err)
+	}
+
+	server := New(store, storage)
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest("GET", "/?filter=all", nil)
+	server.mux.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected status 200, got %d: %s", rec.Code, rec.Body.String())
+	}
+	body := rec.Body.String()
+	if !strings.Contains(body, "line two") || !strings.Contains(body, "update-preview") {
+		t.Fatalf("expected multiline update preview in index response")
+	}
+}
+
 func TestStatusPageRendersServiceDatabaseAndDaemon(t *testing.T) {
 	dir := t.TempDir()
 	storage := config.NewStorageManager(filepath.Join(dir, "config.json"))
@@ -529,6 +563,9 @@ func TestUpdatePageShowsChangeAndAISummaries(t *testing.T) {
 	if err := store.SavePluginResult(updateID, plugins.NotificationsID, "success", "http://localhost:9009/update?id=1", ""); err != nil {
 		t.Fatal(err)
 	}
+	if err := store.SavePluginResult(updateID, plugins.NotificationsID, "skipped", "", "notifications disabled"); err != nil {
+		t.Fatal(err)
+	}
 
 	server := New(store, storage)
 	rec := httptest.NewRecorder()
@@ -539,13 +576,124 @@ func TestUpdatePageShowsChangeAndAISummaries(t *testing.T) {
 		t.Fatalf("expected status 200, got %d: %s", rec.Code, rec.Body.String())
 	}
 	body := rec.Body.String()
-	for _, want := range []string{"Fast-forward", "first summary", "second summary", "Generate again", "Plugin results", "notifications"} {
+	for _, want := range []string{"Repo", "Change ID", "#", "Revision range", "Fast-forward", "first summary", "second summary", "Generate again", "Plugin results", "notifications", "legacy result"} {
 		if !strings.Contains(body, want) {
 			t.Fatalf("expected update page to contain %q", want)
 		}
 	}
 	if !strings.Contains(body, "118e9c5b1a25") || !strings.Contains(body, `title="118e9c5b1a2572ac41acc8cf9a2c7dd65d0309a7"`) {
 		t.Fatalf("expected compact revision hash with full hash title")
+	}
+}
+
+func TestRunUpdateAISummaryErrorRedirectsToPluginResults(t *testing.T) {
+	dir := t.TempDir()
+	storage := config.NewStorageManager(filepath.Join(dir, "config.json"))
+	if err := storage.Load(); err != nil {
+		t.Fatal(err)
+	}
+	store, err := db.Open(filepath.Join(dir, "updates.sqlite"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	if err := storage.SetPluginState(config.PluginState{
+		ID:      plugins.AISummaryID,
+		Enabled: true,
+		Config: map[string]string{
+			"provider": "broken",
+			"api_type": "responses",
+			"url":      "https://api.example.test/v1",
+			"token":    "test-key",
+			"model":    "test-model",
+		},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	updateID, err := store.BeginUpdate("/repo/missing", "missing")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.FinishUpdateWithRevisions(updateID, "Fast-forward", nil, "abc", "def"); err != nil {
+		t.Fatal(err)
+	}
+
+	server := New(store, storage)
+	rec := httptest.NewRecorder()
+	form := url.Values{"id": {strconv.FormatInt(updateID, 10)}}
+	req := httptest.NewRequest("POST", "/update/ai-summary", strings.NewReader(form.Encode()))
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	server.mux.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusSeeOther {
+		t.Fatalf("expected redirect, got %d: %s", rec.Code, rec.Body.String())
+	}
+	location := rec.Header().Get("Location")
+	redirectURL, err := url.Parse(location)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if redirectURL.Path != "/update" || redirectURL.Query().Get("id") != strconv.FormatInt(updateID, 10) || redirectURL.Fragment != "plugin-results" {
+		t.Fatalf("expected redirect back to update plugin results, got %q", location)
+	}
+	if strings.Contains(location, "not+a+git+repository") || strings.Contains(location, "AI+provider+returned") {
+		t.Fatalf("expected short flash without raw provider error, got %q", location)
+	}
+}
+
+func TestRunRepoAISummaryErrorRedirectsToPluginResults(t *testing.T) {
+	dir := t.TempDir()
+	storage := config.NewStorageManager(filepath.Join(dir, "config.json"))
+	if err := storage.Load(); err != nil {
+		t.Fatal(err)
+	}
+	store, err := db.Open(filepath.Join(dir, "updates.sqlite"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	seedRepo(t, dir, "/repo/missing", "missing")
+	if err := storage.SetPluginState(config.PluginState{
+		ID:      plugins.AISummaryID,
+		Enabled: true,
+		Config: map[string]string{
+			"provider": "broken",
+			"api_type": "responses",
+			"url":      "https://api.example.test/v1",
+			"token":    "test-key",
+			"model":    "test-model",
+		},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	updateID, err := store.BeginUpdate("/repo/missing", "missing")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.FinishUpdateWithRevisions(updateID, "Fast-forward", nil, "abc", "def"); err != nil {
+		t.Fatal(err)
+	}
+
+	server := New(store, storage)
+	rec := httptest.NewRecorder()
+	form := url.Values{"path": {"/repo/missing"}}
+	req := httptest.NewRequest("POST", "/repo/ai-summary", strings.NewReader(form.Encode()))
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	server.mux.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusSeeOther {
+		t.Fatalf("expected redirect, got %d: %s", rec.Code, rec.Body.String())
+	}
+	location := rec.Header().Get("Location")
+	redirectURL, err := url.Parse(location)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if redirectURL.Path != "/update" || redirectURL.Query().Get("id") != strconv.FormatInt(updateID, 10) || redirectURL.Fragment != "plugin-results" {
+		t.Fatalf("expected redirect back to update plugin results, got %q", location)
+	}
+	if strings.Contains(location, "not+a+git+repository") || strings.Contains(location, "AI+provider+returned") {
+		t.Fatalf("expected short flash without raw provider error, got %q", location)
 	}
 }
 

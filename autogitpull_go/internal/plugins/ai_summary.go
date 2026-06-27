@@ -3,6 +3,7 @@ package plugins
 import (
 	"bytes"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -15,6 +16,8 @@ import (
 const AISummaryID = "ai_summary"
 const defaultOpenAIBaseURL = "https://api.openai.com/v1"
 const aiSummaryPrompt = "Summarize a git pull for a developer. Be concise. Include notable commits, changed areas, and potential follow-up work. Avoid hype."
+
+var errAIProviderNotConfigured = errors.New("AI provider is not configured")
 
 var aiSummaryHTTPClient = &http.Client{Timeout: 45 * time.Second}
 
@@ -37,7 +40,7 @@ func aiSummaryPlugin() Definition {
 			"api_type": "responses",
 			"url":      defaultOpenAIBaseURL,
 			"token":    "",
-			"model":    "gpt-5.5",
+			"model":    "",
 		},
 		Fields: []Field{
 			{Key: "provider", Label: "Provider name", Type: "text"},
@@ -75,11 +78,14 @@ func aiSummaryPlugin() Definition {
 
 			summary, err := generateAISummary(ctx.Config, ctx.Repo.Name, context)
 			if err != nil {
+				if errors.Is(err, errAIProviderNotConfigured) {
+					return ctx.Store.SavePluginResult(ctx.Update.ID, AISummaryID, "skipped", "", err.Error())
+				}
 				_ = ctx.Store.SavePluginResult(ctx.Update.ID, AISummaryID, "error", context, err.Error())
 				return err
 			}
 			if summary == "" {
-				return ctx.Store.SavePluginResult(ctx.Update.ID, AISummaryID, "pending", context, "")
+				return ctx.Store.SavePluginResult(ctx.Update.ID, AISummaryID, "error", context, "AI provider returned empty response")
 			}
 			return ctx.Store.SavePluginResult(ctx.Update.ID, AISummaryID, "success", summary, "")
 		},
@@ -87,8 +93,8 @@ func aiSummaryPlugin() Definition {
 }
 
 func generateAISummary(cfg map[string]string, repoName, context string) (string, error) {
-	if strings.TrimSpace(cfg["url"]) == "" || strings.TrimSpace(cfg["token"]) == "" {
-		return "", nil
+	if strings.TrimSpace(cfg["url"]) == "" || strings.TrimSpace(cfg["token"]) == "" || strings.TrimSpace(cfg["model"]) == "" {
+		return "", errAIProviderNotConfigured
 	}
 	return callAIProvider(cfg, repoName, context)
 }
@@ -115,7 +121,7 @@ func callOpenAIResponses(cfg map[string]string, repoName, context string) (strin
 	}
 	model := strings.TrimSpace(cfg["model"])
 	if model == "" {
-		model = "gpt-5.5"
+		return "", fmt.Errorf("missing model")
 	}
 	baseURL := strings.TrimRight(strings.TrimSpace(cfg["url"]), "/")
 	if baseURL == "" {
@@ -161,7 +167,7 @@ func callChatCompletions(cfg map[string]string, repoName, context string) (strin
 	}
 	model := strings.TrimSpace(cfg["model"])
 	if model == "" {
-		model = "gpt-5.5"
+		return "", fmt.Errorf("missing model")
 	}
 	baseURL := strings.TrimRight(strings.TrimSpace(cfg["url"]), "/")
 	if baseURL == "" {

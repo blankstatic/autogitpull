@@ -110,7 +110,7 @@ func (d *Daemon) IsRunning() bool {
 func (d *Daemon) run() {
 	defer d.wg.Done()
 
-	d.pullAllRepos(false)
+	d.pullAllRepos(true)
 
 	for {
 		interval := d.currentInterval()

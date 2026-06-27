@@ -113,19 +113,48 @@ func TestNotificationsPluginStoresResult(t *testing.T) {
 		t.Fatal("notification was not sent")
 	}
 	var results []db.PluginResult
-	deadline := time.Now().Add(time.Second)
-	for time.Now().Before(deadline) {
-		results, err = store.PluginResultsByUpdate(updateID)
-		if err != nil {
-			t.Fatal(err)
-		}
-		if len(results) > 0 {
-			break
-		}
-		time.Sleep(10 * time.Millisecond)
+	results, err = store.PluginResultsByUpdate(updateID)
+	if err != nil {
+		t.Fatal(err)
 	}
 	if len(results) != 1 || results[0].PluginID != NotificationsID || results[0].Status != "success" {
 		t.Fatalf("unexpected notification result: %+v", results)
+	}
+}
+
+func TestNotificationsPluginStoresMutedReason(t *testing.T) {
+	store, err := db.Open(filepath.Join(t.TempDir(), "updates.sqlite"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	updateID, err := store.BeginUpdate("/repo/a", "a")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.FinishUpdate(updateID, "pulled changes", nil); err != nil {
+		t.Fatal(err)
+	}
+	update, err := store.GetUpdate(updateID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	muted := false
+	if err := notificationPlugin().Run(Context{
+		Repo:   &config.RepoInfo{Path: "/repo/a", Name: "a", Notify: &muted},
+		Update: update,
+		Store:  store,
+		Notify: true,
+		Source: "daemon",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	results, err := store.PluginResultsByUpdate(updateID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(results) != 1 || results[0].Error != "repo notifications muted" {
+		t.Fatalf("unexpected muted notification result: %+v", results)
 	}
 }
 
@@ -214,6 +243,16 @@ func TestAISummaryPluginIsRegisteredDisabledByDefault(t *testing.T) {
 	}
 	if !foundProviderName {
 		t.Fatalf("expected editable provider name field: %+v", def.Fields)
+	}
+}
+
+func TestAISummaryMissingProviderConfig(t *testing.T) {
+	_, err := generateAISummary(map[string]string{
+		"url":   "https://api.example.test/v1",
+		"token": "test-key",
+	}, "repo", "abc123 change")
+	if !errors.Is(err, errAIProviderNotConfigured) {
+		t.Fatalf("expected not configured error, got %v", err)
 	}
 }
 
