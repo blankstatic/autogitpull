@@ -1,10 +1,12 @@
 package plugins
 
 import (
+	"encoding/json"
 	"errors"
 	"net/http"
 	"net/http/httptest"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -122,6 +124,54 @@ func TestNotificationsPluginStoresResult(t *testing.T) {
 	}
 }
 
+func TestNotificationsPluginSendsForRemoteRefUpdate(t *testing.T) {
+	oldNotify := notifyURL
+	done := make(chan string, 1)
+	notifyURL = func(_, _, _, openURL string) error {
+		done <- openURL
+		return nil
+	}
+	defer func() { notifyURL = oldNotify }()
+
+	store, err := db.Open(filepath.Join(t.TempDir(), "updates.sqlite"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	updateID, err := store.BeginUpdate("/repo/a", "a")
+	if err != nil {
+		t.Fatal(err)
+	}
+	result := "From github.com:blankstatic/autogitpull\n   e81aec2..86bf794  plugins    -> origin/plugins\nAlready up to date."
+	if err := store.FinishUpdateWithRevisions(updateID, result, nil, "same", "same"); err != nil {
+		t.Fatal(err)
+	}
+	update, err := store.GetUpdate(updateID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if update.Changed {
+		t.Fatal("expected remote-ref-only update not to be marked changed")
+	}
+
+	if err := notificationPlugin().Run(Context{
+		Repo:    &config.RepoInfo{Path: "/repo/a", Name: "a"},
+		Update:  update,
+		Store:   store,
+		Notify:  true,
+		Source:  "daemon",
+		OpenURL: "http://localhost:9009/update?id=1",
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("notification was not sent")
+	}
+}
+
 func TestNotificationsPluginStoresMutedReason(t *testing.T) {
 	store, err := db.Open(filepath.Join(t.TempDir(), "updates.sqlite"))
 	if err != nil {
@@ -236,13 +286,20 @@ func TestAISummaryPluginIsRegisteredDisabledByDefault(t *testing.T) {
 		t.Fatalf("expected default provider config: %+v", def.DefaultConfig)
 	}
 	foundProviderName := false
+	foundPrompt := false
 	for _, field := range def.Fields {
 		if field.Key == "provider" && field.Type == "text" {
 			foundProviderName = true
 		}
+		if field.Key == "prompt" && field.Type == "textarea" {
+			foundPrompt = true
+		}
 	}
 	if !foundProviderName {
 		t.Fatalf("expected editable provider name field: %+v", def.Fields)
+	}
+	if !foundPrompt || def.DefaultConfig["prompt"] == "" {
+		t.Fatalf("expected editable prompt field: %+v", def.Fields)
 	}
 }
 
@@ -341,12 +398,23 @@ func TestResponsesSummaryCall(t *testing.T) {
 	defer func() { aiSummaryHTTPClient = oldClient }()
 
 	var sawAuth bool
+	var sawPrompt bool
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path != "/v1/responses" {
 			t.Fatalf("unexpected path: %s", r.URL.Path)
 		}
 		if r.Header.Get("Authorization") == "Bearer test-key" {
 			sawAuth = true
+		}
+		var payload struct {
+			Instructions string `json:"instructions"`
+			Input        string `json:"input"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&payload); err != nil {
+			t.Fatal(err)
+		}
+		if payload.Instructions == "Custom prompt" && payload.Input == "Repository: repo\n\nChange context:\nabc123 change" {
+			sawPrompt = true
 		}
 		w.Header().Set("Content-Type", "application/json")
 		_, _ = w.Write([]byte(`{"output_text":"Updated auth flow and storage tests."}`))
@@ -359,6 +427,7 @@ func TestResponsesSummaryCall(t *testing.T) {
 		"url":      server.URL + "/v1",
 		"token":    "test-key",
 		"model":    "gpt-test",
+		"prompt":   "Custom prompt",
 	}, "repo", "abc123 change")
 	if err != nil {
 		t.Fatal(err)
@@ -366,8 +435,49 @@ func TestResponsesSummaryCall(t *testing.T) {
 	if !sawAuth {
 		t.Fatalf("expected bearer authorization header")
 	}
+	if !sawPrompt {
+		t.Fatalf("expected custom prompt and canonical input")
+	}
 	if summary != "Updated auth flow and storage tests." {
 		t.Fatalf("unexpected summary: %q", summary)
+	}
+}
+
+func TestAISummaryInputAndContextTruncation(t *testing.T) {
+	input := AISummaryInput("repo", "Unified code diff:\n+new code")
+	if !strings.Contains(input, "Repository: repo") || !strings.Contains(input, "Unified code diff") {
+		t.Fatalf("unexpected input: %q", input)
+	}
+
+	large := strings.Repeat("x", maxAIChangeContextBytes+10)
+	truncated := truncateAIChangeContext(large)
+	if len(truncated) <= maxAIChangeContextBytes || !strings.Contains(truncated, "[truncated:") {
+		t.Fatalf("expected truncation marker, got len=%d", len(truncated))
+	}
+}
+
+func TestBuildAISummaryChangeContextSelectsFileDiffsWithinBudget(t *testing.T) {
+	context, err := buildAISummaryChangeContext(
+		"abc123 change",
+		"small.go | 1 +\nlarge.go | 10000 +",
+		[]string{"small.go", "large.go"},
+		func(filePath string) (string, error) {
+			if filePath == "large.go" {
+				return strings.Repeat("+large change\n", maxAIChangeContextBytes), nil
+			}
+			return "diff --git a/small.go b/small.go\n+small change", nil
+		},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, want := range []string{"Commits and file stats", "Diff summary", "File diff: small.go", "+small change", "Omitted files", "large.go"} {
+		if !strings.Contains(context, want) {
+			t.Fatalf("expected context to contain %q:\n%s", want, context)
+		}
+	}
+	if strings.Contains(context, "+large change") {
+		t.Fatalf("expected large diff to be omitted")
 	}
 }
 

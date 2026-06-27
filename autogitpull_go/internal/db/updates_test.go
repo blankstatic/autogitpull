@@ -49,6 +49,41 @@ func TestIsChangedPullResult(t *testing.T) {
 	}
 }
 
+func TestIsRemoteUpdatedPullResult(t *testing.T) {
+	result := "From github.com:blankstatic/autogitpull\n   e81aec2..86bf794  plugins    -> origin/plugins\nAlready up to date."
+	if !IsRemoteUpdatedPullResult(result) {
+		t.Fatal("expected remote ref update")
+	}
+	if IsRemoteUpdatedPullResult("Already up to date.") {
+		t.Fatal("expected plain up-to-date output not to be remote update")
+	}
+}
+
+func TestStoreDoesNotMarkFetchOnlyPullAsChanged(t *testing.T) {
+	store, err := Open(filepath.Join(t.TempDir(), "updates.sqlite"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+
+	id, err := store.BeginUpdate("/repo/path", "repo")
+	if err != nil {
+		t.Fatal(err)
+	}
+	result := "From github.com:blankstatic/autogitpull\n   e81aec2..86bf794  plugins    -> origin/plugins\nAlready up to date."
+	if err := store.FinishUpdateWithRevisions(id, result, nil, "6e8ddeaec98e", "6e8ddeaec98e"); err != nil {
+		t.Fatal(err)
+	}
+
+	update, err := store.GetUpdate(id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if update.Changed {
+		t.Fatalf("expected same-revision pull not to be changed: %+v", update)
+	}
+}
+
 func TestStoreRecordsError(t *testing.T) {
 	store, err := Open(filepath.Join(t.TempDir(), "updates.sqlite"))
 	if err != nil {

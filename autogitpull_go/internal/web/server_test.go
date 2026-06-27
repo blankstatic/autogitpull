@@ -216,8 +216,14 @@ func TestPluginsPageRendersBuiltInPlugins(t *testing.T) {
 	if !strings.Contains(rec.Body.String(), `action="/plugins/test-ai-summary"`) || !strings.Contains(rec.Body.String(), ">Test</button>") {
 		t.Fatalf("expected AI summary test button in response")
 	}
+	if !strings.Contains(rec.Body.String(), `<textarea class="input wide" name="config_prompt">`) {
+		t.Fatalf("expected AI summary prompt textarea in response")
+	}
 	if !strings.Contains(rec.Body.String(), "plugin-repo-path") || !strings.Contains(rec.Body.String(), `title="/Users/dmitry/proj/autogitpull_source"`) {
 		t.Fatalf("expected selected repo path to render in wrapping container")
+	}
+	if !strings.Contains(rec.Body.String(), `formaction="/plugins/remove-repo"`) || !strings.Contains(rec.Body.String(), `Remove selected repo`) {
+		t.Fatalf("expected selected repo remove control in response")
 	}
 }
 
@@ -481,6 +487,48 @@ func TestToggleRepoPlugin(t *testing.T) {
 	}
 }
 
+func TestRemovePluginRepo(t *testing.T) {
+	dir := t.TempDir()
+	storage := config.NewStorageManager(filepath.Join(dir, "config.json"))
+	if err := storage.Load(); err != nil {
+		t.Fatal(err)
+	}
+	store, err := db.Open(filepath.Join(dir, "updates.sqlite"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	if err := storage.SetPluginState(config.PluginState{
+		ID:      plugins.AISummaryID,
+		Enabled: true,
+		Config: map[string]string{
+			plugins.RepoScopeConfigKey:     "selected",
+			plugins.SelectedReposConfigKey: `["/repo/a","/repo/b"]`,
+			"provider":                     "Local",
+		},
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	server := New(store, storage)
+	form := url.Values{"id": {plugins.AISummaryID}, "repo": {"/repo/a"}}
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest("POST", "/plugins/remove-repo", strings.NewReader(form.Encode()))
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	server.mux.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusSeeOther {
+		t.Fatalf("expected redirect, got %d: %s", rec.Code, rec.Body.String())
+	}
+	state := storage.GetPluginStates()[plugins.AISummaryID]
+	if state.Config[plugins.SelectedReposConfigKey] != `["/repo/b"]` {
+		t.Fatalf("expected selected repo to be removed, got %+v", state.Config)
+	}
+	if state.Config["provider"] != "Local" || state.Config[plugins.RepoScopeConfigKey] != "selected" {
+		t.Fatalf("expected unrelated plugin config to be preserved, got %+v", state.Config)
+	}
+}
+
 func TestAISummaryTestEndpoint(t *testing.T) {
 	oldClient := plugins.AISummaryHTTPClientForTest()
 	defer plugins.SetAISummaryHTTPClientForTest(oldClient)
@@ -576,7 +624,7 @@ func TestUpdatePageShowsChangeAndAISummaries(t *testing.T) {
 		t.Fatalf("expected status 200, got %d: %s", rec.Code, rec.Body.String())
 	}
 	body := rec.Body.String()
-	for _, want := range []string{"Repo", "Change ID", "#", "Revision range", "Fast-forward", "first summary", "second summary", "Generate again", "Plugin results", "notifications", "legacy result"} {
+	for _, want := range []string{"Repo", "Change ID", "#", "Revision range", "Pull output for change", "first summary", "second summary", "Generate again", "AI model input", "AI input context", "Provider", "Model", `details class="disclosure"`, "System prompt", "Summarize a git pull", "Plugin results", "notifications", "legacy result"} {
 		if !strings.Contains(body, want) {
 			t.Fatalf("expected update page to contain %q", want)
 		}

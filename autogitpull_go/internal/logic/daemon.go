@@ -13,11 +13,14 @@ import (
 	"github.com/blankstatic/autogitpull/autogitpull_go/internal/config"
 	"github.com/blankstatic/autogitpull/autogitpull_go/internal/db"
 	"github.com/blankstatic/autogitpull/autogitpull_go/internal/plugins"
+	"github.com/blankstatic/autogitpull/autogitpull_go/internal/pulllock"
 	"github.com/blankstatic/autogitpull/autogitpull_go/internal/web"
 	"github.com/blankstatic/autogitpull/autogitpull_go/pkg/fs"
 	"github.com/blankstatic/autogitpull/autogitpull_go/pkg/git"
 	"github.com/spf13/cobra"
 )
+
+const maxConcurrentDaemonPulls = 4
 
 type Daemon struct {
 	interval    time.Duration
@@ -25,6 +28,7 @@ type Daemon struct {
 	isRunning   bool
 	stopChan    chan struct{}
 	wg          sync.WaitGroup
+	pluginWG    sync.WaitGroup
 	mu          sync.RWMutex
 	onPullStart func(repo *config.RepoInfo)
 	onPullDone  func(repo *config.RepoInfo, result string, err error, notify bool)
@@ -93,6 +97,7 @@ func (d *Daemon) Stop() {
 	d.mu.Unlock()
 
 	d.wg.Wait()
+	d.pluginWG.Wait()
 
 	d.mu.Lock()
 	if d.stopChan == stopChan {
@@ -159,13 +164,16 @@ func (d *Daemon) pullAllRepos(notify bool) {
 	repos := d.storage.GetAllRepos()
 
 	var wg sync.WaitGroup
+	sem := make(chan struct{}, maxConcurrentDaemonPulls)
 	for i := range repos {
 		if repos[i].Paused {
 			continue
 		}
 		wg.Add(1)
+		sem <- struct{}{}
 		go func(repo *config.RepoInfo) {
 			defer wg.Done()
+			defer func() { <-sem }()
 			d.pullRepo(repo, notify)
 		}(&repos[i])
 	}
@@ -173,6 +181,12 @@ func (d *Daemon) pullAllRepos(notify bool) {
 }
 
 func (d *Daemon) pullRepo(repo *config.RepoInfo, notify bool) {
+	if !pulllock.TryLock(repo.Path) {
+		slog.Info("Skipping repository already being pulled", slog.String("repo", repo.Name), slog.String("path", repo.Path))
+		return
+	}
+	defer pulllock.Unlock(repo.Path)
+
 	web.SetDaemonRepoRunning(repo.Name, true)
 	defer web.SetDaemonRepoRunning(repo.Name, false)
 
@@ -196,7 +210,7 @@ func (d *Daemon) pullRepo(repo *config.RepoInfo, notify bool) {
 		if recordErr := d.updateStore.FinishUpdateWithRevisions(updateID, result, err, beforeRev, afterRev); recordErr != nil {
 			slog.Error("failed to record update result", slog.String("repo", repo.Name), slog.String("err", recordErr.Error()))
 		} else if err == nil {
-			d.runPluginsAfterChange(repo, updateID, notify)
+			d.runPluginsAfterChangeAsync(repo, updateID, notify)
 		}
 	}
 
@@ -209,6 +223,18 @@ func (d *Daemon) pullRepo(repo *config.RepoInfo, notify bool) {
 			slog.Error("failed to update last sync", slog.String("repo", repo.Name), slog.String("err", syncErr.Error()))
 		}
 	}
+}
+
+func (d *Daemon) runPluginsAfterChangeAsync(repo *config.RepoInfo, updateID int64, notify bool) {
+	if repo == nil {
+		return
+	}
+	repoCopy := *repo
+	d.pluginWG.Add(1)
+	go func() {
+		defer d.pluginWG.Done()
+		d.runPluginsAfterChange(&repoCopy, updateID, notify)
+	}()
 }
 
 func (d *Daemon) runPluginsAfterChange(repo *config.RepoInfo, updateID int64, notify bool) {

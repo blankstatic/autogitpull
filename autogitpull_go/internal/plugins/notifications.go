@@ -3,6 +3,7 @@ package plugins
 import (
 	"fmt"
 
+	"github.com/blankstatic/autogitpull/autogitpull_go/internal/db"
 	"github.com/blankstatic/autogitpull/autogitpull_go/pkg/notifications"
 )
 
@@ -36,7 +37,8 @@ func notificationPlugin() Definition {
 				saveNotificationResult(ctx, "skipped", "", "repo notifications muted")
 				return nil
 			}
-			if !ctx.Update.Changed && ctx.Source != "web_manual" && ctx.Source != "tui_manual" {
+			remoteUpdated := db.IsRemoteUpdatedPullResult(ctx.Update.Result)
+			if !ctx.Update.Changed && !remoteUpdated && ctx.Source != "web_manual" && ctx.Source != "tui_manual" {
 				saveNotificationResult(ctx, "skipped", "", "no changes")
 				return nil
 			}

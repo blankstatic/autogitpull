@@ -19,6 +19,7 @@ import (
 	"github.com/blankstatic/autogitpull/autogitpull_go/internal/config"
 	"github.com/blankstatic/autogitpull/autogitpull_go/internal/db"
 	"github.com/blankstatic/autogitpull/autogitpull_go/internal/plugins"
+	"github.com/blankstatic/autogitpull/autogitpull_go/internal/pulllock"
 	servicepkg "github.com/blankstatic/autogitpull/autogitpull_go/internal/service"
 	versionpkg "github.com/blankstatic/autogitpull/autogitpull_go/internal/version"
 	"github.com/blankstatic/autogitpull/autogitpull_go/pkg/git"
@@ -29,6 +30,7 @@ const serviceInterval = 30 * time.Minute
 const serviceLabel = "com.blankstatic.autogitpull"
 const updatesPerPage = 50
 const activityWeeks = 53
+const maxConcurrentPulls = 4
 const eventFilterChanges = "changes"
 const eventFilterAll = "all"
 
@@ -63,6 +65,15 @@ type PluginRepoControl struct {
 type ChangedFile struct {
 	Status string
 	Path   string
+}
+
+type AISummaryInputPreview struct {
+	Prompt   string
+	Input    string
+	Error    string
+	Provider string
+	APIType  string
+	Model    string
 }
 
 type flashMessage struct {
@@ -189,6 +200,7 @@ func (s *Server) routes() {
 	s.mux.HandleFunc("/status", s.status)
 	s.mux.HandleFunc("/plugins", s.plugins)
 	s.mux.HandleFunc("/plugins/save", s.savePlugin)
+	s.mux.HandleFunc("/plugins/remove-repo", s.removePluginRepo)
 	s.mux.HandleFunc("/plugins/test-ai-summary", s.testAISummaryPlugin)
 	s.mux.HandleFunc("/favicon.ico", s.icon)
 	s.mux.HandleFunc("/assets/app-icon.png", s.icon)
@@ -364,7 +376,14 @@ func (s *Server) pullRepo(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, err.Error(), http.StatusNotFound)
 		return
 	}
+	if !pulllock.TryLock(repo.Path) {
+		redirectRepoFlash(w, r, repo.Path, "Pull already running", "skipped")
+		return
+	}
+	defer pulllock.Unlock(repo.Path)
 
+	SetDaemonRepoRunning(repo.Name, true)
+	defer SetDaemonRepoRunning(repo.Name, false)
 	updateID, err := s.store.BeginUpdate(repo.Path, repo.Name)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
@@ -381,7 +400,7 @@ func (s *Server) pullRepo(w http.ResponseWriter, r *http.Request) {
 	}
 	if pullErr == nil {
 		_ = s.storage.UpdateLastSync(repo.Path)
-		s.runPluginsAfterChange(repo, updateID, true, "web_manual")
+		s.runPluginsAfterChangeAsync(repo, updateID, true, "web_manual")
 	}
 	http.Redirect(w, r, repoURLWithFlash(repoPath, eventFilterAll, "Pulled successfully", "success"), http.StatusSeeOther)
 }
@@ -450,6 +469,7 @@ func (s *Server) update(w http.ResponseWriter, r *http.Request) {
 	renderTemplate(w, updateTemplate, map[string]any{
 		"Update":        update,
 		"AISummaries":   aiSummaryResults(results),
+		"AIInput":       s.aiSummaryInputPreview(update),
 		"PluginResults": results,
 		"Flash":         flashFromRequest(r),
 	})
@@ -598,14 +618,45 @@ func (s *Server) savePlugin(w http.ResponseWriter, r *http.Request) {
 			state.Config[key] = value
 		}
 	}
+	if err := r.ParseForm(); err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
 	for _, field := range plugins.ConfigFields(def) {
-		state.Config[field.Key] = strings.TrimSpace(r.FormValue("config_" + field.Key))
+		formKey := "config_" + field.Key
+		if _, ok := r.Form[formKey]; !ok {
+			continue
+		}
+		state.Config[field.Key] = strings.TrimSpace(r.FormValue(formKey))
 	}
 	if err := s.storage.SetPluginState(state); err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
 	http.Redirect(w, r, flashURL("/plugins", "Plugin saved", "success"), http.StatusSeeOther)
+}
+
+func (s *Server) removePluginRepo(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	id := r.FormValue("id")
+	repoPath := r.FormValue("repo")
+	if repoPath == "" {
+		http.Error(w, "missing repo", http.StatusBadRequest)
+		return
+	}
+	state, err := plugins.SetRepoEnabled(s.storage.GetPluginStates(), id, repoPath, false)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+	if err := s.storage.SetPluginState(state); err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	http.Redirect(w, r, flashURL("/plugins", "Selected repo removed", "success"), http.StatusSeeOther)
 }
 
 func (s *Server) testAISummaryPlugin(w http.ResponseWriter, r *http.Request) {
@@ -647,13 +698,12 @@ func (s *Server) bulkRepos(w http.ResponseWriter, r *http.Request) {
 	switch action {
 	case "pull_all":
 		repos := s.storage.GetAllRepos()
-		for i := range repos {
-			if repos[i].Paused {
-				continue
-			}
-			s.pullRepoRecord(&repos[i])
+		queued := s.pullReposAsync(repos)
+		if queued == 0 {
+			http.Redirect(w, r, flashURL("/", "No repositories to pull", "skipped"), http.StatusSeeOther)
+			return
 		}
-		http.Redirect(w, r, flashURL("/", "Bulk pull finished", "success"), http.StatusSeeOther)
+		http.Redirect(w, r, flashURL("/", fmt.Sprintf("Bulk pull started for %d repos", queued), "running"), http.StatusSeeOther)
 	case "pause_errors":
 		latest, err := s.store.LatestUpdatesByRepo()
 		if err != nil {
@@ -698,7 +748,44 @@ func (s *Server) bulkRepos(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
+func (s *Server) pullReposAsync(repos []config.RepoInfo) int {
+	pending := make([]config.RepoInfo, 0, len(repos))
+	for _, repo := range repos {
+		if !repo.Paused {
+			pending = append(pending, repo)
+		}
+	}
+	if len(pending) == 0 {
+		return 0
+	}
+	go func() {
+		sem := make(chan struct{}, maxConcurrentPulls)
+		var wg sync.WaitGroup
+		for i := range pending {
+			repo := pending[i]
+			wg.Add(1)
+			sem <- struct{}{}
+			go func() {
+				defer wg.Done()
+				defer func() { <-sem }()
+				s.pullRepoRecord(&repo)
+			}()
+		}
+		wg.Wait()
+	}()
+	return len(pending)
+}
+
 func (s *Server) pullRepoRecord(repo *config.RepoInfo) {
+	if !pulllock.TryLock(repo.Path) {
+		slog.Info("skipping bulk pull because repository is already being pulled", slog.String("repo", repo.Name), slog.String("path", repo.Path))
+		return
+	}
+	defer pulllock.Unlock(repo.Path)
+
+	SetDaemonRepoRunning(repo.Name, true)
+	defer SetDaemonRepoRunning(repo.Name, false)
+
 	updateID, err := s.store.BeginUpdate(repo.Path, repo.Name)
 	if err != nil {
 		slog.Error("failed to record bulk pull start", slog.String("repo", repo.Name), slog.String("err", err.Error()))
@@ -710,7 +797,7 @@ func (s *Server) pullRepoRecord(repo *config.RepoInfo) {
 	}
 	if pullErr == nil {
 		_ = s.storage.UpdateLastSync(repo.Path)
-		s.runPluginsAfterChange(repo, updateID, true, "web_bulk")
+		s.runPluginsAfterChangeAsync(repo, updateID, true, "web_bulk")
 	}
 }
 
@@ -859,6 +946,40 @@ func pluginResultMessage(result db.PluginResult) string {
 	return message
 }
 
+func (s *Server) aiSummaryInputPreview(update db.Update) AISummaryInputPreview {
+	cfg := aiSummaryConfig(s.storage.GetPluginStates())
+	preview := AISummaryInputPreview{
+		Prompt:   plugins.AISummaryPrompt(cfg),
+		Provider: cfg["provider"],
+		APIType:  cfg["api_type"],
+		Model:    cfg["model"],
+	}
+	if update.BeforeRev == "" || update.AfterRev == "" || update.BeforeRev == update.AfterRev {
+		preview.Error = "missing revision range"
+		return preview
+	}
+	context, err := plugins.BuildAISummaryChangeContext(update.RepoPath, update.BeforeRev, update.AfterRev)
+	if err != nil {
+		preview.Error = err.Error()
+		return preview
+	}
+	if context == "" {
+		preview.Error = "empty change context"
+		return preview
+	}
+	preview.Input = plugins.AISummaryInput(update.RepoName, context)
+	return preview
+}
+
+func aiSummaryConfig(states map[string]config.PluginState) map[string]string {
+	for _, view := range plugins.Views(states) {
+		if view.ID == plugins.AISummaryID {
+			return view.Config
+		}
+	}
+	return map[string]string{}
+}
+
 func redirectRepo(w http.ResponseWriter, r *http.Request, repoPath string) {
 	http.Redirect(w, r, repoURL(repoPath, ""), http.StatusSeeOther)
 }
@@ -996,6 +1117,14 @@ func (s *Server) runPluginsAfterChange(repo *config.RepoInfo, updateID int64, no
 		AppName:   config.AppName,
 		Logger:    slog.Default(),
 	}, s.storage.GetPluginStates())
+}
+
+func (s *Server) runPluginsAfterChangeAsync(repo *config.RepoInfo, updateID int64, notify bool, source string) {
+	if repo == nil {
+		return
+	}
+	repoCopy := *repo
+	go s.runPluginsAfterChange(&repoCopy, updateID, notify, source)
 }
 
 func pullFlashType(pullErr error) string {
@@ -1514,6 +1643,9 @@ var baseCSS = template.CSS(`
 	.revision-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 12px; }
 	.revision-item { min-width: 0; border: 1px solid var(--border-muted); border-radius: 8px; padding: 11px 12px; background: var(--subtle); }
 	.revision-hash { display: block; margin-top: 4px; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-weight: 650; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+	.context-grid { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 10px; margin-bottom: 12px; }
+	.context-item { min-width: 0; border: 1px solid var(--border-muted); border-radius: 8px; padding: 9px 10px; background: var(--subtle); }
+	.context-value { margin-top: 3px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-weight: 650; }
 	.panel { background: var(--panel); border: 1px solid var(--border-muted); border-radius: 8px; overflow: hidden; box-shadow: var(--shadow); }
 	.panel:hover { border-color: #d0d7de; }
 	.panel-head { padding: 13px 16px; border-bottom: 1px solid var(--border-muted); background: var(--panel); display: flex; justify-content: space-between; gap: 14px; align-items: center; }
@@ -1563,6 +1695,7 @@ var baseCSS = template.CSS(`
 	.button:disabled { opacity: .52; cursor: not-allowed; background: var(--subtle); box-shadow: none; }
 	.input { width: 76px; min-height: 28px; padding: 4px 8px; border: 1px solid var(--border); border-radius: 8px; background: #ffffff; color: var(--text); font: inherit; box-shadow: inset 0 1px 0 rgba(0, 0, 0, .03); }
 	.input.wide { width: min(360px, 100%); }
+	textarea.input { min-height: 110px; resize: vertical; font: 12px/1.45 ui-monospace, SFMono-Regular, Menlo, monospace; }
 	.input:focus, .button:focus-visible, .page-link:focus-visible, .filter-link:focus-visible, a.repo:focus-visible { outline: 2px solid rgba(9, 105, 218, .35); outline-offset: 2px; }
 	.input.confirm { width: 220px; }
 	.repo-list { display: grid; grid-template-columns: repeat(auto-fill, minmax(320px, 1fr)); gap: 14px; }
@@ -1580,6 +1713,12 @@ var baseCSS = template.CSS(`
 	.update-preview-link { display: block; color: inherit; }
 	.update-preview-link:hover { color: inherit; text-decoration: none; }
 	pre { white-space: pre-wrap; background: var(--subtle); border: 1px solid var(--border-muted); border-radius: 8px; padding: 10px 12px; overflow: auto; font: 12px/1.45 ui-monospace, SFMono-Regular, Menlo, monospace; color: var(--text); }
+	details.disclosure { border: 1px solid var(--border-muted); border-radius: 8px; background: var(--panel); margin-bottom: 10px; overflow: hidden; }
+	details.disclosure > summary { cursor: pointer; padding: 10px 12px; color: var(--text); font-weight: 650; background: var(--subtle); list-style: none; }
+	details.disclosure > summary::-webkit-details-marker { display: none; }
+	details.disclosure > summary::before { content: "Show"; display: inline-flex; align-items: center; min-height: 22px; margin-right: 8px; padding: 2px 8px; border: 1px solid var(--border); border-radius: 999px; background: #ffffff; color: var(--muted); font-size: 12px; font-weight: 650; }
+	details.disclosure[open] > summary::before { content: "Hide"; }
+	details.disclosure pre { margin: 0; border: 0; border-top: 1px solid var(--border-muted); border-radius: 0; max-height: 520px; }
 	.badge { display: inline-flex; align-items: center; min-height: 22px; padding: 2px 8px; border: 1px solid transparent; border-radius: 999px; background: #eaeef2; color: var(--text); font-size: 12px; font-weight: 600; white-space: nowrap; }
 	.badge.success { background: #dafbe1; border-color: #aceebb; color: #116329; }
 	.badge.error { background: #ffebe9; border-color: #ffcecb; color: var(--danger); }
@@ -1595,7 +1734,10 @@ var baseCSS = template.CSS(`
 	.time-detail { color: var(--muted); font-size: 12px; margin-top: 2px; white-space: nowrap; }
 	.plugin-repos { color: var(--muted); font-size: 12px; margin-top: 6px; min-width: 0; overflow-wrap: anywhere; }
 	.plugin-repo-list { display: inline-flex; flex-wrap: wrap; gap: 4px; vertical-align: middle; max-width: 100%; }
+	.plugin-repo-chip { display: inline-flex; align-items: center; gap: 4px; min-width: 0; max-width: 100%; padding: 2px 4px 2px 6px; border: 1px solid var(--border-muted); border-radius: 999px; background: var(--subtle); }
 	.plugin-repo-path { min-width: 0; max-width: 100%; color: var(--muted); font-family: ui-monospace, SFMono-Regular, Menlo, monospace; overflow-wrap: anywhere; word-break: break-word; }
+	.chip-remove { display: inline-flex; align-items: center; justify-content: center; width: 18px; height: 18px; border: 1px solid var(--border); border-radius: 999px; background: #ffffff; color: var(--muted); font: inherit; font-size: 11px; font-weight: 700; cursor: pointer; padding: 0; }
+	.chip-remove:hover { color: var(--danger); border-color: #ffcecb; background: #ffebe9; }
 	.empty { color: var(--muted); padding: 18px; }
 	footer { max-width: 1220px; margin: 0 auto; padding: 0 24px 28px; color: var(--muted); font-size: 12px; }
 	@media (max-width: 760px) {
@@ -1604,6 +1746,7 @@ var baseCSS = template.CSS(`
 		.summary { grid-template-columns: 1fr; }
 		.change-identity { grid-template-columns: 1fr; }
 		.revision-grid { grid-template-columns: 1fr; }
+		.context-grid { grid-template-columns: 1fr; }
 		.repo-list { grid-template-columns: 1fr; }
 		.activity-meta { align-items: flex-start; flex-direction: column; }
 		th:nth-child(4), td:nth-child(4) { display: none; }
@@ -1802,10 +1945,10 @@ var pluginsTemplate = template.Must(template.New("plugins").Funcs(templateFuncs)
 	<input type="hidden" name="id" value="{{.ID}}">
 	<div class="repo-title"><strong>{{.Name}}</strong>{{if .Enabled}}<span class="badge success">enabled</span>{{else}}<span class="badge paused">disabled</span>{{end}}</div>
 	<div class="plugin-description">{{.Description}}</div>
-	<div class="plugin-repos">Selected repos: {{if .SelectedRepos}}<span class="plugin-repo-list">{{range .SelectedRepos}}<span class="plugin-repo-path" title="{{.}}">{{compactPath .}}</span>{{end}}</span>{{else}}none{{end}}</div>
+	<div class="plugin-repos">Selected repos: {{if .SelectedRepos}}<span class="plugin-repo-list">{{range .SelectedRepos}}<span class="plugin-repo-chip"><span class="plugin-repo-path" title="{{.}}">{{compactPath .}}</span><button class="chip-remove" type="submit" formaction="/plugins/remove-repo" formmethod="post" name="repo" value="{{.}}" title="Remove selected repo" aria-label="Remove selected repo">x</button></span>{{end}}</span>{{else}}none{{end}}</div>
 	<div class="toolbar" style="margin-top:12px;margin-bottom:0"><div class="toolbar-group">
 		<label class="select-all"><input type="checkbox" name="enabled" value="1" {{if .Enabled}}checked{{end}}> Enabled</label>
-		{{range .Fields}}{{$field := .}}<label class="action-form"><span class="badge paused">{{.Label}}</span>{{if eq .Type "select"}}<select class="input wide" name="config_{{.Key}}">{{range .Options}}<option value="{{.Value}}" {{if eq (configValue $plugin.Config $field.Key) .Value}}selected{{end}}>{{.Label}}</option>{{end}}</select>{{else}}<input class="input wide" type="{{inputType .Type}}" name="config_{{.Key}}" value="{{configValue $plugin.Config .Key}}">{{end}}</label>{{end}}
+		{{range .Fields}}{{$field := .}}<label class="action-form"><span class="badge paused">{{.Label}}</span>{{if eq .Type "select"}}<select class="input wide" name="config_{{.Key}}">{{range .Options}}<option value="{{.Value}}" {{if eq (configValue $plugin.Config $field.Key) .Value}}selected{{end}}>{{.Label}}</option>{{end}}</select>{{else if eq .Type "textarea"}}<textarea class="input wide" name="config_{{.Key}}">{{configValue $plugin.Config .Key}}</textarea>{{else}}<input class="input wide" type="{{inputType .Type}}" name="config_{{.Key}}" value="{{configValue $plugin.Config .Key}}">{{end}}</label>{{end}}
 	</div><button class="button primary" type="submit">Save</button>{{if eq .ID "ai_summary"}}<button class="button" type="submit" form="ai-summary-test-form">Test</button>{{end}}</div>
 </form>{{end}}</div><form id="ai-summary-test-form" method="post" action="/plugins/test-ai-summary"></form>{{else}}<div class="empty">No plugins available.</div>{{end}}
 </div></section>
@@ -1830,12 +1973,26 @@ var updateTemplate = template.Must(template.New("update").Funcs(templateFuncs).P
 	<div class="revision-item"><div class="metric-label">Before</div>{{if .Update.BeforeRev}}<span class="revision-hash" title="{{.Update.BeforeRev}}">{{shortHash .Update.BeforeRev}}</span>{{else}}<span class="revision-hash">-</span>{{end}}</div>
 	<div class="revision-item"><div class="metric-label">After</div>{{if .Update.AfterRev}}<span class="revision-hash" title="{{.Update.AfterRev}}">{{shortHash .Update.AfterRev}}</span>{{else}}<span class="revision-hash">-</span>{{end}}</div>
 </div></div></section>
-<section class="panel" id="change"><div class="panel-head"><h2><a class="panel-title" href="#change">Change</a></h2></div><div class="panel-body"><pre>{{if .Update.Error}}{{.Update.Error}}{{else}}{{.Update.Result}}{{end}}</pre></div></section>
+<section class="panel" id="change"><div class="panel-head"><h2><a class="panel-title" href="#change">Change</a></h2></div><div class="panel-body"><details class="disclosure"><summary>Pull output for change #{{.Update.ID}}</summary><pre>{{if .Update.Error}}{{.Update.Error}}{{else}}{{.Update.Result}}{{end}}</pre></details></div></section>
 <section class="panel" id="ai-summary"><div class="panel-head"><h2><a class="panel-title" href="#ai-summary">AI summaries</a></h2><form class="action-form" method="post" action="/update/ai-summary"><input type="hidden" name="id" value="{{.Update.ID}}"><button class="button primary" type="submit">Generate again</button></form></div><div class="panel-body">
-{{if .AISummaries}}{{range .AISummaries}}<div class="repo" style="box-shadow:none;margin-bottom:12px"><div class="repo-title"><strong>{{humanTime .CreatedAt}}</strong><span class="badge {{statusClass .Status}}">{{.Status}}</span></div>{{if .Error}}<pre>{{.Error}}</pre>{{end}}{{if .Result}}<pre>{{.Result}}</pre>{{end}}</div>{{end}}{{else}}<div class="empty">No AI summaries yet.</div>{{end}}
+{{if .AISummaries}}{{range .AISummaries}}<details class="disclosure"><summary>AI summary · {{humanTime .CreatedAt}} · {{.Status}}</summary>{{if .Error}}<pre>{{.Error}}</pre>{{end}}{{if .Result}}<pre>{{.Result}}</pre>{{end}}</details>{{end}}{{else}}<div class="empty">No AI summaries yet.</div>{{end}}
+</div></section>
+<section class="panel" id="ai-input"><div class="panel-head"><h2><a class="panel-title" href="#ai-input">AI model input</a></h2></div><div class="panel-body">
+	<div class="context-grid" aria-label="AI input context">
+		<div class="context-item"><div class="metric-label">Change</div><div class="context-value">#{{.Update.ID}}</div></div>
+		<div class="context-item"><div class="metric-label">Repo</div><div class="context-value" title="{{.Update.RepoName}}">{{.Update.RepoName}}</div></div>
+		<div class="context-item"><div class="metric-label">Provider</div><div class="context-value" title="{{.AIInput.Provider}}">{{if .AIInput.Provider}}{{.AIInput.Provider}}{{else}}-{{end}}</div></div>
+		<div class="context-item"><div class="metric-label">Model</div><div class="context-value" title="{{.AIInput.Model}}">{{if .AIInput.Model}}{{.AIInput.Model}}{{else}}-{{end}}</div></div>
+		<div class="context-item"><div class="metric-label">Before</div><div class="context-value">{{if .Update.BeforeRev}}<span title="{{.Update.BeforeRev}}">{{shortHash .Update.BeforeRev}}</span>{{else}}-{{end}}</div></div>
+		<div class="context-item"><div class="metric-label">After</div><div class="context-value">{{if .Update.AfterRev}}<span title="{{.Update.AfterRev}}">{{shortHash .Update.AfterRev}}</span>{{else}}-{{end}}</div></div>
+		<div class="context-item"><div class="metric-label">API type</div><div class="context-value">{{if .AIInput.APIType}}{{.AIInput.APIType}}{{else}}responses{{end}}</div></div>
+		<div class="context-item"><div class="metric-label">Path</div><div class="context-value path" title="{{.Update.RepoPath}}">{{compactPath .Update.RepoPath}}</div></div>
+	</div>
+	<details class="disclosure"><summary>System prompt for change #{{.Update.ID}}</summary><pre>{{.AIInput.Prompt}}</pre></details>
+	{{if .AIInput.Error}}<details class="disclosure"><summary>User input build error for change #{{.Update.ID}}</summary><pre>{{.AIInput.Error}}</pre></details>{{else}}<details class="disclosure"><summary>User input for change #{{.Update.ID}}</summary><pre>{{.AIInput.Input}}</pre></details>{{end}}
 </div></section>
 <section class="panel" id="plugin-results"><div class="panel-head"><h2><a class="panel-title" href="#plugin-results">Plugin results</a></h2></div><div class="panel-body">
-{{if .PluginResults}}<table><tr><th>Time</th><th>Plugin</th><th>Status</th><th>Result</th></tr>{{range .PluginResults}}<tr><td><div class="time">{{humanTime .CreatedAt}}</div><div class="time-detail">{{formatTime .CreatedAt}}</div></td><td>{{.PluginID}}</td><td><span class="badge {{statusClass .Status}}">{{.Status}}</span></td><td><pre>{{pluginResultMessage .}}</pre></td></tr>{{end}}</table>{{else}}<div class="empty">No plugin results yet.</div>{{end}}
+{{if .PluginResults}}{{range .PluginResults}}<details class="disclosure"><summary>{{.PluginID}} · {{.Status}} · {{humanTime .CreatedAt}}</summary><pre>{{pluginResultMessage .}}</pre></details>{{end}}{{else}}<div class="empty">No plugin results yet.</div>{{end}}
 </div></section>
 </main><script>document.querySelectorAll('form').forEach(form => form.addEventListener('submit', () => { const b = document.activeElement; if (b && b.tagName === 'BUTTON') b.textContent = 'Working...'; }));</script></body></html>`))
 

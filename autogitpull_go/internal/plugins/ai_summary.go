@@ -15,7 +15,8 @@ import (
 
 const AISummaryID = "ai_summary"
 const defaultOpenAIBaseURL = "https://api.openai.com/v1"
-const aiSummaryPrompt = "Summarize a git pull for a developer. Be concise. Include notable commits, changed areas, and potential follow-up work. Avoid hype."
+const defaultAISummaryPrompt = "Summarize a git pull for a developer. Be concise. Include notable commits, changed areas, and potential follow-up work. Avoid hype."
+const maxAIChangeContextBytes = 120000
 
 var errAIProviderNotConfigured = errors.New("AI provider is not configured")
 
@@ -41,6 +42,7 @@ func aiSummaryPlugin() Definition {
 			"url":      defaultOpenAIBaseURL,
 			"token":    "",
 			"model":    "",
+			"prompt":   defaultAISummaryPrompt,
 		},
 		Fields: []Field{
 			{Key: "provider", Label: "Provider name", Type: "text"},
@@ -51,6 +53,7 @@ func aiSummaryPlugin() Definition {
 			{Key: "url", Label: "API URL", Type: "url"},
 			{Key: "token", Label: "API key", Type: "password"},
 			{Key: "model", Label: "Model", Type: "text"},
+			{Key: "prompt", Label: "Prompt", Type: "textarea"},
 		},
 		Run: func(ctx Context) error {
 			if ctx.Store == nil || ctx.Repo == nil || ctx.Update.ID == 0 {
@@ -60,18 +63,11 @@ func aiSummaryPlugin() Definition {
 				return ctx.Store.SavePluginResult(ctx.Update.ID, AISummaryID, "skipped", "", "missing revision range")
 			}
 
-			logText, err := git.GitChangedLog(ctx.Repo.Path, ctx.Update.BeforeRev, ctx.Update.AfterRev)
+			context, err := BuildAISummaryChangeContext(ctx.Repo.Path, ctx.Update.BeforeRev, ctx.Update.AfterRev)
 			if err != nil {
 				_ = ctx.Store.SavePluginResult(ctx.Update.ID, AISummaryID, "error", "", err.Error())
 				return err
 			}
-			diffStat, err := git.GitDiffStat(ctx.Repo.Path, ctx.Update.BeforeRev, ctx.Update.AfterRev)
-			if err != nil {
-				_ = ctx.Store.SavePluginResult(ctx.Update.ID, AISummaryID, "error", "", err.Error())
-				return err
-			}
-
-			context := strings.TrimSpace(logText + "\n\n" + diffStat)
 			if context == "" {
 				return ctx.Store.SavePluginResult(ctx.Update.ID, AISummaryID, "skipped", "", "empty change context")
 			}
@@ -103,6 +99,110 @@ func TestAISummary(cfg map[string]string) (string, error) {
 	return generateAISummary(cfg, "test", "hello")
 }
 
+func AISummaryPrompt(cfg map[string]string) string {
+	if prompt := strings.TrimSpace(cfg["prompt"]); prompt != "" {
+		return prompt
+	}
+	return defaultAISummaryPrompt
+}
+
+func AISummaryInput(repoName, context string) string {
+	return fmt.Sprintf("Repository: %s\n\nChange context:\n%s", repoName, context)
+}
+
+func BuildAISummaryChangeContext(repoPath, beforeRev, afterRev string) (string, error) {
+	logText, err := git.GitChangedLog(repoPath, beforeRev, afterRev)
+	if err != nil {
+		return "", err
+	}
+	diffStat, err := git.GitDiffStat(repoPath, beforeRev, afterRev)
+	if err != nil {
+		return "", err
+	}
+	files, err := git.GitChangedFiles(repoPath, beforeRev, afterRev)
+	if err != nil {
+		return "", err
+	}
+	return buildAISummaryChangeContext(logText, diffStat, files, func(filePath string) (string, error) {
+		return git.GitDiffPatchForFile(repoPath, beforeRev, afterRev, filePath)
+	})
+}
+
+func buildAISummaryChangeContext(logText, diffStat string, files []string, diffForFile func(string) (string, error)) (string, error) {
+	sections := []string{
+		sectionText("Commits and file stats", logText),
+		sectionText("Diff summary", diffStat),
+	}
+	base := strings.TrimSpace(strings.Join(nonEmpty(sections), "\n\n"))
+	if base == "" && len(files) == 0 {
+		return "", nil
+	}
+	if len(base) >= maxAIChangeContextBytes {
+		return truncateAIChangeContext(base) + "\n\n[omitted code diffs: metadata exceeded context budget]", nil
+	}
+
+	var included []string
+	var omitted []string
+	var diffSections []string
+	used := len(base)
+	for _, file := range files {
+		diffText, err := diffForFile(file)
+		if err != nil {
+			return "", err
+		}
+		diffText = strings.TrimSpace(diffText)
+		if diffText == "" {
+			continue
+		}
+		section := fmt.Sprintf("File diff: %s\n%s", file, diffText)
+		cost := len(section) + 2
+		if used+cost > maxAIChangeContextBytes {
+			omitted = append(omitted, file)
+			continue
+		}
+		included = append(included, file)
+		diffSections = append(diffSections, section)
+		used += cost
+	}
+
+	var out []string
+	if base != "" {
+		out = append(out, base)
+	}
+	if len(diffSections) > 0 {
+		out = append(out, "Selected unified code diffs:\n"+strings.Join(diffSections, "\n\n"))
+	}
+	if len(omitted) > 0 {
+		out = append(out, fmt.Sprintf("Omitted files because context budget was exhausted (%d included, %d omitted):\n%s", len(included), len(omitted), strings.Join(omitted, "\n")))
+	}
+	return strings.TrimSpace(strings.Join(out, "\n\n")), nil
+}
+
+func sectionText(title, body string) string {
+	body = strings.TrimSpace(body)
+	if body == "" {
+		return ""
+	}
+	return title + ":\n" + body
+}
+
+func nonEmpty(values []string) []string {
+	out := make([]string, 0, len(values))
+	for _, value := range values {
+		if strings.TrimSpace(value) != "" {
+			out = append(out, value)
+		}
+	}
+	return out
+}
+
+func truncateAIChangeContext(context string) string {
+	if len(context) <= maxAIChangeContextBytes {
+		return context
+	}
+	return context[:maxAIChangeContextBytes] + "\n\n[truncated: change context exceeded 120000 bytes]"
+}
+
 func callAIProvider(cfg map[string]string, repoName, context string) (string, error) {
 	switch cfg["api_type"] {
 	case "", "responses":
@@ -130,8 +230,8 @@ func callOpenAIResponses(cfg map[string]string, repoName, context string) (strin
 
 	body := map[string]any{
 		"model":        model,
-		"instructions": aiSummaryPrompt,
-		"input":        fmt.Sprintf("Repository: %s\n\nGit log/stat context:\n%s", repoName, context),
+		"instructions": AISummaryPrompt(cfg),
+		"input":        AISummaryInput(repoName, context),
 	}
 	payload, err := json.Marshal(body)
 	if err != nil {
@@ -177,8 +277,8 @@ func callChatCompletions(cfg map[string]string, repoName, context string) (strin
 	body := map[string]any{
 		"model": model,
 		"messages": []map[string]string{
-			{"role": "system", "content": aiSummaryPrompt},
-			{"role": "user", "content": fmt.Sprintf("Repository: %s\n\nGit log/stat context:\n%s", repoName, context)},
+			{"role": "system", "content": AISummaryPrompt(cfg)},
+			{"role": "user", "content": AISummaryInput(repoName, context)},
 		},
 	}
 	payload, err := json.Marshal(body)

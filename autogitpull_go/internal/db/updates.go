@@ -95,6 +95,9 @@ func (s *Store) FinishUpdateWithRevisions(id int64, result string, pullErr error
 	}
 
 	changed := status == "success" && IsChangedPullResult(result)
+	if status == "success" && beforeRev != "" && afterRev != "" {
+		changed = beforeRev != afterRev
+	}
 	_, err := s.db.Exec(`
 		UPDATE updates
 		SET status = ?, result = ?, error = ?, skip_reason = ?, changed = ?, before_rev = ?, after_rev = ?, finished_at = ?
@@ -455,6 +458,16 @@ func IsSkippedPullError(errText string) bool {
 
 func IsChangedPullResult(result string) bool {
 	return strings.TrimSpace(result) != "" && !isUpToDate(result)
+}
+
+func IsRemoteUpdatedPullResult(result string) bool {
+	for _, line := range strings.Split(result, "\n") {
+		line = strings.TrimSpace(line)
+		if strings.Contains(line, " -> ") && (strings.Contains(line, "..") || strings.Contains(line, "[new ") || strings.Contains(line, "+ ")) {
+			return true
+		}
+	}
+	return false
 }
 
 func SkipReasonFromPullError(errText string) string {
