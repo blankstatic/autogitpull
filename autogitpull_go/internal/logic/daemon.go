@@ -3,21 +3,24 @@ package logic
 import (
 	"fmt"
 	"log/slog"
-	"net/url"
 	"os"
 	"os/signal"
+	"strconv"
 	"sync"
 	"syscall"
 	"time"
 
 	"github.com/blankstatic/autogitpull/autogitpull_go/internal/config"
 	"github.com/blankstatic/autogitpull/autogitpull_go/internal/db"
+	"github.com/blankstatic/autogitpull/autogitpull_go/internal/plugins"
+	"github.com/blankstatic/autogitpull/autogitpull_go/internal/pulllock"
 	"github.com/blankstatic/autogitpull/autogitpull_go/internal/web"
 	"github.com/blankstatic/autogitpull/autogitpull_go/pkg/fs"
 	"github.com/blankstatic/autogitpull/autogitpull_go/pkg/git"
-	"github.com/blankstatic/autogitpull/autogitpull_go/pkg/notifications"
 	"github.com/spf13/cobra"
 )
+
+const maxConcurrentDaemonPulls = 4
 
 type Daemon struct {
 	interval    time.Duration
@@ -25,6 +28,7 @@ type Daemon struct {
 	isRunning   bool
 	stopChan    chan struct{}
 	wg          sync.WaitGroup
+	pluginWG    sync.WaitGroup
 	mu          sync.RWMutex
 	onPullStart func(repo *config.RepoInfo)
 	onPullDone  func(repo *config.RepoInfo, result string, err error, notify bool)
@@ -93,6 +97,7 @@ func (d *Daemon) Stop() {
 	d.mu.Unlock()
 
 	d.wg.Wait()
+	d.pluginWG.Wait()
 
 	d.mu.Lock()
 	if d.stopChan == stopChan {
@@ -110,7 +115,7 @@ func (d *Daemon) IsRunning() bool {
 func (d *Daemon) run() {
 	defer d.wg.Done()
 
-	d.pullAllRepos(false)
+	d.pullAllRepos(true)
 
 	for {
 		interval := d.currentInterval()
@@ -159,13 +164,16 @@ func (d *Daemon) pullAllRepos(notify bool) {
 	repos := d.storage.GetAllRepos()
 
 	var wg sync.WaitGroup
+	sem := make(chan struct{}, maxConcurrentDaemonPulls)
 	for i := range repos {
 		if repos[i].Paused {
 			continue
 		}
 		wg.Add(1)
+		sem <- struct{}{}
 		go func(repo *config.RepoInfo) {
 			defer wg.Done()
+			defer func() { <-sem }()
 			d.pullRepo(repo, notify)
 		}(&repos[i])
 	}
@@ -173,6 +181,12 @@ func (d *Daemon) pullAllRepos(notify bool) {
 }
 
 func (d *Daemon) pullRepo(repo *config.RepoInfo, notify bool) {
+	if !pulllock.TryLock(repo.Path) {
+		slog.Info("Skipping repository already being pulled", slog.String("repo", repo.Name), slog.String("path", repo.Path))
+		return
+	}
+	defer pulllock.Unlock(repo.Path)
+
 	web.SetDaemonRepoRunning(repo.Name, true)
 	defer web.SetDaemonRepoRunning(repo.Name, false)
 
@@ -189,12 +203,14 @@ func (d *Daemon) pullRepo(repo *config.RepoInfo, notify bool) {
 		d.onPullStart(repo)
 	}
 
-	result, err := d.performPull(repo)
+	result, beforeRev, afterRev, err := d.performPull(repo)
 	web.AddDaemonRunResult(updateStatus(err))
 
 	if d.updateStore != nil && updateID > 0 {
-		if recordErr := d.updateStore.FinishUpdate(updateID, result, err); recordErr != nil {
+		if recordErr := d.updateStore.FinishUpdateWithRevisions(updateID, result, err, beforeRev, afterRev); recordErr != nil {
 			slog.Error("failed to record update result", slog.String("repo", repo.Name), slog.String("err", recordErr.Error()))
+		} else if err == nil {
+			d.runPluginsAfterChangeAsync(repo, updateID, notify)
 		}
 	}
 
@@ -209,6 +225,40 @@ func (d *Daemon) pullRepo(repo *config.RepoInfo, notify bool) {
 	}
 }
 
+func (d *Daemon) runPluginsAfterChangeAsync(repo *config.RepoInfo, updateID int64, notify bool) {
+	if repo == nil {
+		return
+	}
+	repoCopy := *repo
+	d.pluginWG.Add(1)
+	go func() {
+		defer d.pluginWG.Done()
+		d.runPluginsAfterChange(&repoCopy, updateID, notify)
+	}()
+}
+
+func (d *Daemon) runPluginsAfterChange(repo *config.RepoInfo, updateID int64, notify bool) {
+	if d.updateStore == nil || d.storage == nil {
+		return
+	}
+	update, err := d.updateStore.GetUpdate(updateID)
+	if err != nil {
+		slog.Error("failed to load update for plugins", slog.String("repo", repo.Name), slog.String("err", err.Error()))
+		return
+	}
+	plugins.RunAfterChange(plugins.Context{
+		Repo:      repo,
+		Update:    update,
+		Store:     d.updateStore,
+		Notify:    notify,
+		Source:    "daemon",
+		Dashboard: "http://localhost:9009",
+		OpenURL:   "http://localhost:9009/update?id=" + strconv.FormatInt(update.ID, 10),
+		AppName:   config.AppName,
+		Logger:    slog.Default(),
+	}, d.storage.GetPluginStates())
+}
+
 func updateStatus(err error) string {
 	if err == nil {
 		return "success"
@@ -219,30 +269,32 @@ func updateStatus(err error) string {
 	return "error"
 }
 
-func (d *Daemon) performPull(repo *config.RepoInfo) (string, error) {
+func (d *Daemon) performPull(repo *config.RepoInfo) (result, beforeRev, afterRev string, err error) {
 	currentBranch, err := git.GetCurrentBranch(repo.Path)
 	if err != nil {
-		return "", fmt.Errorf("get current branch: %w", err)
+		return "", "", "", fmt.Errorf("get current branch: %w", err)
 	}
 
 	if currentBranch != repo.DefaultBranch {
-		return "", fmt.Errorf("current branch %s is not default branch %s", currentBranch, repo.DefaultBranch)
+		return "", "", "", fmt.Errorf("current branch %s is not default branch %s", currentBranch, repo.DefaultBranch)
 	}
 
 	hasChanges, err := git.GitHasUncommitedChanges(repo.Path)
 	if err != nil {
-		return "", fmt.Errorf("check changes: %w", err)
+		return "", "", "", fmt.Errorf("check changes: %w", err)
 	}
 	if hasChanges {
-		return "", fmt.Errorf("repository has uncommitted changes")
+		return "", "", "", fmt.Errorf("repository has uncommitted changes")
 	}
 
-	result, err := git.GitPull(repo.Path)
+	beforeRev, _ = git.GitHead(repo.Path)
+	result, err = git.GitPull(repo.Path)
+	afterRev, _ = git.GitHead(repo.Path)
 	if err != nil {
-		return result, fmt.Errorf("git pull: %w", err)
+		return result, beforeRev, afterRev, fmt.Errorf("git pull: %w", err)
 	}
 
-	return result, nil
+	return result, beforeRev, afterRev, nil
 }
 
 func (d *Daemon) UpdateInterval(newInterval time.Duration) {
@@ -322,14 +374,6 @@ func DaemonCommandHandler(cmd *cobra.Command, args []string) {
 				slog.Warn("Failed to pull", slog.String("repo", repo.Name), slog.String("err", err.Error()))
 			} else {
 				slog.Info("Successfully pulled", slog.String("repo", repo.Name))
-				if notify && repo.NotificationsEnabled() && db.IsChangedPullResult(result) {
-					notifyURL := "http://localhost:9009/repo?path=" + url.QueryEscape(repo.Path)
-					go func() {
-						if notifyErr := notifications.OSNotifyURL(config.AppName, fmt.Sprintf("Pulled: %s", repo.Name), result, notifyURL); notifyErr != nil {
-							slog.Error("failed to send pull notification", slog.String("repo", repo.Name), slog.String("err", notifyErr.Error()))
-						}
-					}()
-				}
 			}
 		},
 	})

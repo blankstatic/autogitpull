@@ -1,0 +1,29 @@
+# Project Memory
+
+- Keep answers concise.
+- Go code lives in `autogitpull_go`.
+- Config and repo state are stored in the shared SQLite DB at `~/.autogitpull/updates.sqlite`.
+- Web UI is in `autogitpull_go/internal/web/server.go`; templates are embedded Go template strings in that file.
+- Main web dashboard should contain only activity, repositories, updates, and the compact plugins summary/link. Put everything else on separate pages.
+- Web service/database/daemon details live on the separate `/status` page; keep those details off the main dashboard.
+- Web daemon settings live on the separate `/settings` page; keep interval/retention out of the main dashboard header.
+- Web, TUI, and daemon must use one shared system for pull/update side effects: record via `db.Store.FinishUpdate`, load the saved `db.Update`, then call `plugins.RunAfterChange` with a source such as `web_manual`, `web_bulk`, `tui_manual`, or `daemon`.
+- Web bulk pulls and daemon pulls should use bounded concurrency, not unbounded fan-out. Web bulk pull starts in the background and redirects immediately. Web/daemon pulls share `internal/pulllock` to avoid two in-process pulls for the same repo path. Web/daemon after-pull plugin pipelines may run asynchronously after the update is saved so slow plugins do not block pull completion; daemon shutdown must wait for async plugin tasks before closing the shared DB.
+- Historically some functionality was duplicated between web and TUI; avoid new duplicate side-effect logic and keep web/TUI/daemon behavior aligned through shared packages.
+- Pull history is in `autogitpull_go/internal/db/updates.go`.
+- When `before_rev` and `after_rev` are available, `Update.Changed` should be based on `before_rev != after_rev`, not only pull stdout, because `git pull` may fetch remote branch updates while local HEAD remains unchanged.
+- Daemon pull flow is in `autogitpull_go/internal/logic/daemon.go`.
+- Change-processing plugins live in `autogitpull_go/internal/plugins`.
+- Plugins run after a successful pull has been recorded. By default they run only when the saved `db.Update.Changed` is true; plugins may opt into no-change runs with `RunOnNoChange`.
+- Plugin state is stored in `plugin_settings` via `config.StorageManager`; repo-scoped plugin selection is generic, uses plugin config `repo_scope` plus `selected_repos`, and must be editable from `/plugins`.
+- Plugin outputs are append-only, newest-first, and stored in `plugin_results` via `db.Store`; AI summary architecture should use saved `Update.BeforeRev`/`AfterRev` ranges, not ad hoc ORIG_HEAD assumptions.
+- Built-in `ai_summary` plugin is disabled by default; it uses saved `Update.BeforeRev`/`AfterRev` ranges to send commit stats, diff stats, and selected per-file unified code diffs to a custom-named OpenAI-compatible Responses or Chat Completions API with configured URL/key/model/prompt. Large changes must preserve metadata and list omitted files instead of blindly truncating the first diff bytes. It has a `/plugins` Test button that sends `hello`, and can run manually, globally, from `/update`, or through the generic selected-repos plugin scope. Missing URL/key/model is a skipped plugin result, not pending work. The `/update?id=...` page should show the exact AI system prompt and user input preview for the change.
+- Web change details live at `/update?id=...`; notifications should deep-link there, and the page should show pull text plus all AI summaries with a regenerate button.
+- Notifications plugin records sent/skipped/error diagnostics in `plugin_results`; use `/update?id=...` plugin results to debug missing notifications.
+- Remote ref updates from `git pull` output, such as `branch -> origin/branch` with unchanged local `HEAD`, should not mark `Update.Changed`, but notifications may still send for them.
+- Web plugin UI is a separate `/plugins` page, linked from the main dashboard and repo pages.
+- `web.New` calls `plugins.EnsureDefaults(storage)` so built-in plugin defaults are persisted.
+- Notifications are implemented as the built-in `notifications` plugin, default enabled with `title_prefix=Pulled`; do not call `pkg/notifications` directly from web, TUI, or daemon flows.
+- Manual web and TUI pull notifications should fire through the notifications plugin even when the pull has no new changes; other plugins remain changed-only unless they opt into no-change runs.
+- Before finishing code changes, run `go test ./...` from `autogitpull_go`.
+- Keep project memory and docs current: update `AGENTS.md` and `autogitpull_go/README.md` when dashboard pages, plugin behavior, storage, pull flow, TUI/web/daemon alignment, or user-facing commands change.

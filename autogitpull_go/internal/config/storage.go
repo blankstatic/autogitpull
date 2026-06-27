@@ -329,7 +329,71 @@ func (sm *StorageManager) migrate(db *sql.DB) error {
 			key TEXT PRIMARY KEY,
 			value TEXT NOT NULL
 		);
+		CREATE TABLE IF NOT EXISTS plugin_settings (
+			id TEXT PRIMARY KEY,
+			enabled INTEGER NOT NULL,
+			config_json TEXT NOT NULL DEFAULT '{}'
+		);
 	`)
+	return err
+}
+
+func (sm *StorageManager) GetPluginStates() map[string]PluginState {
+	sm.mu.Lock()
+	defer sm.mu.Unlock()
+
+	db, err := sm.open()
+	if err != nil {
+		return map[string]PluginState{}
+	}
+	defer db.Close()
+
+	rows, err := db.Query(`SELECT id, enabled, config_json FROM plugin_settings`)
+	if err != nil {
+		return map[string]PluginState{}
+	}
+	defer rows.Close()
+
+	states := map[string]PluginState{}
+	for rows.Next() {
+		var state PluginState
+		var enabled int
+		var configJSON string
+		if err := rows.Scan(&state.ID, &enabled, &configJSON); err != nil {
+			continue
+		}
+		state.Enabled = enabled != 0
+		if err := json.Unmarshal([]byte(configJSON), &state.Config); err != nil || state.Config == nil {
+			state.Config = map[string]string{}
+		}
+		states[state.ID] = state
+	}
+	return states
+}
+
+func (sm *StorageManager) SetPluginState(state PluginState) error {
+	if state.ID == "" {
+		return fmt.Errorf("plugin id is required")
+	}
+	configJSON, err := json.Marshal(state.Config)
+	if err != nil {
+		return err
+	}
+
+	sm.mu.Lock()
+	defer sm.mu.Unlock()
+
+	db, err := sm.open()
+	if err != nil {
+		return err
+	}
+	defer db.Close()
+
+	_, err = db.Exec(`
+		INSERT INTO plugin_settings (id, enabled, config_json)
+		VALUES (?, ?, ?)
+		ON CONFLICT(id) DO UPDATE SET enabled = excluded.enabled, config_json = excluded.config_json
+	`, state.ID, boolToInt(state.Enabled), string(configJSON))
 	return err
 }
 

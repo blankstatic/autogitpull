@@ -17,7 +17,9 @@ you work.
 - Records update history in `~/.autogitpull/updates.sqlite`.
 - Shows registered repositories in a terminal UI.
 - Starts a local dashboard at `http://localhost:9009` while the daemon runs.
-- Sends macOS notifications when a pull brings new changes.
+- Runs change-processing plugins after recorded pulls.
+- Sends macOS notifications through the built-in Notifications plugin.
+- Can store plugin output, including prepared AI-summary context, per update.
 - Can be installed as a macOS `launchd` service.
 
 The safety rule is intentionally simple: `autogitpull` only pulls when the repo
@@ -119,7 +121,11 @@ autogitpull daemon
 ```
 
 The daemon immediately checks all registered repositories, then repeats every
-30 minutes. It logs JSON to stdout when running in the foreground.
+30 minutes. Repository pulls run with bounded concurrency so a large repository
+set does not start unbounded git processes. The daemon and web dashboard also
+share an in-process repo lock so the same repository is not pulled twice at the
+same time from the same running process. It logs JSON to stdout when running in
+the foreground.
 
 ## Commands
 
@@ -209,18 +215,79 @@ http://localhost:9009
 The dashboard shows:
 
 - registered repositories;
-- last sync time;
-- update history;
-- skipped pulls;
-- failed pulls;
 - changed update activity for the last year;
+- update history;
+- skipped and failed pulls;
+- a compact plugin summary;
 - per-repository details and current local changes.
+
+Additional dashboard pages:
+
+- `/status` shows service state, database path, plugin summary, and daemon run
+  status.
+- `/settings` configures daemon pull interval and history retention.
+- `/plugins` enables and configures change-processing plugins.
+
+Dashboard bulk `Pull all` starts eligible repositories in the background and
+returns immediately. Progress appears through update history, repository status,
+and the `/status` daemon-style running list.
 
 Notification clicks open the related repository page in this dashboard.
 
+## Plugins
+
+Plugins run from the shared pull/update pipeline used by the web dashboard, the
+terminal UI, and the daemon:
+
+1. A pull is recorded with `db.Store.FinishUpdate`.
+2. The saved `db.Update` is loaded.
+3. `plugins.RunAfterChange` runs enabled plugins.
+
+By default, plugins run only when the saved update has `changed = true`. A plugin
+can opt into no-change runs. The built-in Notifications plugin is enabled by
+default with `title_prefix=Pulled` and also runs for manual web and TUI pulls
+that complete without new changes.
+Web and daemon after-pull plugin processing runs after the update is saved and
+does not block pull completion, so slow providers such as AI summary APIs cannot
+stall the pull loop. Daemon shutdown waits for those async plugin tasks before
+closing the shared database.
+
+The built-in AI Summary plugin is disabled by default. When enabled, it uses the
+saved `before_rev` and `after_rev` range to collect `git log --stat` and
+`git diff --stat` metadata plus selected per-file unified code diffs, then
+stores the generated summary in plugin results.
+Configure a provider name, API key, model, prompt, API type, and API URL on the
+plugin settings page. Any OpenAI-compatible provider can use either Responses API
+or Chat Completions by changing the API type and URL. Use the AI Summary `Test`
+button on the plugin settings page to send `hello` and verify the configured
+provider response. API URL, API key, and model must be filled before the plugin
+will call a provider. The configured prompt is sent as the system
+prompt/instructions. The user input is the repository name plus `git log --stat`
+metadata, `git diff --stat`, and a unified code diff for the saved
+`before_rev..after_rev` range. For large changes, metadata is kept first, file
+diffs are added until the context budget is exhausted, and omitted files are
+listed explicitly. Each generated summary is stored as a separate plugin result,
+so a change can have multiple AI summaries.
+It can be run manually from a repo page, scoped to selected repositories through
+the generic repo plugin controls, or run globally for all changed updates from
+the plugin settings page. The plugin settings page lets every plugin switch
+between all repositories and selected repositories, and shows the selected
+repository list for repo-scoped plugins.
+
+Each recorded update has a change details page at `/update?id=<id>`. It shows
+the pull output or error, all AI summaries for that update, and a button to
+generate another summary. Pull notifications deep-link to this change page, and
+notification sent/skipped/error diagnostics are shown in that page's plugin
+results. The page also shows the exact AI prompt and user input preview for that
+change. Plugin results are shown newest first.
+
+Plugin settings are stored in the `plugin_settings` table in
+`~/.autogitpull/updates.sqlite`.
+
 ## Storage
 
-Repositories, settings, and update history are stored in SQLite:
+Repositories, settings, plugin settings, update history, and plugin results are
+stored in SQLite:
 
 ```sh
 ~/.autogitpull/updates.sqlite
@@ -248,6 +315,8 @@ For every registered repository, `autogitpull` does this:
 4. Runs `git pull origin` only when the branch matches and the working tree is
    clean.
 5. Records the result in the update history database.
+6. Stores the pre-pull and post-pull revisions when available.
+7. Runs enabled plugins from the saved update record.
 
 Common skip cases:
 
@@ -260,8 +329,14 @@ This avoids pulling into feature branches or overwriting active local work.
 
 ## Notifications
 
-On macOS, `autogitpull` sends notifications for registration actions and for
-successful pulls that bring changes.
+On macOS, `autogitpull` sends notifications for registration actions. Pull
+notifications are handled by the built-in Notifications plugin. It sends
+notifications for changed daemon/web/TUI pulls, and also for successful manual
+web/TUI pulls even when there are no new changes.
+Remote-tracking branch updates reported by `git pull` can also trigger
+notifications even when the local `HEAD` did not change. Those events are not
+treated as AI-summary code changes because there is no local revision range to
+summarize.
 
 By default it looks for:
 

@@ -3,17 +3,17 @@ package ui
 import (
 	"fmt"
 	"log/slog"
-	"net/url"
 	"os"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
 
 	"github.com/blankstatic/autogitpull/autogitpull_go/internal/config"
 	"github.com/blankstatic/autogitpull/autogitpull_go/internal/db"
+	"github.com/blankstatic/autogitpull/autogitpull_go/internal/plugins"
 	"github.com/blankstatic/autogitpull/autogitpull_go/pkg/git"
-	"github.com/blankstatic/autogitpull/autogitpull_go/pkg/notifications"
 	"github.com/charmbracelet/bubbles/table"
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
@@ -536,6 +536,8 @@ func handleUnregisterRepo(path string) error {
 func handlePullRepo(repo *config.RepoInfo, modelRef *model) error {
 	var handleError error
 	var pullResult string
+	var beforeRev string
+	var afterRev string
 	var updateStore *db.Store
 	var updateID int64
 
@@ -559,18 +561,14 @@ func handlePullRepo(repo *config.RepoInfo, modelRef *model) error {
 
 	defer func() {
 		if updateStore != nil && updateID > 0 {
-			if err := updateStore.FinishUpdate(updateID, pullResult, handleError); err != nil {
+			if err := updateStore.FinishUpdateWithRevisions(updateID, pullResult, handleError, beforeRev, afterRev); err != nil {
 				slog.Error("failed to record update result", slog.String("repo", repo.Name), slog.String("err", err.Error()))
+			} else if handleError == nil {
+				runPluginsAfterPull(repo, updateStore, updateID)
 			}
 		}
 
-		notifyURL := "http://localhost:9009/repo?path=" + url.QueryEscape(repo.Path)
 		if handleError != nil {
-			notifyAsync(
-				fmt.Sprintf("%s pull failed", repo.Name),
-				handleError.Error(),
-				notifyURL,
-			)
 			if db.IsSkippedPullError(handleError.Error()) {
 				modelRef.sendStatusUpdate(repo.Path, "Skipped")
 			} else {
@@ -586,11 +584,6 @@ func handlePullRepo(repo *config.RepoInfo, modelRef *model) error {
 				}
 			}()
 		} else {
-			notifyAsync(
-				fmt.Sprintf("%s pull", repo.Name),
-				pullResult,
-				notifyURL,
-			)
 			modelRef.sendStatusUpdate(repo.Path, "Success")
 			go func() {
 				if err := updateRepoLastSync(repo.Path); err != nil {
@@ -635,7 +628,9 @@ func handlePullRepo(repo *config.RepoInfo, modelRef *model) error {
 
 	modelRef.sendStatusUpdate(repo.Path, "Pulling...")
 
+	beforeRev, _ = git.GitHead(repo.Path)
 	pullResult, handleError = git.GitPull(repo.Path)
+	afterRev, _ = git.GitHead(repo.Path)
 	if handleError != nil {
 		modelRef.sendStatusUpdate(repo.Path, "Pull failed")
 	} else {
@@ -643,6 +638,36 @@ func handlePullRepo(repo *config.RepoInfo, modelRef *model) error {
 	}
 
 	return handleError
+}
+
+func runPluginsAfterPull(repo *config.RepoInfo, updateStore *db.Store, updateID int64) {
+	update, err := updateStore.GetUpdate(updateID)
+	if err != nil {
+		slog.Error("failed to load update for plugins", slog.String("repo", repo.Name), slog.String("err", err.Error()))
+		return
+	}
+	configPath, err := config.GetConfigPath()
+	if err != nil {
+		slog.Error("failed to get config path for plugins", slog.String("repo", repo.Name), slog.String("err", err.Error()))
+		return
+	}
+	storage := config.NewStorageManager(configPath)
+	if err := storage.Load(); err != nil {
+		slog.Error("failed to load config for plugins", slog.String("repo", repo.Name), slog.String("err", err.Error()))
+		return
+	}
+	plugins.EnsureDefaults(storage)
+	plugins.RunAfterChange(plugins.Context{
+		Repo:      repo,
+		Update:    update,
+		Store:     updateStore,
+		Notify:    true,
+		Source:    "tui_manual",
+		Dashboard: "http://localhost:9009",
+		OpenURL:   "http://localhost:9009/update?id=" + strconv.FormatInt(update.ID, 10),
+		AppName:   config.AppName,
+		Logger:    slog.Default(),
+	}, storage.GetPluginStates())
 }
 
 func updateRepoLastSync(path string) error {
@@ -657,12 +682,4 @@ func updateRepoLastSync(path string) error {
 	}
 	err = storage.UpdateLastSync(path)
 	return err
-}
-
-func notifyAsync(title, body, openURL string) {
-	go func() {
-		if err := notifications.OSNotifyURL(config.AppName, title, body, openURL); err != nil {
-			slog.Error("failed to send notification", slog.String("title", title), slog.String("err", err.Error()))
-		}
-	}()
 }

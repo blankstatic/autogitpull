@@ -96,6 +96,28 @@ func TestSetRepoPausedAndPullInterval(t *testing.T) {
 	}
 }
 
+func TestPluginStateRoundTrip(t *testing.T) {
+	sm := NewStorageManager(filepath.Join(t.TempDir(), "config.json"))
+	if err := sm.Load(); err != nil {
+		t.Fatal(err)
+	}
+
+	state := PluginState{
+		ID:      "notifications",
+		Enabled: false,
+		Config:  map[string]string{"title_prefix": "Changed"},
+	}
+	if err := sm.SetPluginState(state); err != nil {
+		t.Fatal(err)
+	}
+
+	states := sm.GetPluginStates()
+	got := states["notifications"]
+	if got.ID != state.ID || got.Enabled || got.Config["title_prefix"] != "Changed" {
+		t.Fatalf("unexpected plugin state: %+v", got)
+	}
+}
+
 func TestGetRepoReturnsCopy(t *testing.T) {
 	sm := NewStorageManager(filepath.Join(t.TempDir(), "config.json"))
 	seedConfig(t, sm, Config{Repositories: []RepoInfo{{

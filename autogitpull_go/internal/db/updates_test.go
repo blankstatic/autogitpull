@@ -18,7 +18,7 @@ func TestStoreRecordsUpdate(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := store.FinishUpdate(id, "pulled changes", nil); err != nil {
+	if err := store.FinishUpdateWithRevisions(id, "pulled changes", nil, "abc", "def"); err != nil {
 		t.Fatal(err)
 	}
 
@@ -32,6 +32,9 @@ func TestStoreRecordsUpdate(t *testing.T) {
 	if updates[0].RepoName != "repo" || updates[0].Status != "success" || !updates[0].Changed {
 		t.Fatalf("unexpected update: %+v", updates[0])
 	}
+	if updates[0].BeforeRev != "abc" || updates[0].AfterRev != "def" {
+		t.Fatalf("unexpected update revisions: %+v", updates[0])
+	}
 }
 
 func TestIsChangedPullResult(t *testing.T) {
@@ -43,6 +46,41 @@ func TestIsChangedPullResult(t *testing.T) {
 	}
 	if IsChangedPullResult("   ") {
 		t.Fatal("expected blank result not to be changed")
+	}
+}
+
+func TestIsRemoteUpdatedPullResult(t *testing.T) {
+	result := "From github.com:blankstatic/autogitpull\n   e81aec2..86bf794  plugins    -> origin/plugins\nAlready up to date."
+	if !IsRemoteUpdatedPullResult(result) {
+		t.Fatal("expected remote ref update")
+	}
+	if IsRemoteUpdatedPullResult("Already up to date.") {
+		t.Fatal("expected plain up-to-date output not to be remote update")
+	}
+}
+
+func TestStoreDoesNotMarkFetchOnlyPullAsChanged(t *testing.T) {
+	store, err := Open(filepath.Join(t.TempDir(), "updates.sqlite"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+
+	id, err := store.BeginUpdate("/repo/path", "repo")
+	if err != nil {
+		t.Fatal(err)
+	}
+	result := "From github.com:blankstatic/autogitpull\n   e81aec2..86bf794  plugins    -> origin/plugins\nAlready up to date."
+	if err := store.FinishUpdateWithRevisions(id, result, nil, "6e8ddeaec98e", "6e8ddeaec98e"); err != nil {
+		t.Fatal(err)
+	}
+
+	update, err := store.GetUpdate(id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if update.Changed {
+		t.Fatalf("expected same-revision pull not to be changed: %+v", update)
 	}
 }
 
@@ -247,6 +285,33 @@ func TestLatestUpdatesByRepoAndDeleteBefore(t *testing.T) {
 	}
 	if total != 2 {
 		t.Fatalf("expected 2 remaining rows, got %d", total)
+	}
+}
+
+func TestPluginResultRoundTrip(t *testing.T) {
+	store, err := Open(filepath.Join(t.TempDir(), "updates.sqlite"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+
+	id, err := store.BeginUpdate("/repo/path", "repo")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.SavePluginResult(id, "ai_summary", "pending", "context", ""); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.SavePluginResult(id, "ai_summary", "success", "summary", ""); err != nil {
+		t.Fatal(err)
+	}
+
+	results, err := store.PluginResultsByUpdate(id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(results) != 2 || results[0].PluginID != "ai_summary" || results[0].Status != "success" || results[0].Result != "summary" {
+		t.Fatalf("unexpected plugin results: %+v", results)
 	}
 }
 

@@ -3,6 +3,7 @@ package web
 import (
 	"bytes"
 	_ "embed"
+	"errors"
 	"fmt"
 	"html/template"
 	"log/slog"
@@ -17,10 +18,11 @@ import (
 
 	"github.com/blankstatic/autogitpull/autogitpull_go/internal/config"
 	"github.com/blankstatic/autogitpull/autogitpull_go/internal/db"
+	"github.com/blankstatic/autogitpull/autogitpull_go/internal/plugins"
+	"github.com/blankstatic/autogitpull/autogitpull_go/internal/pulllock"
 	servicepkg "github.com/blankstatic/autogitpull/autogitpull_go/internal/service"
 	versionpkg "github.com/blankstatic/autogitpull/autogitpull_go/internal/version"
 	"github.com/blankstatic/autogitpull/autogitpull_go/pkg/git"
-	"github.com/blankstatic/autogitpull/autogitpull_go/pkg/notifications"
 )
 
 const Addr = ":9009"
@@ -28,6 +30,7 @@ const serviceInterval = 30 * time.Minute
 const serviceLabel = "com.blankstatic.autogitpull"
 const updatesPerPage = 50
 const activityWeeks = 53
+const maxConcurrentPulls = 4
 const eventFilterChanges = "changes"
 const eventFilterAll = "all"
 
@@ -45,9 +48,32 @@ type RepoCard struct {
 	LastUpdate *db.Update
 }
 
+type PluginSummary struct {
+	Total   int
+	Enabled int
+}
+
+type PluginRepoControl struct {
+	ID          string
+	Name        string
+	Status      string
+	StatusClass string
+	Action      string
+	NextEnabled bool
+}
+
 type ChangedFile struct {
 	Status string
 	Path   string
+}
+
+type AISummaryInputPreview struct {
+	Prompt   string
+	Input    string
+	Error    string
+	Provider string
+	APIType  string
+	Model    string
 }
 
 type flashMessage struct {
@@ -138,6 +164,7 @@ func GetDaemonStatus() DaemonStatus {
 }
 
 func New(store *db.Store, storage *config.StorageManager) *Server {
+	plugins.EnsureDefaults(storage)
 	s := &Server{
 		store:   store,
 		storage: storage,
@@ -160,12 +187,21 @@ func (s *Server) routes() {
 	s.mux.HandleFunc("/", s.index)
 	s.mux.HandleFunc("/repo", s.repo)
 	s.mux.HandleFunc("/repo/pull", s.pullRepo)
+	s.mux.HandleFunc("/repo/ai-summary", s.runRepoAISummary)
+	s.mux.HandleFunc("/repo/plugin-toggle", s.toggleRepoPlugin)
+	s.mux.HandleFunc("/update", s.update)
+	s.mux.HandleFunc("/update/ai-summary", s.runUpdateAISummary)
 	s.mux.HandleFunc("/repo/pause", s.pauseRepo)
 	s.mux.HandleFunc("/repo/notify", s.notifyRepo)
 	s.mux.HandleFunc("/repo/open", s.openRepo)
 	s.mux.HandleFunc("/repo/unregister", s.unregisterRepo)
 	s.mux.HandleFunc("/repos/bulk", s.bulkRepos)
 	s.mux.HandleFunc("/settings", s.settings)
+	s.mux.HandleFunc("/status", s.status)
+	s.mux.HandleFunc("/plugins", s.plugins)
+	s.mux.HandleFunc("/plugins/save", s.savePlugin)
+	s.mux.HandleFunc("/plugins/remove-repo", s.removePluginRepo)
+	s.mux.HandleFunc("/plugins/test-ai-summary", s.testAISummaryPlugin)
 	s.mux.HandleFunc("/favicon.ico", s.icon)
 	s.mux.HandleFunc("/assets/app-icon.png", s.icon)
 }
@@ -193,9 +229,6 @@ func (s *Server) index(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
-	dbPath, _ := config.GetUpdatesDBPath()
-	serviceStatus := getServiceStatus()
-	cfg := s.storage.GetConfig()
 	activity, err := s.activity("")
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
@@ -212,13 +245,20 @@ func (s *Server) index(w http.ResponseWriter, r *http.Request) {
 		"TotalUpdates":  totalUpdates,
 		"Pagination":    newPagination(r.URL.Path, filterQueryValues(filter), page, totalUpdates),
 		"EventFilter":   newEventFilter(r.URL.Path, nil, filter),
-		"DBPath":        dbPath,
-		"ServiceStatus": serviceStatus,
-		"ServiceLabel":  serviceLabel,
+		"PluginSummary": newPluginSummary(s.storage.GetPluginStates()),
 		"AppVersion":    versionpkg.AppVersion,
-		"PullInterval":  cfg.PullIntervalMinutes,
-		"RetentionDays": cfg.HistoryRetentionDays,
+		"Flash":         flashFromRequest(r),
+	})
+}
+
+func (s *Server) status(w http.ResponseWriter, r *http.Request) {
+	dbPath, _ := config.GetUpdatesDBPath()
+	renderTemplate(w, statusTemplate, map[string]any{
+		"DBPath":        dbPath,
+		"ServiceStatus": getServiceStatus(),
+		"ServiceLabel":  serviceLabel,
 		"DaemonStatus":  GetDaemonStatus(),
+		"PluginSummary": newPluginSummary(s.storage.GetPluginStates()),
 		"Flash":         flashFromRequest(r),
 	})
 }
@@ -264,17 +304,61 @@ func (s *Server) repo(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	pluginStates := s.storage.GetPluginStates()
 	renderTemplate(w, repoTemplate, map[string]any{
-		"Repo":         repo,
-		"Updates":      updates,
-		"Activity":     activity,
-		"Changes":      changes,
-		"ChangedFiles": changedFiles,
-		"TotalUpdates": totalUpdates,
-		"Pagination":   newPagination(r.URL.Path, repoQueryValues(repoPath, filter), page, totalUpdates),
-		"EventFilter":  newEventFilter(r.URL.Path, url.Values{"path": []string{repoPath}}, filter),
-		"Flash":        flashFromRequest(r),
+		"Repo":           repo,
+		"PluginControls": pluginRepoControls(pluginStates, repo.Path),
+		"Updates":        updates,
+		"Activity":       activity,
+		"Changes":        changes,
+		"ChangedFiles":   changedFiles,
+		"TotalUpdates":   totalUpdates,
+		"Pagination":     newPagination(r.URL.Path, repoQueryValues(repoPath, filter), page, totalUpdates),
+		"EventFilter":    newEventFilter(r.URL.Path, url.Values{"path": []string{repoPath}}, filter),
+		"Flash":          flashFromRequest(r),
 	})
+}
+
+func (s *Server) toggleRepoPlugin(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	pluginID := r.FormValue("plugin_id")
+	if pluginID == "" {
+		http.Error(w, "missing plugin_id", http.StatusBadRequest)
+		return
+	}
+	def, err := plugins.ValidateID(pluginID)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+	repoPath := r.FormValue("path")
+	if repoPath == "" {
+		http.Error(w, "missing path", http.StatusBadRequest)
+		return
+	}
+	repo, err := s.storage.GetRepo(repoPath)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusNotFound)
+		return
+	}
+	enabled := r.FormValue("enabled") == "1"
+	state, err := plugins.SetRepoEnabled(s.storage.GetPluginStates(), pluginID, repo.Path, enabled)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+	if err := s.storage.SetPluginState(state); err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	if enabled {
+		redirectRepoFlash(w, r, repo.Path, def.Name+" enabled for this repo", "success")
+		return
+	}
+	redirectRepoFlash(w, r, repo.Path, def.Name+" disabled for this repo", "info")
 }
 
 func (s *Server) pullRepo(w http.ResponseWriter, r *http.Request) {
@@ -292,28 +376,143 @@ func (s *Server) pullRepo(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, err.Error(), http.StatusNotFound)
 		return
 	}
+	if !pulllock.TryLock(repo.Path) {
+		redirectRepoFlash(w, r, repo.Path, "Pull already running", "skipped")
+		return
+	}
+	defer pulllock.Unlock(repo.Path)
 
+	SetDaemonRepoRunning(repo.Name, true)
+	defer SetDaemonRepoRunning(repo.Name, false)
 	updateID, err := s.store.BeginUpdate(repo.Path, repo.Name)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
-	result, pullErr := performPull(repo)
-	if err := s.store.FinishUpdate(updateID, result, pullErr); err != nil {
+	result, beforeRev, afterRev, pullErr := performPull(repo)
+	if err := s.store.FinishUpdateWithRevisions(updateID, result, pullErr, beforeRev, afterRev); err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
-	notifyURL := "http://localhost" + Addr + repoURL(repo.Path, "")
 	if pullErr != nil {
-		notifyPull(repo, fmt.Sprintf("%s pull failed", repo.Name), pullErr.Error(), notifyURL)
 		http.Redirect(w, r, repoURLWithFlash(repoPath, eventFilterAll, pullFlashText(pullErr), pullFlashType(pullErr)), http.StatusSeeOther)
 		return
 	}
 	if pullErr == nil {
 		_ = s.storage.UpdateLastSync(repo.Path)
-		notifyPull(repo, fmt.Sprintf("%s pull", repo.Name), result, notifyURL)
+		s.runPluginsAfterChangeAsync(repo, updateID, true, "web_manual")
 	}
 	http.Redirect(w, r, repoURLWithFlash(repoPath, eventFilterAll, "Pulled successfully", "success"), http.StatusSeeOther)
+}
+
+func (s *Server) runRepoAISummary(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	repoPath := r.FormValue("path")
+	if repoPath == "" {
+		http.Error(w, "missing path", http.StatusBadRequest)
+		return
+	}
+	repo, err := s.storage.GetRepo(repoPath)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusNotFound)
+		return
+	}
+	updates, err := s.store.RepoUpdatesPageFiltered(repo.Path, 1, 0, db.UpdateFilter{ChangedOnly: true})
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	if len(updates) == 0 {
+		redirectRepoFlash(w, r, repo.Path, "No changed update to summarize", "skipped")
+		return
+	}
+	err = plugins.RunOne(plugins.AISummaryID, plugins.Context{
+		Repo:      repo,
+		Update:    updates[0],
+		Store:     s.store,
+		Source:    "web_repo_manual_ai",
+		Dashboard: "http://localhost" + Addr,
+		OpenURL:   "http://localhost" + Addr + updateURL(updates[0].ID),
+		AppName:   config.AppName,
+		Logger:    slog.Default(),
+	}, s.storage.GetPluginStates())
+	if errors.Is(err, plugins.ErrPluginDisabled) {
+		redirectRepoFlash(w, r, repo.Path, "AI summary plugin is disabled", "skipped")
+		return
+	}
+	if err != nil {
+		http.Redirect(w, r, updateURLWithFlashFragment(updates[0].ID, "AI summary failed; see plugin results below", "skipped", "plugin-results"), http.StatusSeeOther)
+		return
+	}
+	http.Redirect(w, r, updateURLWithFlashFragment(updates[0].ID, "AI summary generated", "success", "ai-summary"), http.StatusSeeOther)
+}
+
+func (s *Server) update(w http.ResponseWriter, r *http.Request) {
+	id, err := strconv.ParseInt(r.URL.Query().Get("id"), 10, 64)
+	if err != nil || id <= 0 {
+		http.Error(w, "invalid update id", http.StatusBadRequest)
+		return
+	}
+	update, err := s.store.GetUpdate(id)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusNotFound)
+		return
+	}
+	results, err := s.store.PluginResultsByUpdate(id)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	renderTemplate(w, updateTemplate, map[string]any{
+		"Update":        update,
+		"AISummaries":   aiSummaryResults(results),
+		"AIInput":       s.aiSummaryInputPreview(update),
+		"PluginResults": results,
+		"Flash":         flashFromRequest(r),
+	})
+}
+
+func (s *Server) runUpdateAISummary(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	id, err := strconv.ParseInt(r.FormValue("id"), 10, 64)
+	if err != nil || id <= 0 {
+		http.Error(w, "invalid update id", http.StatusBadRequest)
+		return
+	}
+	update, err := s.store.GetUpdate(id)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusNotFound)
+		return
+	}
+	repo, err := s.storage.GetRepo(update.RepoPath)
+	if err != nil {
+		repo = &config.RepoInfo{Path: update.RepoPath, Name: update.RepoName}
+	}
+	err = plugins.RunOne(plugins.AISummaryID, plugins.Context{
+		Repo:      repo,
+		Update:    update,
+		Store:     s.store,
+		Source:    "web_update_manual_ai",
+		Dashboard: "http://localhost" + Addr,
+		OpenURL:   "http://localhost" + Addr + updateURL(update.ID),
+		AppName:   config.AppName,
+		Logger:    slog.Default(),
+	}, s.storage.GetPluginStates())
+	if errors.Is(err, plugins.ErrPluginDisabled) {
+		http.Redirect(w, r, updateURLWithFlashFragment(update.ID, "AI summary plugin is disabled", "skipped", "ai-summary"), http.StatusSeeOther)
+		return
+	}
+	if err != nil {
+		http.Redirect(w, r, updateURLWithFlashFragment(update.ID, "AI summary failed; see plugin results below", "skipped", "plugin-results"), http.StatusSeeOther)
+		return
+	}
+	http.Redirect(w, r, updateURLWithFlashFragment(update.ID, "AI summary generated", "success", "ai-summary"), http.StatusSeeOther)
 }
 
 func (s *Server) pauseRepo(w http.ResponseWriter, r *http.Request) {
@@ -357,6 +556,15 @@ func (s *Server) notifyRepo(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) settings(w http.ResponseWriter, r *http.Request) {
+	if r.Method == http.MethodGet {
+		cfg := s.storage.GetConfig()
+		renderTemplate(w, settingsTemplate, map[string]any{
+			"PullInterval":  cfg.PullIntervalMinutes,
+			"RetentionDays": cfg.HistoryRetentionDays,
+			"Flash":         flashFromRequest(r),
+		})
+		return
+	}
 	if r.Method != http.MethodPost {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 		return
@@ -383,7 +591,102 @@ func (s *Server) settings(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
-	http.Redirect(w, r, flashURL("/", "Settings saved", "success"), http.StatusSeeOther)
+	http.Redirect(w, r, flashURL("/settings", "Settings saved", "success"), http.StatusSeeOther)
+}
+
+func (s *Server) plugins(w http.ResponseWriter, r *http.Request) {
+	renderTemplate(w, pluginsTemplate, map[string]any{
+		"Plugins": plugins.Views(s.storage.GetPluginStates()),
+		"Flash":   flashFromRequest(r),
+	})
+}
+
+func (s *Server) savePlugin(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	id := r.FormValue("id")
+	def, err := plugins.ValidateID(id)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+	state := config.PluginState{ID: id, Enabled: r.FormValue("enabled") == "1", Config: map[string]string{}}
+	if existing, ok := s.storage.GetPluginStates()[id]; ok {
+		for key, value := range existing.Config {
+			state.Config[key] = value
+		}
+	}
+	if err := r.ParseForm(); err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+	for _, field := range plugins.ConfigFields(def) {
+		formKey := "config_" + field.Key
+		if _, ok := r.Form[formKey]; !ok {
+			continue
+		}
+		state.Config[field.Key] = strings.TrimSpace(r.FormValue(formKey))
+	}
+	if err := s.storage.SetPluginState(state); err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	http.Redirect(w, r, flashURL("/plugins", "Plugin saved", "success"), http.StatusSeeOther)
+}
+
+func (s *Server) removePluginRepo(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	id := r.FormValue("id")
+	repoPath := r.FormValue("repo")
+	if repoPath == "" {
+		http.Error(w, "missing repo", http.StatusBadRequest)
+		return
+	}
+	state, err := plugins.SetRepoEnabled(s.storage.GetPluginStates(), id, repoPath, false)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+	if err := s.storage.SetPluginState(state); err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	http.Redirect(w, r, flashURL("/plugins", "Selected repo removed", "success"), http.StatusSeeOther)
+}
+
+func (s *Server) testAISummaryPlugin(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	states := s.storage.GetPluginStates()
+	state, ok := states[plugins.AISummaryID]
+	if !ok {
+		http.Redirect(w, r, flashURL("/plugins", "AI summary plugin settings not found", "skipped"), http.StatusSeeOther)
+		return
+	}
+	view := plugins.Views(states)
+	cfg := state.Config
+	for _, item := range view {
+		if item.ID == plugins.AISummaryID {
+			cfg = item.Config
+			break
+		}
+	}
+	result, err := plugins.TestAISummary(cfg)
+	if err != nil {
+		http.Redirect(w, r, flashURL("/plugins", "AI summary test failed: "+err.Error(), "skipped"), http.StatusSeeOther)
+		return
+	}
+	if result == "" {
+		result = "(empty response)"
+	}
+	http.Redirect(w, r, flashURL("/plugins", "AI summary test: "+firstLine(result), "success"), http.StatusSeeOther)
 }
 
 func (s *Server) bulkRepos(w http.ResponseWriter, r *http.Request) {
@@ -395,13 +698,12 @@ func (s *Server) bulkRepos(w http.ResponseWriter, r *http.Request) {
 	switch action {
 	case "pull_all":
 		repos := s.storage.GetAllRepos()
-		for i := range repos {
-			if repos[i].Paused {
-				continue
-			}
-			s.pullRepoRecord(&repos[i])
+		queued := s.pullReposAsync(repos)
+		if queued == 0 {
+			http.Redirect(w, r, flashURL("/", "No repositories to pull", "skipped"), http.StatusSeeOther)
+			return
 		}
-		http.Redirect(w, r, flashURL("/", "Bulk pull finished", "success"), http.StatusSeeOther)
+		http.Redirect(w, r, flashURL("/", fmt.Sprintf("Bulk pull started for %d repos", queued), "running"), http.StatusSeeOther)
 	case "pause_errors":
 		latest, err := s.store.LatestUpdatesByRepo()
 		if err != nil {
@@ -446,18 +748,56 @@ func (s *Server) bulkRepos(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
+func (s *Server) pullReposAsync(repos []config.RepoInfo) int {
+	pending := make([]config.RepoInfo, 0, len(repos))
+	for _, repo := range repos {
+		if !repo.Paused {
+			pending = append(pending, repo)
+		}
+	}
+	if len(pending) == 0 {
+		return 0
+	}
+	go func() {
+		sem := make(chan struct{}, maxConcurrentPulls)
+		var wg sync.WaitGroup
+		for i := range pending {
+			repo := pending[i]
+			wg.Add(1)
+			sem <- struct{}{}
+			go func() {
+				defer wg.Done()
+				defer func() { <-sem }()
+				s.pullRepoRecord(&repo)
+			}()
+		}
+		wg.Wait()
+	}()
+	return len(pending)
+}
+
 func (s *Server) pullRepoRecord(repo *config.RepoInfo) {
+	if !pulllock.TryLock(repo.Path) {
+		slog.Info("skipping bulk pull because repository is already being pulled", slog.String("repo", repo.Name), slog.String("path", repo.Path))
+		return
+	}
+	defer pulllock.Unlock(repo.Path)
+
+	SetDaemonRepoRunning(repo.Name, true)
+	defer SetDaemonRepoRunning(repo.Name, false)
+
 	updateID, err := s.store.BeginUpdate(repo.Path, repo.Name)
 	if err != nil {
 		slog.Error("failed to record bulk pull start", slog.String("repo", repo.Name), slog.String("err", err.Error()))
 		return
 	}
-	result, pullErr := performPull(repo)
-	if err := s.store.FinishUpdate(updateID, result, pullErr); err != nil {
+	result, beforeRev, afterRev, pullErr := performPull(repo)
+	if err := s.store.FinishUpdateWithRevisions(updateID, result, pullErr, beforeRev, afterRev); err != nil {
 		slog.Error("failed to record bulk pull result", slog.String("repo", repo.Name), slog.String("err", err.Error()))
 	}
 	if pullErr == nil {
 		_ = s.storage.UpdateLastSync(repo.Path)
+		s.runPluginsAfterChangeAsync(repo, updateID, true, "web_bulk")
 	}
 }
 
@@ -537,6 +877,109 @@ func repoCards(repos []config.RepoInfo, latest map[string]db.Update) []RepoCard 
 	return cards
 }
 
+func newPluginSummary(states map[string]config.PluginState) PluginSummary {
+	views := plugins.Views(states)
+	summary := PluginSummary{Total: len(views)}
+	for _, view := range views {
+		if view.Enabled {
+			summary.Enabled++
+		}
+	}
+	return summary
+}
+
+func pluginRepoControls(states map[string]config.PluginState, repoPath string) []PluginRepoControl {
+	views := plugins.Views(states)
+	controls := make([]PluginRepoControl, 0, len(views))
+	for _, view := range views {
+		control := PluginRepoControl{
+			ID:     view.ID,
+			Name:   view.Name,
+			Status: "disabled", StatusClass: "paused",
+			Action: "Enable for repo", NextEnabled: true,
+		}
+		scope := view.Config[plugins.RepoScopeConfigKey]
+		if scope == "" {
+			scope = view.Config["run_mode"]
+		}
+		if view.Enabled && scope != "selected" && scope != "manual" {
+			control.Status = "global"
+			control.StatusClass = "success"
+			control.Action = "Limit to repo"
+			control.NextEnabled = true
+		} else if plugins.EnabledForRepo(states, view.ID, repoPath) {
+			control.Status = "enabled"
+			control.StatusClass = "success"
+			control.Action = "Disable for repo"
+			control.NextEnabled = false
+		}
+		controls = append(controls, PluginRepoControl{
+			ID:          control.ID,
+			Name:        control.Name,
+			Status:      control.Status,
+			StatusClass: control.StatusClass,
+			Action:      control.Action,
+			NextEnabled: control.NextEnabled,
+		})
+	}
+	return controls
+}
+
+func aiSummaryResults(results []db.PluginResult) []db.PluginResult {
+	out := make([]db.PluginResult, 0, len(results))
+	for _, result := range results {
+		if result.PluginID == plugins.AISummaryID {
+			out = append(out, result)
+		}
+	}
+	return out
+}
+
+func pluginResultMessage(result db.PluginResult) string {
+	message := result.Result
+	if result.Error != "" {
+		message = result.Error
+	}
+	if result.PluginID == plugins.NotificationsID && message == "notifications disabled" {
+		return "notification dispatch disabled (legacy result; restart daemon/web if this repeats)"
+	}
+	return message
+}
+
+func (s *Server) aiSummaryInputPreview(update db.Update) AISummaryInputPreview {
+	cfg := aiSummaryConfig(s.storage.GetPluginStates())
+	preview := AISummaryInputPreview{
+		Prompt:   plugins.AISummaryPrompt(cfg),
+		Provider: cfg["provider"],
+		APIType:  cfg["api_type"],
+		Model:    cfg["model"],
+	}
+	if update.BeforeRev == "" || update.AfterRev == "" || update.BeforeRev == update.AfterRev {
+		preview.Error = "missing revision range"
+		return preview
+	}
+	context, err := plugins.BuildAISummaryChangeContext(update.RepoPath, update.BeforeRev, update.AfterRev)
+	if err != nil {
+		preview.Error = err.Error()
+		return preview
+	}
+	if context == "" {
+		preview.Error = "empty change context"
+		return preview
+	}
+	preview.Input = plugins.AISummaryInput(update.RepoName, context)
+	return preview
+}
+
+func aiSummaryConfig(states map[string]config.PluginState) map[string]string {
+	for _, view := range plugins.Views(states) {
+		if view.ID == plugins.AISummaryID {
+			return view.Config
+		}
+	}
+	return map[string]string{}
+}
+
 func redirectRepo(w http.ResponseWriter, r *http.Request, repoPath string) {
 	http.Redirect(w, r, repoURL(repoPath, ""), http.StatusSeeOther)
 }
@@ -565,6 +1008,30 @@ func repoURLWithFlash(repoPath, filter, flash, flashType string) string {
 		}
 	}
 	return "/repo?" + queryWithPath(values, repoPath)
+}
+
+func updateURL(id int64) string {
+	return "/update?id=" + strconv.FormatInt(id, 10)
+}
+
+func updateURLWithFlash(id int64, flash, flashType string) string {
+	return updateURLWithFlashFragment(id, flash, flashType, "")
+}
+
+func updateURLWithFlashFragment(id int64, flash, flashType, fragment string) string {
+	values := url.Values{}
+	values.Set("id", strconv.FormatInt(id, 10))
+	if flash != "" {
+		values.Set("flash", flash)
+		if flashType != "" {
+			values.Set("flash_type", flashType)
+		}
+	}
+	out := "/update?" + queryValues(values)
+	if fragment != "" {
+		out += "#" + url.QueryEscape(fragment)
+	}
+	return out
 }
 
 func queryWithPath(values url.Values, repoPath string) string {
@@ -625,22 +1092,39 @@ func openTargetLabel(target string) string {
 	}
 }
 
-func notifyPull(repo *config.RepoInfo, title, body, notifyURL string) {
-	if !repo.NotificationsEnabled() {
-		return
-	}
-	go func() {
-		if notifyErr := notifications.OSNotifyURL(config.AppName, title, body, notifyURL); notifyErr != nil {
-			slog.Error("failed to send pull notification", slog.String("repo", repo.Name), slog.String("err", notifyErr.Error()))
-		}
-	}()
-}
-
 func pullFlashText(pullErr error) string {
 	if db.IsSkippedPullError(pullErr.Error()) {
 		return "Pull skipped: " + pullErr.Error()
 	}
 	return "Pull failed: " + pullErr.Error()
+}
+
+func (s *Server) runPluginsAfterChange(repo *config.RepoInfo, updateID int64, notify bool, source string) {
+	update, err := s.store.GetUpdate(updateID)
+	if err != nil {
+		slog.Error("failed to load update for plugins", slog.String("repo", repo.Name), slog.String("err", err.Error()))
+		return
+	}
+	openURL := "http://localhost" + Addr + updateURL(update.ID)
+	plugins.RunAfterChange(plugins.Context{
+		Repo:      repo,
+		Update:    update,
+		Store:     s.store,
+		Notify:    notify,
+		Source:    source,
+		Dashboard: "http://localhost" + Addr,
+		OpenURL:   openURL,
+		AppName:   config.AppName,
+		Logger:    slog.Default(),
+	}, s.storage.GetPluginStates())
+}
+
+func (s *Server) runPluginsAfterChangeAsync(repo *config.RepoInfo, updateID int64, notify bool, source string) {
+	if repo == nil {
+		return
+	}
+	repoCopy := *repo
+	go s.runPluginsAfterChange(&repoCopy, updateID, notify, source)
 }
 
 func pullFlashType(pullErr error) string {
@@ -665,22 +1149,25 @@ func parseChangedFiles(changes string) []ChangedFile {
 	return files
 }
 
-func performPull(repo *config.RepoInfo) (string, error) {
+func performPull(repo *config.RepoInfo) (result, beforeRev, afterRev string, err error) {
 	currentBranch, err := git.GetCurrentBranch(repo.Path)
 	if err != nil {
-		return "", fmt.Errorf("get current branch: %w", err)
+		return "", "", "", fmt.Errorf("get current branch: %w", err)
 	}
 	if currentBranch != repo.DefaultBranch {
-		return "", fmt.Errorf("current branch %s is not default branch %s", currentBranch, repo.DefaultBranch)
+		return "", "", "", fmt.Errorf("current branch %s is not default branch %s", currentBranch, repo.DefaultBranch)
 	}
 	hasChanges, err := git.GitHasUncommitedChanges(repo.Path)
 	if err != nil {
-		return "", fmt.Errorf("check changes: %w", err)
+		return "", "", "", fmt.Errorf("check changes: %w", err)
 	}
 	if hasChanges {
-		return "", fmt.Errorf("repository has uncommitted changes")
+		return "", "", "", fmt.Errorf("repository has uncommitted changes")
 	}
-	return git.GitPull(repo.Path)
+	beforeRev, _ = git.GitHead(repo.Path)
+	result, err = git.GitPull(repo.Path)
+	afterRev, _ = git.GitHead(repo.Path)
+	return result, beforeRev, afterRev, err
 }
 
 func renderTemplate(w http.ResponseWriter, tmpl *template.Template, data any) {
@@ -1096,6 +1583,17 @@ func compactPath(path string) string {
 	return path
 }
 
+func firstLine(s string) string {
+	s = strings.TrimSpace(s)
+	if s == "" {
+		return "-"
+	}
+	if i := strings.IndexByte(s, '\n'); i >= 0 {
+		return s[:i]
+	}
+	return s
+}
+
 var baseCSS = template.CSS(`
 	:root {
 		color-scheme: light;
@@ -1138,6 +1636,16 @@ var baseCSS = template.CSS(`
 	.metric-label { color: var(--muted); font-size: 11px; font-weight: 650; text-transform: uppercase; letter-spacing: .04em; }
 	.metric-value { margin-top: 4px; font-size: 20px; font-weight: 650; color: var(--text); }
 	.metric-detail { margin-top: 4px; color: var(--muted); font-size: 12px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+	.metric-hash { display: inline-block; max-width: 100%; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; overflow: hidden; text-overflow: ellipsis; vertical-align: bottom; }
+	.change-identity { display: grid; grid-template-columns: minmax(180px, 1.1fr) minmax(120px, .5fr) minmax(220px, 1.6fr); gap: 14px; margin-bottom: 18px; }
+	.change-field { min-width: 0; background: var(--panel); border: 1px solid var(--border-muted); border-radius: 8px; padding: 14px 15px; box-shadow: var(--shadow); }
+	.change-field-value { margin-top: 4px; font-size: 18px; font-weight: 650; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+	.revision-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 12px; }
+	.revision-item { min-width: 0; border: 1px solid var(--border-muted); border-radius: 8px; padding: 11px 12px; background: var(--subtle); }
+	.revision-hash { display: block; margin-top: 4px; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-weight: 650; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+	.context-grid { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 10px; margin-bottom: 12px; }
+	.context-item { min-width: 0; border: 1px solid var(--border-muted); border-radius: 8px; padding: 9px 10px; background: var(--subtle); }
+	.context-value { margin-top: 3px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-weight: 650; }
 	.panel { background: var(--panel); border: 1px solid var(--border-muted); border-radius: 8px; overflow: hidden; box-shadow: var(--shadow); }
 	.panel:hover { border-color: #d0d7de; }
 	.panel-head { padding: 13px 16px; border-bottom: 1px solid var(--border-muted); background: var(--panel); display: flex; justify-content: space-between; gap: 14px; align-items: center; }
@@ -1186,6 +1694,8 @@ var baseCSS = template.CSS(`
 	.select-all { display: inline-flex; align-items: center; gap: 6px; color: var(--muted); font-size: 12px; font-weight: 600; user-select: none; }
 	.button:disabled { opacity: .52; cursor: not-allowed; background: var(--subtle); box-shadow: none; }
 	.input { width: 76px; min-height: 28px; padding: 4px 8px; border: 1px solid var(--border); border-radius: 8px; background: #ffffff; color: var(--text); font: inherit; box-shadow: inset 0 1px 0 rgba(0, 0, 0, .03); }
+	.input.wide { width: min(360px, 100%); }
+	textarea.input { min-height: 110px; resize: vertical; font: 12px/1.45 ui-monospace, SFMono-Regular, Menlo, monospace; }
 	.input:focus, .button:focus-visible, .page-link:focus-visible, .filter-link:focus-visible, a.repo:focus-visible { outline: 2px solid rgba(9, 105, 218, .35); outline-offset: 2px; }
 	.input.confirm { width: 220px; }
 	.repo-list { display: grid; grid-template-columns: repeat(auto-fill, minmax(320px, 1fr)); gap: 14px; }
@@ -1199,7 +1709,16 @@ var baseCSS = template.CSS(`
 	th { color: var(--muted); font-size: 11px; background: var(--subtle); font-weight: 650; text-transform: uppercase; letter-spacing: .04em; }
 	tr:hover td { background: var(--subtle); }
 	td pre { margin: 0; max-height: 160px; }
+	.update-preview { max-height: 12.5em; white-space: pre-wrap; }
+	.update-preview-link { display: block; color: inherit; }
+	.update-preview-link:hover { color: inherit; text-decoration: none; }
 	pre { white-space: pre-wrap; background: var(--subtle); border: 1px solid var(--border-muted); border-radius: 8px; padding: 10px 12px; overflow: auto; font: 12px/1.45 ui-monospace, SFMono-Regular, Menlo, monospace; color: var(--text); }
+	details.disclosure { border: 1px solid var(--border-muted); border-radius: 8px; background: var(--panel); margin-bottom: 10px; overflow: hidden; }
+	details.disclosure > summary { cursor: pointer; padding: 10px 12px; color: var(--text); font-weight: 650; background: var(--subtle); list-style: none; }
+	details.disclosure > summary::-webkit-details-marker { display: none; }
+	details.disclosure > summary::before { content: "Show"; display: inline-flex; align-items: center; min-height: 22px; margin-right: 8px; padding: 2px 8px; border: 1px solid var(--border); border-radius: 999px; background: #ffffff; color: var(--muted); font-size: 12px; font-weight: 650; }
+	details.disclosure[open] > summary::before { content: "Hide"; }
+	details.disclosure pre { margin: 0; border: 0; border-top: 1px solid var(--border-muted); border-radius: 0; max-height: 520px; }
 	.badge { display: inline-flex; align-items: center; min-height: 22px; padding: 2px 8px; border: 1px solid transparent; border-radius: 999px; background: #eaeef2; color: var(--text); font-size: 12px; font-weight: 600; white-space: nowrap; }
 	.badge.success { background: #dafbe1; border-color: #aceebb; color: #116329; }
 	.badge.error { background: #ffebe9; border-color: #ffcecb; color: var(--danger); }
@@ -1213,12 +1732,21 @@ var baseCSS = template.CSS(`
 	.changed-icon.empty { color: var(--muted); font-weight: 600; }
 	.time { white-space: nowrap; }
 	.time-detail { color: var(--muted); font-size: 12px; margin-top: 2px; white-space: nowrap; }
+	.plugin-repos { color: var(--muted); font-size: 12px; margin-top: 6px; min-width: 0; overflow-wrap: anywhere; }
+	.plugin-repo-list { display: inline-flex; flex-wrap: wrap; gap: 4px; vertical-align: middle; max-width: 100%; }
+	.plugin-repo-chip { display: inline-flex; align-items: center; gap: 4px; min-width: 0; max-width: 100%; padding: 2px 4px 2px 6px; border: 1px solid var(--border-muted); border-radius: 999px; background: var(--subtle); }
+	.plugin-repo-path { min-width: 0; max-width: 100%; color: var(--muted); font-family: ui-monospace, SFMono-Regular, Menlo, monospace; overflow-wrap: anywhere; word-break: break-word; }
+	.chip-remove { display: inline-flex; align-items: center; justify-content: center; width: 18px; height: 18px; border: 1px solid var(--border); border-radius: 999px; background: #ffffff; color: var(--muted); font: inherit; font-size: 11px; font-weight: 700; cursor: pointer; padding: 0; }
+	.chip-remove:hover { color: var(--danger); border-color: #ffcecb; background: #ffebe9; }
 	.empty { color: var(--muted); padding: 18px; }
 	footer { max-width: 1220px; margin: 0 auto; padding: 0 24px 28px; color: var(--muted); font-size: 12px; }
 	@media (max-width: 760px) {
 		.header-inner { display: grid; align-items: start; }
 		.action-form { width: 100%; }
 		.summary { grid-template-columns: 1fr; }
+		.change-identity { grid-template-columns: 1fr; }
+		.revision-grid { grid-template-columns: 1fr; }
+		.context-grid { grid-template-columns: 1fr; }
 		.repo-list { grid-template-columns: 1fr; }
 		.activity-meta { align-items: flex-start; flex-direction: column; }
 		th:nth-child(4), td:nth-child(4) { display: none; }
@@ -1261,6 +1789,13 @@ var templateFuncs = template.FuncMap{
 	"humanDuration": humanDurationUnit,
 	"join":          strings.Join,
 	"humanNumber":   humanizeNumber,
+	"updateURL":     updateURL,
+	"shortHash": func(hash string) string {
+		if len(hash) <= 12 {
+			return hash
+		}
+		return hash[:12]
+	},
 	"skipReasonLabel": func(reason string) string {
 		switch reason {
 		case "dirty_worktree":
@@ -1273,40 +1808,37 @@ var templateFuncs = template.FuncMap{
 			return reason
 		}
 	},
-	"firstLine": func(s string) string {
-		s = strings.TrimSpace(s)
-		if s == "" {
-			return "-"
+	"firstLine":           firstLine,
+	"compactPath":         compactPath,
+	"pluginResultMessage": pluginResultMessage,
+	"configValue": func(values map[string]string, key string) string {
+		if values == nil {
+			return ""
 		}
-		if i := strings.IndexByte(s, '\n'); i >= 0 {
-			return s[:i]
-		}
-		return s
+		return values[key]
 	},
-	"compactPath": compactPath,
+	"inputType": func(fieldType string) string {
+		switch fieldType {
+		case "password", "url":
+			return fieldType
+		default:
+			return "text"
+		}
+	},
 }
 
 const activityTemplate = `{{define "activity"}}<div class="activity-wrap"><div class="activity-grid" aria-label="Changed update activity from {{.Start}} to {{.End}}">{{range .Cells}}<span class="activity-cell" data-level="{{.Level}}" data-title="{{.Title}}" aria-label="{{.Title}}" tabindex="0"></span>{{end}}</div></div><div class="activity-meta"><div>{{humanNumber .Total}} changed updates in the last year</div><div class="activity-legend"><span>Less</span><span class="activity-cell" data-level="0"></span><span class="activity-cell" data-level="1"></span><span class="activity-cell" data-level="2"></span><span class="activity-cell" data-level="3"></span><span class="activity-cell" data-level="4"></span><span>More</span></div></div>{{end}}`
 
 var indexTemplate = template.Must(template.New("index").Funcs(templateFuncs).Parse(`
 <!doctype html><html><head><meta charset="utf-8"><title>autogitpull</title><link rel="icon" type="image/png" href="/favicon.ico"><style>` + string(baseCSS) + `</style></head>
-<body><header><div class="header-inner"><a class="brand" href="/"><img class="brand-icon" src="/assets/app-icon.png" alt=""><h1>autogitpull</h1></a><form class="action-form" method="post" action="/settings"><span class="badge paused">Interval</span><input class="input" type="number" min="1" name="pull_interval_minutes" value="{{.PullInterval}}" aria-label="Pull interval minutes"><span class="badge paused">Retention</span><input class="input" type="number" min="1" name="history_retention_days" value="{{.RetentionDays}}" aria-label="History retention days"><button class="button" type="submit">Save</button></form></div></header><main>
+<body><header><div class="header-inner"><a class="brand" href="/"><img class="brand-icon" src="/assets/app-icon.png" alt=""><h1>autogitpull</h1></a><div class="actions"><a class="button" href="/status">Status</a><a class="button" href="/plugins">Plugins</a><a class="button" href="/settings">Settings</a></div></div></header><main>
 {{if .Flash.Text}}<div class="flash {{.Flash.Class}}">{{.Flash.Text}}</div>{{end}}
 <section class="summary">
 	<div class="metric"><div class="metric-label">Repositories</div><div class="metric-value">{{humanNumber .RepoCount}}</div></div>
 	<div class="metric"><div class="metric-label">Recent events</div><div class="metric-value">{{humanNumber .TotalUpdates}}</div></div>
-	<div class="metric"><div class="metric-label">Service</div><div class="metric-value"><span class="badge {{serviceStatusClass .ServiceStatus}}">{{.ServiceStatus}}</span></div><div class="metric-detail">{{.ServiceLabel}}</div></div>
-	<div class="metric"><div class="metric-label">Database</div><div class="path" title="{{.DBPath}}">{{compactPath .DBPath}}</div></div>
+	<div class="metric"><div class="metric-label">Plugins</div><div class="metric-value">{{humanNumber .PluginSummary.Enabled}}/{{humanNumber .PluginSummary.Total}}</div><div class="metric-detail"><a href="/plugins">Configure plugins</a></div></div>
 </section>
 <div class="grid">
-<section class="panel" id="daemon"><div class="panel-head"><h2><a class="panel-title" href="#daemon">Daemon</a></h2></div><div class="panel-body">
-<div class="summary">
-	<div class="metric"><div class="metric-label">Next run</div><div class="metric-value">{{humanTime .DaemonStatus.NextRunAt}}</div><div class="metric-detail">{{formatTime .DaemonStatus.NextRunAt}}</div></div>
-	<div class="metric"><div class="metric-label">Last run</div><div class="metric-value">{{if .DaemonStatus.LastRunDuration}}{{humanDuration .DaemonStatus.LastRunDuration}}{{else}}-{{end}}</div><div class="metric-detail">{{formatTime .DaemonStatus.LastRunStarted}}</div></div>
-	<div class="metric"><div class="metric-label">Pulling now</div><div class="metric-value">{{humanNumber (len .DaemonStatus.RunningRepos)}}</div><div class="metric-detail">{{if .DaemonStatus.RunningRepos}}{{join .DaemonStatus.RunningRepos ", "}}{{else}}Idle{{end}}</div></div>
-	<div class="metric"><div class="metric-label">Last run result</div><div class="metric-value">{{humanNumber .DaemonStatus.Checked}}</div><div class="metric-detail">ok {{humanNumber .DaemonStatus.Success}} · skipped {{humanNumber .DaemonStatus.Skipped}} · error {{humanNumber .DaemonStatus.Error}}</div></div>
-</div>
-</div></section>
 <section class="panel" id="activity"><div class="panel-head"><h2><a class="panel-title" href="#activity">Activity</a></h2></div><div class="panel-body">
 {{template "activity" .Activity}}
 </div></section>
@@ -1315,7 +1847,7 @@ var indexTemplate = template.Must(template.New("index").Funcs(templateFuncs).Par
 </div></section>
 <section class="panel" id="updates"><div class="panel-head"><h2><a class="panel-title" href="#updates">Recent updates</a></h2><div class="filter">{{range .EventFilter.Options}}<a class="{{.Class}}" href="{{.URL}}">{{.Label}}</a>{{end}}</div></div>
 {{if .Updates}}<table><tr><th>Time</th><th>Repo</th><th>Status</th><th>Result</th></tr>
-{{range .Updates}}<tr><td><div class="time">{{humanTime .StartedAt}}</div><div class="time-detail">{{formatTime .StartedAt}}</div></td><td><a href="/repo?path={{.RepoPath | urlquery}}">{{.RepoName}}</a><div class="path" title="{{.RepoPath}}">{{compactPath .RepoPath}}</div></td><td><span class="badge {{statusClass .Status}}">{{.Status}}</span></td><td><pre>{{if .Error}}{{.Error}}{{else}}{{.Result | firstLine}}{{end}}</pre></td></tr>{{end}}
+{{range .Updates}}<tr><td><a href="{{updateURL .ID}}"><div class="time">{{humanTime .StartedAt}}</div><div class="time-detail">{{formatTime .StartedAt}}</div></a></td><td><a href="/repo?path={{.RepoPath | urlquery}}">{{.RepoName}}</a><div class="path" title="{{.RepoPath}}">{{compactPath .RepoPath}}</div></td><td><span class="badge {{statusClass .Status}}">{{.Status}}</span></td><td><a class="update-preview-link" href="{{updateURL .ID}}"><pre class="update-preview">{{if .Error}}{{.Error}}{{else}}{{.Result}}{{end}}</pre></a></td></tr>{{end}}
 </table>{{template "pagination" .Pagination}}{{else}}<div class="empty">No updates match this filter.</div>{{end}}</section>
 </div>
 </main><footer>version {{.AppVersion}}</footer><script>
@@ -1380,7 +1912,7 @@ var indexTemplate = template.Must(template.New("index").Funcs(templateFuncs).Par
 
 var repoTemplate = template.Must(template.New("repo").Funcs(templateFuncs).Parse(`
 <!doctype html><html><head><meta charset="utf-8"><title>{{.Repo.Name}} - autogitpull</title><link rel="icon" type="image/png" href="/favicon.ico"><style>` + string(baseCSS) + `</style></head>
-<body><header><div class="header-inner"><a class="brand" href="/"><img class="brand-icon" src="/assets/app-icon.png" alt=""><div class="header-title"><h1>{{.Repo.Name}}</h1><div class="header-path" title="{{.Repo.Path}}">{{compactPath .Repo.Path}}</div></div></a><div class="actions"><form class="action-form" method="post" action="/repo/pull"><input type="hidden" name="path" value="{{.Repo.Path}}"><button class="button primary" type="submit">Pull now</button></form><form class="action-form" method="post" action="/repo/open"><input type="hidden" name="path" value="{{.Repo.Path}}"><input type="hidden" name="target" value="finder"><button class="button" type="submit">Finder</button></form><form class="action-form" method="post" action="/repo/open"><input type="hidden" name="path" value="{{.Repo.Path}}"><input type="hidden" name="target" value="terminal"><button class="button" type="submit">Terminal</button></form><form class="action-form" method="post" action="/repo/open"><input type="hidden" name="path" value="{{.Repo.Path}}"><input type="hidden" name="target" value="code"><button class="button" type="submit">VS Code</button></form><form class="action-form" method="post" action="/repo/notify"><input type="hidden" name="path" value="{{.Repo.Path}}">{{if .Repo.NotificationsEnabled}}<input type="hidden" name="notify" value="0"><button class="button quiet" type="submit">Mute notifications</button>{{else}}<input type="hidden" name="notify" value="1"><button class="button quiet" type="submit">Enable notifications</button>{{end}}</form><form class="action-form" method="post" action="/repo/pause"><input type="hidden" name="path" value="{{.Repo.Path}}">{{if .Repo.Paused}}<input type="hidden" name="paused" value="0"><button class="button" type="submit">Resume auto-pull</button>{{else}}<input type="hidden" name="paused" value="1"><button class="button warn" type="submit">Pause auto-pull</button>{{end}}</form><a class="button danger" href="/repo/unregister?path={{.Repo.Path | urlquery}}">Unregister</a><a class="badge" href="/">Back</a></div></div></header><main class="grid">
+<body><header><div class="header-inner"><a class="brand" href="/"><img class="brand-icon" src="/assets/app-icon.png" alt=""><div class="header-title"><h1>{{.Repo.Name}}</h1><div class="header-path" title="{{.Repo.Path}}">{{compactPath .Repo.Path}}</div></div></a><div class="actions"><form class="action-form" method="post" action="/repo/pull"><input type="hidden" name="path" value="{{.Repo.Path}}"><button class="button primary" type="submit">Pull now</button></form><form class="action-form" method="post" action="/repo/ai-summary"><input type="hidden" name="path" value="{{.Repo.Path}}"><button class="button" type="submit">Run AI summary</button></form><form class="action-form" method="post" action="/repo/open"><input type="hidden" name="path" value="{{.Repo.Path}}"><input type="hidden" name="target" value="finder"><button class="button" type="submit">Finder</button></form><form class="action-form" method="post" action="/repo/open"><input type="hidden" name="path" value="{{.Repo.Path}}"><input type="hidden" name="target" value="terminal"><button class="button" type="submit">Terminal</button></form><form class="action-form" method="post" action="/repo/open"><input type="hidden" name="path" value="{{.Repo.Path}}"><input type="hidden" name="target" value="code"><button class="button" type="submit">VS Code</button></form><form class="action-form" method="post" action="/repo/notify"><input type="hidden" name="path" value="{{.Repo.Path}}">{{if .Repo.NotificationsEnabled}}<input type="hidden" name="notify" value="0"><button class="button quiet" type="submit">Mute notifications</button>{{else}}<input type="hidden" name="notify" value="1"><button class="button quiet" type="submit">Enable notifications</button>{{end}}</form><form class="action-form" method="post" action="/repo/pause"><input type="hidden" name="path" value="{{.Repo.Path}}">{{if .Repo.Paused}}<input type="hidden" name="paused" value="0"><button class="button" type="submit">Resume auto-pull</button>{{else}}<input type="hidden" name="paused" value="1"><button class="button warn" type="submit">Pause auto-pull</button>{{end}}</form><a class="button" href="/plugins">Plugins</a><a class="button danger" href="/repo/unregister?path={{.Repo.Path | urlquery}}">Unregister</a><a class="badge" href="/">Back</a></div></div></header><main class="grid">
 {{if .Flash.Text}}<div class="flash {{.Flash.Class}}">{{.Flash.Text}}</div>{{end}}
 <section class="summary">
 	<div class="metric"><div class="metric-label">Default branch</div><div class="metric-value">{{.Repo.DefaultBranch}}</div></div>
@@ -1389,17 +1921,114 @@ var repoTemplate = template.Must(template.New("repo").Funcs(templateFuncs).Parse
 	<div class="metric"><div class="metric-label">Auto pull</div><div class="metric-value">{{if .Repo.Paused}}<span class="badge paused">paused</span>{{else}}<span class="badge success">enabled</span>{{end}}</div></div>
 	<div class="metric"><div class="metric-label">Notifications</div><div class="metric-value">{{if .Repo.NotificationsEnabled}}<span class="badge success">enabled</span>{{else}}<span class="badge paused">muted</span>{{end}}</div></div>
 </section>
+<section class="panel" id="plugins"><div class="panel-head"><h2><a class="panel-title" href="#plugins">Plugins</a></h2><a class="filter-link" href="/plugins">Settings</a></div><div class="panel-body">
+{{if .PluginControls}}<table><tr><th>Plugin</th><th>Status</th><th>Action</th></tr>{{range .PluginControls}}<tr><td>{{.Name}}</td><td><span class="badge {{.StatusClass}}">{{.Status}}</span></td><td><form class="action-form" method="post" action="/repo/plugin-toggle"><input type="hidden" name="path" value="{{$.Repo.Path}}"><input type="hidden" name="plugin_id" value="{{.ID}}"><input type="hidden" name="enabled" value="{{if .NextEnabled}}1{{else}}0{{end}}"><button class="button {{if not .NextEnabled}}quiet{{end}}" type="submit">{{.Action}}</button></form></td></tr>{{end}}</table>{{else}}<div class="empty">No plugins available.</div>{{end}}
+</div></section>
 <section class="panel" id="activity"><div class="panel-head"><h2><a class="panel-title" href="#activity">Activity</a></h2></div><div class="panel-body">
 {{template "activity" .Activity}}
 </div></section>
 <section class="panel" id="changes"><div class="panel-head"><h2><a class="panel-title" href="#changes">Current local changes</a></h2></div><div class="panel-body">{{if .ChangedFiles}}<table><tr><th>Status</th><th>File</th></tr>{{range .ChangedFiles}}<tr><td><span class="badge paused">{{.Status}}</span></td><td><span class="path">{{.Path}}</span></td></tr>{{end}}</table>{{else}}<div class="empty">No uncommitted changes</div>{{end}}</div></section>
 <section class="panel" id="updates"><div class="panel-head"><h2><a class="panel-title" href="#updates">Updates</a></h2><div class="filter">{{range .EventFilter.Options}}<a class="{{.Class}}" href="{{.URL}}">{{.Label}}</a>{{end}}</div></div>
 {{if .Updates}}<table><tr><th>Time</th><th>Status</th><th>Changed</th><th>Result</th></tr>
-{{range .Updates}}<tr><td><div class="time">{{humanTime .StartedAt}}</div><div class="time-detail">{{formatTime .StartedAt}}</div></td><td><span class="badge {{statusClass .Status}}">{{.Status}}</span>{{if .SkipReason}}<div class="time-detail">{{skipReasonLabel .SkipReason}}</div>{{end}}</td><td>{{if .Changed}}<span class="changed-icon" title="Changed" aria-label="Changed">&#10003;</span>{{else}}<span class="changed-icon empty" title="No changes" aria-label="No changes">-</span>{{end}}</td><td><pre>{{if .Error}}{{.Error}}{{else}}{{.Result}}{{end}}</pre></td></tr>{{end}}
+{{range .Updates}}<tr><td><a href="{{updateURL .ID}}"><div class="time">{{humanTime .StartedAt}}</div><div class="time-detail">{{formatTime .StartedAt}}</div></a></td><td><span class="badge {{statusClass .Status}}">{{.Status}}</span>{{if .SkipReason}}<div class="time-detail">{{skipReasonLabel .SkipReason}}</div>{{end}}</td><td>{{if .Changed}}<span class="changed-icon" title="Changed" aria-label="Changed">&#10003;</span>{{else}}<span class="changed-icon empty" title="No changes" aria-label="No changes">-</span>{{end}}</td><td><a href="{{updateURL .ID}}"><pre>{{if .Error}}{{.Error}}{{else}}{{.Result}}{{end}}</pre></a></td></tr>{{end}}
 </table>{{template "pagination" .Pagination}}{{else}}<div class="empty">No updates match this filter.</div>{{end}}</section>
 </main><script>document.querySelectorAll('form').forEach(form => form.addEventListener('submit', () => { const b = document.activeElement; if (b && b.tagName === 'BUTTON') b.textContent = 'Working...'; }));</script></body></html>
 
 {{define "pagination"}}<div class="pagination"><div class="pagination-info">{{if .Total}}Showing {{humanNumber .From}}-{{humanNumber .To}} of {{humanNumber .Total}} · page {{humanNumber .Page}} of {{humanNumber .TotalPages}}{{else}}No records{{end}}</div><div class="pagination-actions">{{if .HasPrev}}<a class="page-link" href="{{.PrevURL}}">Prev</a>{{else}}<span class="page-link disabled">Prev</span>{{end}}{{if .HasNext}}<a class="page-link" href="{{.NextURL}}">Next</a>{{else}}<span class="page-link disabled">Next</span>{{end}}</div></div>{{end}}` + activityTemplate))
+
+var pluginsTemplate = template.Must(template.New("plugins").Funcs(templateFuncs).Parse(`
+<!doctype html><html><head><meta charset="utf-8"><title>Plugins - autogitpull</title><link rel="icon" type="image/png" href="/favicon.ico"><style>` + string(baseCSS) + `</style></head>
+<body><header><div class="header-inner"><a class="brand" href="/"><img class="brand-icon" src="/assets/app-icon.png" alt=""><h1>Plugins</h1></a><a class="badge" href="/">Back</a></div></header><main class="grid">
+{{if .Flash.Text}}<div class="flash {{.Flash.Class}}">{{.Flash.Text}}</div>{{end}}
+<section class="panel"><div class="panel-head"><h2>Change plugins</h2></div><div class="panel-body">
+{{if .Plugins}}<div class="repo-list">{{range .Plugins}}{{$plugin := .}}<form class="repo" method="post" action="/plugins/save">
+	<input type="hidden" name="id" value="{{.ID}}">
+	<div class="repo-title"><strong>{{.Name}}</strong>{{if .Enabled}}<span class="badge success">enabled</span>{{else}}<span class="badge paused">disabled</span>{{end}}</div>
+	<div class="plugin-description">{{.Description}}</div>
+	<div class="plugin-repos">Selected repos: {{if .SelectedRepos}}<span class="plugin-repo-list">{{range .SelectedRepos}}<span class="plugin-repo-chip"><span class="plugin-repo-path" title="{{.}}">{{compactPath .}}</span><button class="chip-remove" type="submit" formaction="/plugins/remove-repo" formmethod="post" name="repo" value="{{.}}" title="Remove selected repo" aria-label="Remove selected repo">x</button></span>{{end}}</span>{{else}}none{{end}}</div>
+	<div class="toolbar" style="margin-top:12px;margin-bottom:0"><div class="toolbar-group">
+		<label class="select-all"><input type="checkbox" name="enabled" value="1" {{if .Enabled}}checked{{end}}> Enabled</label>
+		{{range .Fields}}{{$field := .}}<label class="action-form"><span class="badge paused">{{.Label}}</span>{{if eq .Type "select"}}<select class="input wide" name="config_{{.Key}}">{{range .Options}}<option value="{{.Value}}" {{if eq (configValue $plugin.Config $field.Key) .Value}}selected{{end}}>{{.Label}}</option>{{end}}</select>{{else if eq .Type "textarea"}}<textarea class="input wide" name="config_{{.Key}}">{{configValue $plugin.Config .Key}}</textarea>{{else}}<input class="input wide" type="{{inputType .Type}}" name="config_{{.Key}}" value="{{configValue $plugin.Config .Key}}">{{end}}</label>{{end}}
+	</div><button class="button primary" type="submit">Save</button>{{if eq .ID "ai_summary"}}<button class="button" type="submit" form="ai-summary-test-form">Test</button>{{end}}</div>
+</form>{{end}}</div><form id="ai-summary-test-form" method="post" action="/plugins/test-ai-summary"></form>{{else}}<div class="empty">No plugins available.</div>{{end}}
+</div></section>
+</main><script>document.querySelectorAll('form').forEach(form => form.addEventListener('submit', () => { const b = document.activeElement; if (b && b.tagName === 'BUTTON') b.textContent = b.formAction && b.formAction.includes('/plugins/test-ai-summary') ? 'Testing...' : 'Saving...'; }));</script></body></html>`))
+
+var updateTemplate = template.Must(template.New("update").Funcs(templateFuncs).Parse(`
+<!doctype html><html><head><meta charset="utf-8"><title>Change {{.Update.ID}} - autogitpull</title><link rel="icon" type="image/png" href="/favicon.ico"><style>` + string(baseCSS) + `</style></head>
+<body><header><div class="header-inner"><a class="brand" href="/"><img class="brand-icon" src="/assets/app-icon.png" alt=""><div class="header-title"><h1>Change {{.Update.ID}}</h1><div class="header-path" title="{{.Update.RepoPath}}">{{.Update.RepoName}} · {{compactPath .Update.RepoPath}}</div></div></a><div class="actions"><a class="button" href="/repo?path={{.Update.RepoPath | urlquery}}">Repository</a><a class="badge" href="/">Back</a></div></div></header><main class="grid">
+{{if .Flash.Text}}<div class="flash {{.Flash.Class}}">{{.Flash.Text}}</div>{{end}}
+<section class="change-identity" aria-label="Change identity">
+	<div class="change-field"><div class="metric-label">Repo</div><div class="change-field-value" title="{{.Update.RepoName}}">{{.Update.RepoName}}</div></div>
+	<div class="change-field"><div class="metric-label">Change ID</div><div class="change-field-value">#{{.Update.ID}}</div></div>
+	<div class="change-field"><div class="metric-label">Path</div><div class="change-field-value path" title="{{.Update.RepoPath}}">{{compactPath .Update.RepoPath}}</div></div>
+</section>
+<section class="summary">
+	<div class="metric"><div class="metric-label">Status</div><div class="metric-value"><span class="badge {{statusClass .Update.Status}}">{{.Update.Status}}</span></div></div>
+	<div class="metric"><div class="metric-label">Changed</div><div class="metric-value">{{if .Update.Changed}}<span class="badge success">yes</span>{{else}}<span class="badge paused">no</span>{{end}}</div></div>
+	<div class="metric"><div class="metric-label">Started</div><div class="metric-value">{{humanTime .Update.StartedAt}}</div><div class="metric-detail">{{formatTime .Update.StartedAt}}</div></div>
+	<div class="metric"><div class="metric-label">Finished</div><div class="metric-value">{{humanTime .Update.FinishedAt}}</div><div class="metric-detail">{{formatTime .Update.FinishedAt}}</div></div>
+</section>
+<section class="panel" id="revisions"><div class="panel-head"><h2><a class="panel-title" href="#revisions">Revision range</a></h2></div><div class="panel-body"><div class="revision-grid">
+	<div class="revision-item"><div class="metric-label">Before</div>{{if .Update.BeforeRev}}<span class="revision-hash" title="{{.Update.BeforeRev}}">{{shortHash .Update.BeforeRev}}</span>{{else}}<span class="revision-hash">-</span>{{end}}</div>
+	<div class="revision-item"><div class="metric-label">After</div>{{if .Update.AfterRev}}<span class="revision-hash" title="{{.Update.AfterRev}}">{{shortHash .Update.AfterRev}}</span>{{else}}<span class="revision-hash">-</span>{{end}}</div>
+</div></div></section>
+<section class="panel" id="change"><div class="panel-head"><h2><a class="panel-title" href="#change">Change</a></h2></div><div class="panel-body"><details class="disclosure"><summary>Pull output for change #{{.Update.ID}}</summary><pre>{{if .Update.Error}}{{.Update.Error}}{{else}}{{.Update.Result}}{{end}}</pre></details></div></section>
+<section class="panel" id="ai-summary"><div class="panel-head"><h2><a class="panel-title" href="#ai-summary">AI summaries</a></h2><form class="action-form" method="post" action="/update/ai-summary"><input type="hidden" name="id" value="{{.Update.ID}}"><button class="button primary" type="submit">Generate again</button></form></div><div class="panel-body">
+{{if .AISummaries}}{{range .AISummaries}}<details class="disclosure"><summary>AI summary · {{humanTime .CreatedAt}} · {{.Status}}</summary>{{if .Error}}<pre>{{.Error}}</pre>{{end}}{{if .Result}}<pre>{{.Result}}</pre>{{end}}</details>{{end}}{{else}}<div class="empty">No AI summaries yet.</div>{{end}}
+</div></section>
+<section class="panel" id="ai-input"><div class="panel-head"><h2><a class="panel-title" href="#ai-input">AI model input</a></h2></div><div class="panel-body">
+	<div class="context-grid" aria-label="AI input context">
+		<div class="context-item"><div class="metric-label">Change</div><div class="context-value">#{{.Update.ID}}</div></div>
+		<div class="context-item"><div class="metric-label">Repo</div><div class="context-value" title="{{.Update.RepoName}}">{{.Update.RepoName}}</div></div>
+		<div class="context-item"><div class="metric-label">Provider</div><div class="context-value" title="{{.AIInput.Provider}}">{{if .AIInput.Provider}}{{.AIInput.Provider}}{{else}}-{{end}}</div></div>
+		<div class="context-item"><div class="metric-label">Model</div><div class="context-value" title="{{.AIInput.Model}}">{{if .AIInput.Model}}{{.AIInput.Model}}{{else}}-{{end}}</div></div>
+		<div class="context-item"><div class="metric-label">Before</div><div class="context-value">{{if .Update.BeforeRev}}<span title="{{.Update.BeforeRev}}">{{shortHash .Update.BeforeRev}}</span>{{else}}-{{end}}</div></div>
+		<div class="context-item"><div class="metric-label">After</div><div class="context-value">{{if .Update.AfterRev}}<span title="{{.Update.AfterRev}}">{{shortHash .Update.AfterRev}}</span>{{else}}-{{end}}</div></div>
+		<div class="context-item"><div class="metric-label">API type</div><div class="context-value">{{if .AIInput.APIType}}{{.AIInput.APIType}}{{else}}responses{{end}}</div></div>
+		<div class="context-item"><div class="metric-label">Path</div><div class="context-value path" title="{{.Update.RepoPath}}">{{compactPath .Update.RepoPath}}</div></div>
+	</div>
+	<details class="disclosure"><summary>System prompt for change #{{.Update.ID}}</summary><pre>{{.AIInput.Prompt}}</pre></details>
+	{{if .AIInput.Error}}<details class="disclosure"><summary>User input build error for change #{{.Update.ID}}</summary><pre>{{.AIInput.Error}}</pre></details>{{else}}<details class="disclosure"><summary>User input for change #{{.Update.ID}}</summary><pre>{{.AIInput.Input}}</pre></details>{{end}}
+</div></section>
+<section class="panel" id="plugin-results"><div class="panel-head"><h2><a class="panel-title" href="#plugin-results">Plugin results</a></h2></div><div class="panel-body">
+{{if .PluginResults}}{{range .PluginResults}}<details class="disclosure"><summary>{{.PluginID}} · {{.Status}} · {{humanTime .CreatedAt}}</summary><pre>{{pluginResultMessage .}}</pre></details>{{end}}{{else}}<div class="empty">No plugin results yet.</div>{{end}}
+</div></section>
+</main><script>document.querySelectorAll('form').forEach(form => form.addEventListener('submit', () => { const b = document.activeElement; if (b && b.tagName === 'BUTTON') b.textContent = 'Working...'; }));</script></body></html>`))
+
+var settingsTemplate = template.Must(template.New("settings").Funcs(templateFuncs).Parse(`
+<!doctype html><html><head><meta charset="utf-8"><title>Settings - autogitpull</title><link rel="icon" type="image/png" href="/favicon.ico"><style>` + string(baseCSS) + `</style></head>
+<body><header><div class="header-inner"><a class="brand" href="/"><img class="brand-icon" src="/assets/app-icon.png" alt=""><h1>Settings</h1></a><a class="badge" href="/">Back</a></div></header><main class="grid">
+{{if .Flash.Text}}<div class="flash {{.Flash.Class}}">{{.Flash.Text}}</div>{{end}}
+<section class="panel"><div class="panel-head"><h2>Daemon settings</h2></div><div class="panel-body">
+<form class="grid" method="post" action="/settings">
+	<div class="summary">
+		<div class="metric"><div class="metric-label">Pull interval</div><div class="metric-value"><input class="input" type="number" min="1" name="pull_interval_minutes" value="{{.PullInterval}}" aria-label="Pull interval minutes"></div><div class="metric-detail">minutes between daemon pulls</div></div>
+		<div class="metric"><div class="metric-label">History retention</div><div class="metric-value"><input class="input" type="number" min="1" name="history_retention_days" value="{{.RetentionDays}}" aria-label="History retention days"></div><div class="metric-detail">days to keep update history</div></div>
+	</div>
+	<div class="actions"><button class="button primary" type="submit">Save</button><a class="button" href="/">Cancel</a></div>
+</form>
+</div></section>
+</main><script>document.querySelectorAll('form').forEach(form => form.addEventListener('submit', () => { const b = document.activeElement; if (b && b.tagName === 'BUTTON') b.textContent = 'Saving...'; }));</script></body></html>`))
+
+var statusTemplate = template.Must(template.New("status").Funcs(templateFuncs).Parse(`
+<!doctype html><html><head><meta charset="utf-8"><title>Status - autogitpull</title><link rel="icon" type="image/png" href="/favicon.ico"><style>` + string(baseCSS) + `</style></head>
+<body><header><div class="header-inner"><a class="brand" href="/"><img class="brand-icon" src="/assets/app-icon.png" alt=""><h1>Status</h1></a><a class="badge" href="/">Back</a></div></header><main class="grid">
+{{if .Flash.Text}}<div class="flash {{.Flash.Class}}">{{.Flash.Text}}</div>{{end}}
+<section class="summary">
+	<div class="metric"><div class="metric-label">Service</div><div class="metric-value"><span class="badge {{serviceStatusClass .ServiceStatus}}">{{.ServiceStatus}}</span></div><div class="metric-detail">{{.ServiceLabel}}</div></div>
+	<div class="metric"><div class="metric-label">Database</div><div class="path" title="{{.DBPath}}">{{compactPath .DBPath}}</div></div>
+	<div class="metric"><div class="metric-label">Plugins</div><div class="metric-value">{{humanNumber .PluginSummary.Enabled}}/{{humanNumber .PluginSummary.Total}}</div><div class="metric-detail"><a href="/plugins">Configure plugins</a></div></div>
+</section>
+<section class="panel" id="daemon"><div class="panel-head"><h2><a class="panel-title" href="#daemon">Daemon</a></h2></div><div class="panel-body">
+<div class="summary">
+	<div class="metric"><div class="metric-label">Next run</div><div class="metric-value">{{humanTime .DaemonStatus.NextRunAt}}</div><div class="metric-detail">{{formatTime .DaemonStatus.NextRunAt}}</div></div>
+	<div class="metric"><div class="metric-label">Last run</div><div class="metric-value">{{if .DaemonStatus.LastRunDuration}}{{humanDuration .DaemonStatus.LastRunDuration}}{{else}}-{{end}}</div><div class="metric-detail">{{formatTime .DaemonStatus.LastRunStarted}}</div></div>
+	<div class="metric"><div class="metric-label">Pulling now</div><div class="metric-value">{{humanNumber (len .DaemonStatus.RunningRepos)}}</div><div class="metric-detail">{{if .DaemonStatus.RunningRepos}}{{join .DaemonStatus.RunningRepos ", "}}{{else}}Idle{{end}}</div></div>
+	<div class="metric"><div class="metric-label">Last run result</div><div class="metric-value">{{humanNumber .DaemonStatus.Checked}}</div><div class="metric-detail">ok {{humanNumber .DaemonStatus.Success}} · skipped {{humanNumber .DaemonStatus.Skipped}} · error {{humanNumber .DaemonStatus.Error}}</div></div>
+</div>
+</div></section>
+</main></body></html>`))
 
 var unregisterTemplate = template.Must(template.New("unregister").Funcs(templateFuncs).Parse(`
 <!doctype html><html><head><meta charset="utf-8"><title>Unregister {{.Repo.Name}} - autogitpull</title><link rel="icon" type="image/png" href="/favicon.ico"><style>` + string(baseCSS) + `</style></head>
