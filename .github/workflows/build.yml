@@ -22,7 +22,7 @@ jobs:
 
       - name: Run tests
         run: |
-          cd autogitpull_go
+          cd src
           go test ./...
 
   build-macos:
@@ -42,8 +42,8 @@ jobs:
         env:
           APP_VERSION: ${{ github.ref_name }}
         run: |
-          cd autogitpull_go
-          GOOS=darwin GOARCH=arm64 go build -ldflags "-X github.com/blankstatic/autogitpull/autogitpull_go/internal/version.AppVersion=${APP_VERSION}" -o autogitpull-macos-arm64 .
+          cd src
+          GOOS=darwin GOARCH=arm64 go build -ldflags "-X github.com/blankstatic/autogitpull/src/internal/version.AppVersion=${APP_VERSION}" -o autogitpull-macos-arm64 .
           chmod +x autogitpull-macos-arm64
           tar -czf autogitpull-macos-arm64.tar.gz autogitpull-macos-arm64
 
@@ -52,8 +52,8 @@ jobs:
         with:
           name: macos-binaries
           path: |
-            autogitpull_go/autogitpull-macos-arm64
-            autogitpull_go/autogitpull-macos-arm64.tar.gz
+            src/autogitpull-macos-arm64
+            src/autogitpull-macos-arm64.tar.gz
 
   build-linux:
     name: Build on Linux
@@ -75,12 +75,12 @@ jobs:
         env:
           APP_VERSION: ${{ github.ref_name }}
         run: |
-          cd autogitpull_go
-          GOOS=linux GOARCH=amd64 go build -ldflags "-X github.com/blankstatic/autogitpull/autogitpull_go/internal/version.AppVersion=${APP_VERSION}" -o autogitpull-linux-amd64 .
+          cd src
+          GOOS=linux GOARCH=amd64 go build -ldflags "-X github.com/blankstatic/autogitpull/src/internal/version.AppVersion=${APP_VERSION}" -o autogitpull-linux-amd64 .
           chmod +x autogitpull-linux-amd64
           tar -czf autogitpull-linux-amd64.tar.gz autogitpull-linux-amd64
 
-          CC=aarch64-linux-gnu-gcc GOOS=linux GOARCH=arm64 CGO_ENABLED=1 go build -ldflags "-X github.com/blankstatic/autogitpull/autogitpull_go/internal/version.AppVersion=${APP_VERSION}" -o autogitpull-linux-arm64 .
+          CC=aarch64-linux-gnu-gcc GOOS=linux GOARCH=arm64 CGO_ENABLED=1 go build -ldflags "-X github.com/blankstatic/autogitpull/src/internal/version.AppVersion=${APP_VERSION}" -o autogitpull-linux-arm64 .
           chmod +x autogitpull-linux-arm64
           tar -czf autogitpull-linux-arm64.tar.gz autogitpull-linux-arm64
 
@@ -89,7 +89,7 @@ jobs:
         with:
           name: linux-binaries
           path: |
-            autogitpull_go/autogitpull-linux-amd64
-            autogitpull_go/autogitpull-linux-amd64.tar.gz
-            autogitpull_go/autogitpull-linux-arm64
-            autogitpull_go/autogitpull-linux-arm64.tar.gz
+            src/autogitpull-linux-amd64
+            src/autogitpull-linux-amd64.tar.gz
+            src/autogitpull-linux-arm64
+            src/autogitpull-linux-arm64.tar.gz

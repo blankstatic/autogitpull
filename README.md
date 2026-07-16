@@ -1,348 +1,225 @@
 # autogitpull
 
-`autogitpull` keeps a list of local Git repositories and safely runs `git pull`
-for them in the background.
+`autogitpull` safely keeps multiple local Git repositories up to date. Register
+repositories once, then use the TUI, local web dashboard, or background daemon
+to pull them.
 
-It is built for the common "many repos on one machine" workflow: register the
-repositories once, then let the daemon keep default branches up to date while
-you work.
+It only pulls a repository when:
 
-## What It Does
+- it is on the detected remote default branch;
+- its working tree is clean.
 
-- Registers Git repositories in `~/.autogitpull/updates.sqlite`.
-- Detects each repository's remote default branch.
-- Pulls repositories every 30 minutes when the daemon is running.
-- Skips repositories that are not on their default branch.
-- Skips repositories with uncommitted local changes.
-- Records update history in `~/.autogitpull/updates.sqlite`.
-- Shows registered repositories in a terminal UI.
-- Starts a local dashboard at `http://localhost:9009` while the daemon runs.
-- Sends desktop notifications when a pull brings new changes.
-- Can be installed as a macOS `launchd` service or Linux user `systemd`
-  service.
+Every attempt is recorded in `~/.autogitpull/updates.sqlite`, including skipped
+and failed pulls.
 
-The safety rule is intentionally simple: `autogitpull` only pulls when the repo
-is on its detected default branch and `git status --porcelain` is clean.
+## Features
+
+- recursive repository discovery;
+- terminal UI and local dashboard at `http://localhost:9009`;
+- automatic pulls every 30 minutes;
+- bounded concurrent pulls with protection against duplicate in-process pulls;
+- update history and per-change details;
+- configurable desktop notifications;
+- optional AI-generated change summaries through an OpenAI-compatible API;
+- macOS `launchd` and Linux user `systemd` services.
+
+## Screenshots
+
+### Web dashboard
+
+![autogitpull web dashboard](assets/dashboard.png)
+
+### Terminal UI
+
+![autogitpull terminal UI](assets/tui.png)
+
+### Desktop notifications
+
+![autogitpull desktop notifications](assets/notifications.jpg)
 
 ## Install
 
-macOS Apple Silicon:
+### macOS (Apple Silicon)
 
 ```sh
 bash -c "$(curl -fsSL https://raw.githubusercontent.com/blankstatic/autogitpull/main/tools/install_darwin_arm64.sh)"
 ```
 
-The installer downloads the latest `autogitpull-macos-arm64` release to
-`/usr/local/bin/autogitpull`.
-Re-running it performs an update. If the launchd service is installed, its
-definition is refreshed and it is started after the atomic binary replacement;
-an active service is stopped first for a clean restart.
-
-Optional, for richer macOS notifications:
+For richer clickable notifications, install `terminal-notifier` before running
+the installer:
 
 ```sh
 brew install terminal-notifier
 ```
 
-When `terminal-notifier` is available, the installer also builds
-`~/Applications/FeatureHubLauncher.app` and uses it for clickable
-notifications.
-
-Linux amd64/arm64:
+### Linux (amd64 or arm64)
 
 ```sh
 bash -c "$(curl -fsSL https://raw.githubusercontent.com/blankstatic/autogitpull/main/tools/install_linux.sh)"
 ```
 
-Install and start the Linux user `systemd` service in one step:
+Install the binary and start the user service immediately:
 
 ```sh
 bash -c "$(curl -fsSL https://raw.githubusercontent.com/blankstatic/autogitpull/main/tools/install_linux.sh)" -- --start-service
 ```
 
-Re-running the Linux installer also updates an existing user systemd unit and
-starts it after the atomic binary replacement. `VERSION=vX.Y.Z` installs a
-specific release on either platform.
+The installers download the latest release to `/usr/local/bin/autogitpull`.
+Re-running an installer safely updates the binary and refreshes an existing
+service. Set `VERSION=vX.Y.Z` to install a specific release.
 
-## Build From Source
+### Build from source
+
+Requires Go. From the repository root:
 
 ```sh
-cd autogitpull_go
+cd src
 go build -o autogitpull .
-```
-
-Run the local binary:
-
-```sh
 ./autogitpull --help
 ```
 
-## Quick Start
-
-Register the current repository:
+## Quick start
 
 ```sh
+# Register the current repository
 autogitpull register
-```
 
-Register specific repositories:
-
-```sh
+# Register explicit paths
 autogitpull register ~/work/project-a ~/work/project-b
-```
 
-Discover and register repositories under a directory:
-
-```sh
+# Find and register repositories recursively
 autogitpull discover ~/work
-```
 
-Open the terminal UI:
-
-```sh
+# Open the terminal UI
 autogitpull status
-```
 
-Run the daemon in the foreground:
-
-```sh
+# Run automatic pulls and the dashboard in the foreground
 autogitpull daemon
 ```
 
-Then open:
-
-```text
-http://localhost:9009
-```
-
-## Daily Usage
-
-Use `autogitpull status` to see what is registered:
-
-```sh
-autogitpull status
-```
-
-In the TUI:
-
-```text
-↑/↓  navigate
-p    pull selected repository now
-d    unregister selected repository
-q    quit
-```
-
-Use the daemon when you want automatic updates:
-
-```sh
-autogitpull daemon
-```
-
-The daemon immediately checks all registered repositories, then repeats every
-30 minutes. It logs JSON to stdout when running in the foreground.
+The dashboard is then available at <http://localhost:9009>.
 
 ## Commands
 
 ```text
-autogitpull [command] [flags]
+autogitpull register [paths...]     Add repositories; defaults to the current directory.
+autogitpull unregister [paths...]   Remove repositories; defaults to the current directory.
+autogitpull discover [paths...]     Find Git repositories recursively and register them.
+autogitpull status                  Open the terminal UI (also the default command).
+autogitpull daemon                  Run auto-pull and the web dashboard.
+autogitpull service <command>       Manage the background service.
+autogitpull version                 Print the version.
 ```
 
-Available commands:
+Use `-s` or `--silently` to suppress desktop notifications for a command.
+
+TUI keys:
 
 ```text
-register [paths...]       Add repositories. With no path, adds the current directory.
-unregister [paths...]     Remove repositories. With no path, removes the current directory.
-discover [paths...]       Recursively find Git repositories and register them.
-status                    Open the terminal UI. This is also the default command.
-daemon                    Run the auto-pull loop and web dashboard in the foreground.
-service <command>         Manage the macOS launchd or Linux systemd service.
-version                   Print the version.
+↑/↓  navigate
+p    pull the selected repository
+d    unregister the selected repository
+q    quit
 ```
 
-Global flags:
-
-```text
--s, --silently            Suppress desktop notifications for the command.
--h, --help                Show help.
-```
-
-Examples:
-
-```sh
-autogitpull register ~/src/api
-autogitpull discover ~/src
-autogitpull unregister ~/src/old-project
-autogitpull status
-autogitpull version
-```
-
-## Background Service
-
-Install and start the background service:
+## Background service
 
 ```sh
 autogitpull service install
 autogitpull service start
-```
-
-Check service state:
-
-```sh
 autogitpull service status
-```
-
-Stop or remove it:
-
-```sh
 autogitpull service stop
 autogitpull service uninstall
 ```
 
-The service runs:
-
-```sh
-autogitpull daemon
-```
-
-On macOS it uses launchd label:
+On macOS, logs are written to:
 
 ```text
-com.blankstatic.autogitpull
+/tmp/com.blankstatic.autogitpull.log
+/tmp/com.blankstatic.autogitpull.error.log
 ```
 
-Logs:
-
-```sh
-cat /tmp/com.blankstatic.autogitpull.log
-cat /tmp/com.blankstatic.autogitpull.error.log
-```
-
-On Linux it installs a user `systemd` unit:
-
-```text
-~/.config/systemd/user/autogitpull.service
-```
-
-Linux logs:
+On Linux, follow logs with:
 
 ```sh
 journalctl --user -u autogitpull.service -f
 ```
 
-To keep the Linux user service running after logout, enable lingering once:
+To keep the Linux user service running after logout:
 
 ```sh
 sudo loginctl enable-linger "$USER"
 ```
 
-## Dashboard
+## Web dashboard
 
-When `autogitpull daemon` or the background service is running, the dashboard is
-available at:
+The daemon serves a local web interface with:
+
+- `/` — activity, repositories, updates, and a compact plugin summary;
+- `/status` — service, database, and daemon state;
+- `/settings` — pull interval and history retention;
+- `/plugins` — notification and AI Summary settings;
+- `/update?id=<id>` — pull output, plugin diagnostics, and generated summaries.
+
+Bulk pulls start in the background, so the page returns immediately while
+progress appears in the update history.
+
+## Plugins
+
+Plugins run after a pull has been saved. By default they run only when the local
+revision changed, though individual plugins can opt into no-change events.
+
+### Notifications
+
+The built-in Notifications plugin is enabled by default. It can be configured
+and tested on `/plugins`; notification clicks open the related update details.
+
+Linux desktop notifications require a graphical session. The service imports
+the current desktop environment into `systemd --user` and uses `notify-send`,
+`xdg-open`, D-Bus, or `kdialog` depending on what is available.
+
+### AI Summary
+
+AI Summary is disabled by default. It supports OpenAI-compatible Responses and
+Chat Completions APIs and can be configured with a provider name, URL, API key,
+model, and prompt.
+
+Summaries use the saved pre-pull and post-pull revisions. Context controls let
+you include metadata only or selected code diffs, set file filters and byte
+limits, and choose diff context size. Common secret, dependency, build, and lock
+files are excluded by default. The exact prompt and input preview are visible on
+the update details page.
+
+## Pull behavior
+
+For each registered repository, `autogitpull`:
+
+1. checks the current branch against the stored default branch;
+2. checks `git status --porcelain`;
+3. runs `git pull origin` only when both safety checks pass;
+4. records the result and the revisions before and after the pull;
+5. runs enabled plugins from the saved update.
+
+`register` and `discover` require the default branch to be detectable from
+`origin/HEAD`. Discovery skips hidden and heavy directories such as `.git`,
+`node_modules`, `vendor`, `build`, `dist`, `target`, and common caches.
+
+## Data
+
+Repositories, settings, history, and plugin results are stored in:
 
 ```text
-http://localhost:9009
-```
-
-The dashboard shows:
-
-- registered repositories;
-- last sync time;
-- update history;
-- skipped pulls;
-- failed pulls;
-- changed update activity for the last year;
-- per-repository details and current local changes.
-
-Notification clicks open the related repository page in this dashboard.
-
-## Storage
-
-Repositories, settings, and update history are stored in SQLite:
-
-```sh
 ~/.autogitpull/updates.sqlite
 ```
 
-On upgrade, an existing legacy config is migrated automatically:
+Legacy `~/.autogitpull/config.json` data is migrated automatically.
 
-```sh
-~/.autogitpull/config.json
-```
+## Release artifacts
 
-`register` and `discover` only add repositories where the remote default branch
-can be detected from `origin/HEAD`.
-
-`discover` skips hidden and heavy directories such as `.git`, `node_modules`,
-`vendor`, `build`, `dist`, `target`, and cache/temp directories.
-
-## Pull Behavior
-
-For every registered repository, `autogitpull` does this:
-
-1. Reads the current branch with `git branch --show-current`.
-2. Compares it with the repository's stored `default_branch`.
-3. Checks local changes with `git status --porcelain`.
-4. Runs `git pull origin` only when the branch matches and the working tree is
-   clean.
-5. Records the result in the update history database.
-
-Common skip cases:
-
-```text
-current branch feature/foo is not default branch main
-repository has uncommitted changes
-```
-
-This avoids pulling into feature branches or overwriting active local work.
-
-## Notifications
-
-Pull notifications are handled by the built-in Notifications plugin. It sends
-notifications for changed daemon/web/TUI pulls, and also for successful manual
-web/TUI pulls even when there are no new changes.
-
-On Linux, pull notifications use the desktop notification stack. Clickable
-change links are attempted through `notify-send` actions plus `xdg-open`;
-otherwise `autogitpull` falls back to a normal `beeep` notification through
-session D-Bus, `notify-send`, or `kdialog`. A graphical user session is required.
-When the Linux service is installed or started, it imports the current desktop
-environment into `systemd --user` so notifications and `xdg-open` can see it.
-
-On macOS, by default it looks for:
-
-```sh
-~/Applications/FeatureHubLauncher.app
-```
-
-Build or rebuild the notification app manually:
-
-```sh
-brew install terminal-notifier
-tools/featurehub-build.sh --no-notify
-```
-
-Environment overrides:
-
-```sh
-AUTOGITPULL_NOTIFIER_APP=/path/to/FeatureHubLauncher.app
-AUTOGITPULL_DASHBOARD_URL=http://localhost:9009
-```
-
-Use `--silently` when you do not want desktop notifications for a command:
-
-```sh
-autogitpull register --silently ~/work/project
-```
-
-## Release Artifacts
-
-GitHub Actions builds release binaries:
+GitHub releases use these asset names:
 
 ```text
 autogitpull-macos-arm64
 autogitpull-linux-amd64
 autogitpull-linux-arm64
 ```
-
-The installers expect the release assets to use those exact names.

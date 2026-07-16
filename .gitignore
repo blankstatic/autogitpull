@@ -1,4 +1,4 @@
 .DS_Store
-autogitpull_go/main
-autogitpull_go/autogitpull*
+src/main
+src/autogitpull*
 demo-repos/

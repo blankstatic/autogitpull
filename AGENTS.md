@@ -1,9 +1,9 @@
 # Project Memory
 
 - Keep answers concise.
-- Go code lives in `autogitpull_go`.
+- Go code lives in `src`.
 - Config and repo state are stored in the shared SQLite DB at `~/.autogitpull/updates.sqlite`.
-- Web UI is in `autogitpull_go/internal/web/server.go`; templates are embedded Go template strings in that file.
+- Web UI is in `src/internal/web/server.go`; templates are embedded Go template strings in that file.
 - Main web dashboard should contain only activity, repositories, updates, and the compact plugins summary/link. Put everything else on separate pages.
 - Web service/database/daemon details live on the separate `/status` page; keep those details off the main dashboard.
 - Web daemon settings live on the separate `/settings` page; keep interval/retention out of the main dashboard header.
@@ -11,10 +11,10 @@
 - Web bulk pulls and daemon pulls should use bounded concurrency, not unbounded fan-out. Web bulk pull starts in the background and redirects immediately. Web/daemon pulls share `internal/pulllock` to avoid two in-process pulls for the same repo path. Web/daemon after-pull plugin pipelines may run asynchronously after the update is saved so slow plugins do not block pull completion; daemon shutdown must wait for async plugin tasks before closing the shared DB.
 - Web lifecycle owns its HTTP server, active request handlers, bulk-pull tasks, and bounded plugin worker queue. Shutdown must stop HTTP intake, wait for handlers and bulk pulls, drain plugin work, and finish before the shared DB closes. Daemon plugin work must also use a bounded worker queue. Never run plugins after `FinishUpdateWithRevisions` fails.
 - Historically some functionality was duplicated between web and TUI; avoid new duplicate side-effect logic and keep web/TUI/daemon behavior aligned through shared packages.
-- Pull history is in `autogitpull_go/internal/db/updates.go`.
+- Pull history is in `src/internal/db/updates.go`.
 - When `before_rev` and `after_rev` are available, `Update.Changed` should be based on `before_rev != after_rev`, not only pull stdout, because `git pull` may fetch remote branch updates while local HEAD remains unchanged.
-- Daemon pull flow is in `autogitpull_go/internal/logic/daemon.go`.
-- Change-processing plugins live in `autogitpull_go/internal/plugins`.
+- Daemon pull flow is in `src/internal/logic/daemon.go`.
+- Change-processing plugins live in `src/internal/plugins`.
 - Plugins run after a successful pull has been recorded. By default they run only when the saved `db.Update.Changed` is true; plugins may opt into no-change runs with `RunOnNoChange`.
 - Plugin state is stored in `plugin_settings` via `config.StorageManager`; repo-scoped plugin selection is generic, uses plugin config `repo_scope` plus `selected_repos`, and must be editable from `/plugins`.
 - Plugin outputs are append-only, newest-first, and stored in `plugin_results` via `db.Store`; AI summary architecture should use saved `Update.BeforeRev`/`AfterRev` ranges, not ad hoc ORIG_HEAD assumptions.
@@ -36,5 +36,5 @@
 - Background service management supports macOS launchd and Linux user systemd (`~/.config/systemd/user/autogitpull.service`); keep CLI help, install scripts, CI release artifact names, and README install commands aligned.
 - Release installers are also updaters: validate and stage the new binary before stopping an active service, atomically replace it, refresh an existing service definition, and ensure an installed service is running afterward.
 - Linux desktop notifications depend on a graphical session and use `notify-send` actions plus `xdg-open` for clickable update links, falling back to `beeep`/D-Bus/`notify-send`/`kdialog` when clickable actions are unavailable; Linux service install/start imports desktop env vars into `systemd --user`.
-- Before finishing code changes, run `go test ./...` from `autogitpull_go`.
-- Keep project memory and docs current: update `AGENTS.md` and `autogitpull_go/README.md` when dashboard pages, plugin behavior, storage, pull flow, TUI/web/daemon alignment, or user-facing commands change.
+- Before finishing code changes, run `go test ./...` from `src`.
+- Keep project memory and docs current: update `AGENTS.md` and `src/README.md` when dashboard pages, plugin behavior, storage, pull flow, TUI/web/daemon alignment, or user-facing commands change.
