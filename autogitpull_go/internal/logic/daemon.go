@@ -1,6 +1,7 @@
 package logic
 
 import (
+	"context"
 	"fmt"
 	"log/slog"
 	"os"
@@ -21,18 +22,31 @@ import (
 )
 
 const maxConcurrentDaemonPulls = 4
+const maxConcurrentDaemonPlugins = 4
+const daemonPluginQueueSize = 64
+
+type daemonPluginTask struct {
+	repo     config.RepoInfo
+	updateID int64
+	notify   bool
+}
 
 type Daemon struct {
-	interval    time.Duration
-	storage     *config.StorageManager
-	isRunning   bool
-	stopChan    chan struct{}
-	wg          sync.WaitGroup
-	pluginWG    sync.WaitGroup
-	mu          sync.RWMutex
-	onPullStart func(repo *config.RepoInfo)
-	onPullDone  func(repo *config.RepoInfo, result string, err error, notify bool)
-	updateStore *db.Store
+	interval      time.Duration
+	storage       *config.StorageManager
+	isRunning     bool
+	stopChan      chan struct{}
+	wg            sync.WaitGroup
+	pluginTasks   chan daemonPluginTask
+	pluginWG      sync.WaitGroup
+	pluginMu      sync.Mutex
+	pluginsOpen   bool
+	pluginCtx     context.Context
+	cancelPlugins context.CancelFunc
+	mu            sync.RWMutex
+	onPullStart   func(repo *config.RepoInfo)
+	onPullDone    func(repo *config.RepoInfo, result string, err error, notify bool)
+	updateStore   *db.Store
 }
 
 type Config struct {
@@ -67,6 +81,7 @@ func NewDaemon(cfg Config) (*Daemon, error) {
 		onPullStart: cfg.OnPullStart,
 		onPullDone:  cfg.OnPullDone,
 		updateStore: cfg.UpdateStore,
+		pluginTasks: make(chan daemonPluginTask, daemonPluginQueueSize),
 	}, nil
 }
 
@@ -79,16 +94,21 @@ func (d *Daemon) Start() {
 	}
 
 	d.isRunning = true
+	d.startPluginWorkers()
 	d.wg.Add(1)
 
 	go d.run()
 }
 
 func (d *Daemon) Stop() {
+	_ = d.StopContext(context.Background())
+}
+
+func (d *Daemon) StopContext(ctx context.Context) error {
 	d.mu.Lock()
 	if !d.isRunning {
 		d.mu.Unlock()
-		return
+		return nil
 	}
 
 	d.isRunning = false
@@ -97,13 +117,41 @@ func (d *Daemon) Stop() {
 	d.mu.Unlock()
 
 	d.wg.Wait()
-	d.pluginWG.Wait()
+	d.pluginMu.Lock()
+	if d.pluginsOpen {
+		d.pluginsOpen = false
+		close(d.pluginTasks)
+	}
+	d.pluginMu.Unlock()
+	stopCancelWatch := context.AfterFunc(ctx, d.cancelPlugins)
+	defer stopCancelWatch()
+	if !waitDaemonWG(ctx, &d.pluginWG) {
+		d.cancelPlugins()
+		d.pluginWG.Wait()
+	} else {
+		d.cancelPlugins()
+	}
 
 	d.mu.Lock()
 	if d.stopChan == stopChan {
 		d.stopChan = make(chan struct{})
 	}
 	d.mu.Unlock()
+	return ctx.Err()
+}
+
+func waitDaemonWG(ctx context.Context, wg *sync.WaitGroup) bool {
+	done := make(chan struct{})
+	go func() {
+		wg.Wait()
+		close(done)
+	}()
+	select {
+	case <-done:
+		return true
+	case <-ctx.Done():
+		return false
+	}
 }
 
 func (d *Daemon) IsRunning() bool {
@@ -229,12 +277,33 @@ func (d *Daemon) runPluginsAfterChangeAsync(repo *config.RepoInfo, updateID int6
 	if repo == nil {
 		return
 	}
-	repoCopy := *repo
-	d.pluginWG.Add(1)
-	go func() {
-		defer d.pluginWG.Done()
-		d.runPluginsAfterChange(&repoCopy, updateID, notify)
-	}()
+	d.pluginMu.Lock()
+	defer d.pluginMu.Unlock()
+	if !d.pluginsOpen {
+		slog.Warn("skipping plugin task during daemon shutdown", slog.String("repo", repo.Name), slog.Int64("update_id", updateID))
+		return
+	}
+	d.pluginTasks <- daemonPluginTask{repo: *repo, updateID: updateID, notify: notify}
+}
+
+func (d *Daemon) startPluginWorkers() {
+	d.pluginMu.Lock()
+	defer d.pluginMu.Unlock()
+	if d.pluginsOpen {
+		return
+	}
+	d.pluginTasks = make(chan daemonPluginTask, daemonPluginQueueSize)
+	d.pluginCtx, d.cancelPlugins = context.WithCancel(context.Background())
+	d.pluginsOpen = true
+	for range maxConcurrentDaemonPlugins {
+		d.pluginWG.Add(1)
+		go func() {
+			defer d.pluginWG.Done()
+			for task := range d.pluginTasks {
+				d.runPluginsAfterChange(&task.repo, task.updateID, task.notify)
+			}
+		}()
+	}
 }
 
 func (d *Daemon) runPluginsAfterChange(repo *config.RepoInfo, updateID int64, notify bool) {
@@ -247,6 +316,7 @@ func (d *Daemon) runPluginsAfterChange(repo *config.RepoInfo, updateID int64, no
 		return
 	}
 	plugins.RunAfterChange(plugins.Context{
+		Ctx:       d.pluginCtx,
 		Repo:      repo,
 		Update:    update,
 		Store:     d.updateStore,
@@ -357,7 +427,8 @@ func DaemonCommandHandler(cmd *cobra.Command, args []string) {
 	if err := storage.Load(); err != nil {
 		panic(err)
 	}
-	web.New(updateStore, storage).Start()
+	webServer := web.New(updateStore, storage)
+	webServer.Start()
 
 	cfg := storage.GetConfig()
 	interval := cfg.PullInterval()
@@ -400,7 +471,14 @@ func DaemonCommandHandler(cmd *cobra.Command, args []string) {
 	<-sigChan
 
 	slog.Warn("Stopping daemon...")
-	d.Stop()
+	shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 30*time.Second)
+	if err := webServer.Shutdown(shutdownCtx); err != nil {
+		slog.Warn("Web dashboard shutdown timed out", slog.String("err", err.Error()))
+	}
+	shutdownCancel()
+	if err := d.StopContext(shutdownCtx); err != nil {
+		slog.Warn("Daemon shutdown deadline reached", slog.String("err", err.Error()))
+	}
 	slog.Warn("Daemon stopped")
 
 }

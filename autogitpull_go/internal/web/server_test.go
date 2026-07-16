@@ -1,6 +1,7 @@
 package web
 
 import (
+	"context"
 	"database/sql"
 	"errors"
 	"net/http"
@@ -9,6 +10,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -18,6 +20,97 @@ import (
 	"github.com/blankstatic/autogitpull/autogitpull_go/internal/db"
 	"github.com/blankstatic/autogitpull/autogitpull_go/internal/plugins"
 )
+
+func TestServerPluginWorkersAreBoundedAndShutdownDrains(t *testing.T) {
+	dir := t.TempDir()
+	storage := config.NewStorageManager(filepath.Join(dir, "config.json"))
+	if err := storage.Load(); err != nil {
+		t.Fatal(err)
+	}
+	store, err := db.Open(filepath.Join(dir, "updates.sqlite"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	server := New(store, storage)
+
+	release := make(chan struct{})
+	started := make(chan struct{}, 8)
+	var active atomic.Int32
+	var maximum atomic.Int32
+	var completed atomic.Int32
+	for range 8 {
+		if !server.enqueuePluginTask(func() {
+			current := active.Add(1)
+			for {
+				old := maximum.Load()
+				if current <= old || maximum.CompareAndSwap(old, current) {
+					break
+				}
+			}
+			started <- struct{}{}
+			<-release
+			active.Add(-1)
+			completed.Add(1)
+		}) {
+			t.Fatal("task rejected before shutdown")
+		}
+	}
+	for range webPluginWorkers {
+		select {
+		case <-started:
+		case <-time.After(time.Second):
+			t.Fatal("workers did not start")
+		}
+	}
+	if got := maximum.Load(); got != webPluginWorkers {
+		t.Fatalf("maximum concurrent workers = %d, want %d", got, webPluginWorkers)
+	}
+	close(release)
+	if err := server.Shutdown(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if got := completed.Load(); got != 8 {
+		t.Fatalf("completed tasks = %d, want 8", got)
+	}
+	if server.enqueuePluginTask(func() {}) {
+		t.Fatal("task accepted after shutdown")
+	}
+}
+
+func TestServerShutdownDeadlineCancelsPluginWorkers(t *testing.T) {
+	dir := t.TempDir()
+	storage := config.NewStorageManager(filepath.Join(dir, "config.json"))
+	if err := storage.Load(); err != nil {
+		t.Fatal(err)
+	}
+	store, err := db.Open(filepath.Join(dir, "updates.sqlite"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	server := New(store, storage)
+	started := make(chan struct{})
+	finished := make(chan struct{})
+	if !server.enqueuePluginTask(func() {
+		close(started)
+		<-server.pluginCtx.Done()
+		close(finished)
+	}) {
+		t.Fatal("task rejected")
+	}
+	<-started
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Millisecond)
+	defer cancel()
+	if err := server.Shutdown(ctx); !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("expected shutdown deadline, got %v", err)
+	}
+	select {
+	case <-finished:
+	case <-time.After(time.Second):
+		t.Fatal("plugin worker was not cancelled at shutdown deadline")
+	}
+}
 
 func TestNewActivitySummaryCountsOnlyProvidedChangedTimes(t *testing.T) {
 	loc := time.FixedZone("MSK", 3*60*60)
@@ -216,6 +309,9 @@ func TestPluginsPageRendersBuiltInPlugins(t *testing.T) {
 	if !strings.Contains(rec.Body.String(), `formaction="/plugins/test-ai-summary"`) || !strings.Contains(rec.Body.String(), ">Test connection</button>") {
 		t.Fatalf("expected AI summary test button in response")
 	}
+	if !strings.Contains(rec.Body.String(), `formaction="/plugins/test-notifications"`) || !strings.Contains(rec.Body.String(), ">Send test notification</button>") {
+		t.Fatalf("expected notifications test button in response")
+	}
 	if !strings.Contains(rec.Body.String(), `<textarea class="input" name="config_prompt">`) {
 		t.Fatalf("expected AI summary prompt textarea in response")
 	}
@@ -223,6 +319,9 @@ func TestPluginsPageRendersBuiltInPlugins(t *testing.T) {
 		if !strings.Contains(rec.Body.String(), want) {
 			t.Fatalf("expected compact plugin layout marker %q", want)
 		}
+	}
+	if !strings.Contains(rec.Body.String(), `class="plugin-advanced"`) || !strings.Contains(rec.Body.String(), "Advanced context controls") {
+		t.Fatal("expected collapsible advanced AI summary settings")
 	}
 	if !strings.Contains(rec.Body.String(), "plugin-repo-path") || !strings.Contains(rec.Body.String(), `title="/Users/dmitry/proj/autogitpull_source"`) {
 		t.Fatalf("expected selected repo path to render in wrapping container")

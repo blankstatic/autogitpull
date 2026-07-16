@@ -11,6 +11,15 @@ const NotificationsID = "notifications"
 
 var notifyURL = notifications.OSNotifyURL
 
+// TestNotifications sends a standalone notification using the supplied, possibly unsaved, settings.
+func TestNotifications(appName string, cfg map[string]string) error {
+	prefix := cfg["title_prefix"]
+	if prefix == "" {
+		prefix = "Pulled"
+	}
+	return notifyURL(appName, fmt.Sprintf("%s: Test", prefix), "Notifications are working.", "")
+}
+
 func notificationPlugin() Definition {
 	return Definition{
 		ID:          NotificationsID,

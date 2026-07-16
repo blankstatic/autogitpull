@@ -1,12 +1,24 @@
 package git
 
 import (
+	"context"
+	"errors"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
 )
+
+func TestGitCommandsRespectContextCancellation(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	_, err := GitChangedLogContext(ctx, t.TempDir(), "before", "after")
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("expected context cancellation, got %v", err)
+	}
+}
 
 func TestRemoteWebURL(t *testing.T) {
 	tests := map[string]string{

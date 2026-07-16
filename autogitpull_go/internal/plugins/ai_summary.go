@@ -2,6 +2,7 @@ package plugins
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -58,25 +59,25 @@ func aiSummaryPlugin() Definition {
 			"diff_context_lines":  strconv.Itoa(defaultAIDiffContextLines),
 		},
 		Fields: []Field{
-			{Key: "provider", Label: "Provider name", Type: "text"},
-			{Key: "api_type", Label: "API type", Type: "select", Options: []FieldOption{
+			{Key: "provider", Label: "Connection name", Type: "text", Help: "A label shown in autogitpull. It is not sent to the API."},
+			{Key: "api_type", Label: "API format", Type: "select", Help: "Choose the endpoint format supported by your OpenAI-compatible provider.", Options: []FieldOption{
 				{Value: "responses", Label: "Responses"},
 				{Value: "chat_completions", Label: "Chat completions"},
 			}},
-			{Key: "url", Label: "API URL", Type: "url"},
-			{Key: "token", Label: "API key", Type: "password"},
-			{Key: "model", Label: "Model", Type: "text"},
-			{Key: "prompt", Label: "Prompt", Type: "textarea"},
+			{Key: "url", Label: "API base URL", Type: "url", Help: "Base URL such as https://api.openai.com/v1. The endpoint path is added automatically."},
+			{Key: "token", Label: "API key", Type: "password", Help: "Stored in the local autogitpull database and sent only to this API URL."},
+			{Key: "model", Label: "Model ID", Type: "text", Help: "Exact model identifier expected by the provider."},
+			{Key: "prompt", Label: "Summary instructions", Type: "textarea", Help: "System instructions controlling the content, language, and style of the generated summary."},
 			{Key: "code_detail", Label: "Code sent for analysis", Type: "select", Help: "No code sends only commit and file statistics. Limited sends up to the per-file limit. Full sends complete file diffs while space remains.", Options: []FieldOption{
 				{Value: "none", Label: "No code — metadata only"},
 				{Value: "limited", Label: "Limited code per file (recommended)"},
 				{Value: "full", Label: "Full file diffs"},
 			}},
-			{Key: "include_patterns", Label: "Only include files", Type: "text", Help: "Optional comma-separated patterns, for example **/*.go,docs/**. Leave empty to consider every changed file."},
-			{Key: "exclude_patterns", Label: "Never send these files", Type: "text", Help: "Comma-separated patterns. Matching files are listed, but their code is never sent. Defaults protect common secrets, dependencies, builds, and lock files."},
-			{Key: "max_context_bytes", Label: "Maximum request context (bytes)", Type: "number", Help: "Total budget for change metadata and code. Allowed: 256–2000000 bytes. Default: 120000."},
-			{Key: "max_file_diff_bytes", Label: "Maximum code per file (bytes)", Type: "number", Help: "Used by Limited mode so one large file cannot consume the request. Allowed: 64 bytes up to the total context limit. Default: 20000."},
-			{Key: "diff_context_lines", Label: "Context around changes", Type: "select", Help: "Unchanged lines shown before and after each changed block. Lower values fit more files; higher values give the model more local context.", Options: []FieldOption{
+			{Key: "include_patterns", Label: "Only include files", Type: "text", Advanced: true, Help: "Optional comma-separated patterns, for example **/*.go,docs/**. Leave empty to consider every changed file."},
+			{Key: "exclude_patterns", Label: "Never send these files", Type: "text", Advanced: true, Help: "Comma-separated patterns. Matching files are listed, but their code is never sent. Defaults protect common secrets, dependencies, builds, and lock files."},
+			{Key: "max_context_bytes", Label: "Total context limit (bytes)", Type: "number", Advanced: true, Help: "Total budget for change metadata and code. Allowed: 256–2000000 bytes. Default: 120000."},
+			{Key: "max_file_diff_bytes", Label: "Per-file code limit (bytes)", Type: "number", Advanced: true, Help: "Used by Limited mode so one large file cannot consume the request. Allowed: 64 bytes up to the total context limit. Default: 20000."},
+			{Key: "diff_context_lines", Label: "Unchanged context lines", Type: "select", Advanced: true, Help: "Unchanged lines shown before and after each changed block. Lower values fit more files; higher values give the model more local context.", Options: []FieldOption{
 				{Value: "3", Label: "3 lines — compact"},
 				{Value: "10", Label: "10 lines"},
 				{Value: "20", Label: "20 lines — recommended"},
@@ -93,25 +94,25 @@ func aiSummaryPlugin() Definition {
 				return ctx.Store.SavePluginResult(ctx.Update.ID, AISummaryID, "skipped", "", "missing revision range")
 			}
 
-			context, err := BuildAISummaryChangeContext(ctx.Repo.Path, ctx.Update.BeforeRev, ctx.Update.AfterRev, ctx.Config)
+			changeContext, err := BuildAISummaryChangeContextWithContext(ctx.Ctx, ctx.Repo.Path, ctx.Update.BeforeRev, ctx.Update.AfterRev, ctx.Config)
 			if err != nil {
 				_ = ctx.Store.SavePluginResult(ctx.Update.ID, AISummaryID, "error", "", err.Error())
 				return err
 			}
-			if context == "" {
+			if changeContext == "" {
 				return ctx.Store.SavePluginResult(ctx.Update.ID, AISummaryID, "skipped", "", "empty change context")
 			}
 
-			summary, err := generateAISummary(ctx.Config, ctx.Repo.Name, context)
+			summary, err := generateAISummaryContext(ctx.Ctx, ctx.Config, ctx.Repo.Name, changeContext)
 			if err != nil {
 				if errors.Is(err, errAIProviderNotConfigured) {
 					return ctx.Store.SavePluginResult(ctx.Update.ID, AISummaryID, "skipped", "", err.Error())
 				}
-				_ = ctx.Store.SavePluginResult(ctx.Update.ID, AISummaryID, "error", context, err.Error())
+				_ = ctx.Store.SavePluginResult(ctx.Update.ID, AISummaryID, "error", changeContext, err.Error())
 				return err
 			}
 			if summary == "" {
-				return ctx.Store.SavePluginResult(ctx.Update.ID, AISummaryID, "error", context, "AI provider returned empty response")
+				return ctx.Store.SavePluginResult(ctx.Update.ID, AISummaryID, "error", changeContext, "AI provider returned empty response")
 			}
 			return ctx.Store.SavePluginResult(ctx.Update.ID, AISummaryID, "success", summary, "")
 		},
@@ -152,11 +153,15 @@ func validateAISummaryConfig(cfg map[string]string) error {
 	return nil
 }
 
-func generateAISummary(cfg map[string]string, repoName, context string) (string, error) {
+func generateAISummary(cfg map[string]string, repoName, changeContext string) (string, error) {
+	return generateAISummaryContext(context.Background(), cfg, repoName, changeContext)
+}
+
+func generateAISummaryContext(ctx context.Context, cfg map[string]string, repoName, changeContext string) (string, error) {
 	if strings.TrimSpace(cfg["url"]) == "" || strings.TrimSpace(cfg["token"]) == "" || strings.TrimSpace(cfg["model"]) == "" {
 		return "", errAIProviderNotConfigured
 	}
-	return callAIProvider(cfg, repoName, context)
+	return callAIProviderContext(ctx, cfg, repoName, changeContext)
 }
 
 func TestAISummary(cfg map[string]string) (string, error) {
@@ -175,15 +180,19 @@ func AISummaryInput(repoName, context string) string {
 }
 
 func BuildAISummaryChangeContext(repoPath, beforeRev, afterRev string, configs ...map[string]string) (string, error) {
-	logText, err := git.GitChangedLog(repoPath, beforeRev, afterRev)
+	return BuildAISummaryChangeContextWithContext(context.Background(), repoPath, beforeRev, afterRev, configs...)
+}
+
+func BuildAISummaryChangeContextWithContext(ctx context.Context, repoPath, beforeRev, afterRev string, configs ...map[string]string) (string, error) {
+	logText, err := git.GitChangedLogContext(ctx, repoPath, beforeRev, afterRev)
 	if err != nil {
 		return "", err
 	}
-	diffStat, err := git.GitDiffStat(repoPath, beforeRev, afterRev)
+	diffStat, err := git.GitDiffStatContext(ctx, repoPath, beforeRev, afterRev)
 	if err != nil {
 		return "", err
 	}
-	files, err := git.GitChangedFiles(repoPath, beforeRev, afterRev)
+	files, err := git.GitChangedFilesContext(ctx, repoPath, beforeRev, afterRev)
 	if err != nil {
 		return "", err
 	}
@@ -199,7 +208,7 @@ func BuildAISummaryChangeContext(repoPath, beforeRev, afterRev string, configs .
 		patchLimit = fileLimit
 	}
 	return buildAISummaryChangeContextWithConfig(logText, diffStat, files, func(filePath string) (string, error) {
-		patch, truncated, err := git.GitDiffPatchForFileLimitedContext(repoPath, beforeRev, afterRev, filePath, patchLimit, contextLines)
+		patch, truncated, err := git.GitDiffPatchForFileLimitedContextWithContext(ctx, repoPath, beforeRev, afterRev, filePath, patchLimit, contextLines)
 		if truncated {
 			patch += "\n[git diff output capped before context assembly]"
 		}
@@ -439,18 +448,26 @@ func truncateTextWithMarker(text string, limit int, marker string) string {
 	return text[:end] + marker
 }
 
-func callAIProvider(cfg map[string]string, repoName, context string) (string, error) {
+func callAIProvider(cfg map[string]string, repoName, changeContext string) (string, error) {
+	return callAIProviderContext(context.Background(), cfg, repoName, changeContext)
+}
+
+func callAIProviderContext(ctx context.Context, cfg map[string]string, repoName, changeContext string) (string, error) {
 	switch cfg["api_type"] {
 	case "", "responses":
-		return callOpenAIResponses(cfg, repoName, context)
+		return callOpenAIResponsesContext(ctx, cfg, repoName, changeContext)
 	case "chat_completions":
-		return callChatCompletions(cfg, repoName, context)
+		return callChatCompletionsContext(ctx, cfg, repoName, changeContext)
 	default:
 		return "", fmt.Errorf("unsupported AI API type: %s", cfg["api_type"])
 	}
 }
 
-func callOpenAIResponses(cfg map[string]string, repoName, context string) (string, error) {
+func callOpenAIResponses(cfg map[string]string, repoName, changeContext string) (string, error) {
+	return callOpenAIResponsesContext(context.Background(), cfg, repoName, changeContext)
+}
+
+func callOpenAIResponsesContext(ctx context.Context, cfg map[string]string, repoName, changeContext string) (string, error) {
 	token := strings.TrimSpace(cfg["token"])
 	if token == "" {
 		return "", fmt.Errorf("missing API key")
@@ -467,14 +484,14 @@ func callOpenAIResponses(cfg map[string]string, repoName, context string) (strin
 	body := map[string]any{
 		"model":        model,
 		"instructions": AISummaryPrompt(cfg),
-		"input":        AISummaryInput(repoName, context),
+		"input":        AISummaryInput(repoName, changeContext),
 	}
 	payload, err := json.Marshal(body)
 	if err != nil {
 		return "", err
 	}
 
-	req, err := http.NewRequest(http.MethodPost, baseURL+"/responses", bytes.NewReader(payload))
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, baseURL+"/responses", bytes.NewReader(payload))
 	if err != nil {
 		return "", err
 	}
@@ -496,7 +513,11 @@ func callOpenAIResponses(cfg map[string]string, repoName, context string) (strin
 	return responseOutputText(respBody), nil
 }
 
-func callChatCompletions(cfg map[string]string, repoName, context string) (string, error) {
+func callChatCompletions(cfg map[string]string, repoName, changeContext string) (string, error) {
+	return callChatCompletionsContext(context.Background(), cfg, repoName, changeContext)
+}
+
+func callChatCompletionsContext(ctx context.Context, cfg map[string]string, repoName, changeContext string) (string, error) {
 	token := strings.TrimSpace(cfg["token"])
 	if token == "" {
 		return "", fmt.Errorf("missing API key")
@@ -514,7 +535,7 @@ func callChatCompletions(cfg map[string]string, repoName, context string) (strin
 		"model": model,
 		"messages": []map[string]string{
 			{"role": "system", "content": AISummaryPrompt(cfg)},
-			{"role": "user", "content": AISummaryInput(repoName, context)},
+			{"role": "user", "content": AISummaryInput(repoName, changeContext)},
 		},
 	}
 	payload, err := json.Marshal(body)
@@ -522,7 +543,7 @@ func callChatCompletions(cfg map[string]string, repoName, context string) (strin
 		return "", err
 	}
 
-	req, err := http.NewRequest(http.MethodPost, baseURL+"/chat/completions", bytes.NewReader(payload))
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, baseURL+"/chat/completions", bytes.NewReader(payload))
 	if err != nil {
 		return "", err
 	}

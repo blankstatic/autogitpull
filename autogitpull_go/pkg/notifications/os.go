@@ -9,9 +9,6 @@ import (
 //go:embed assets/info.png
 var InfoIcon []byte
 
-//go:embed assets/warning.png
-var WarningIcon []byte
-
 func OSNotifyURL(appName, title, body, openURL string) error {
 	if err := customNotify(title, body, openURL); err == nil {
 		return nil

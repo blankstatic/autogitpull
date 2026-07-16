@@ -9,6 +9,7 @@
 - Web daemon settings live on the separate `/settings` page; keep interval/retention out of the main dashboard header.
 - Web, TUI, and daemon must use one shared system for pull/update side effects: record via `db.Store.FinishUpdate`, load the saved `db.Update`, then call `plugins.RunAfterChange` with a source such as `web_manual`, `web_bulk`, `tui_manual`, or `daemon`.
 - Web bulk pulls and daemon pulls should use bounded concurrency, not unbounded fan-out. Web bulk pull starts in the background and redirects immediately. Web/daemon pulls share `internal/pulllock` to avoid two in-process pulls for the same repo path. Web/daemon after-pull plugin pipelines may run asynchronously after the update is saved so slow plugins do not block pull completion; daemon shutdown must wait for async plugin tasks before closing the shared DB.
+- Web lifecycle owns its HTTP server, active request handlers, bulk-pull tasks, and bounded plugin worker queue. Shutdown must stop HTTP intake, wait for handlers and bulk pulls, drain plugin work, and finish before the shared DB closes. Daemon plugin work must also use a bounded worker queue. Never run plugins after `FinishUpdateWithRevisions` fails.
 - Historically some functionality was duplicated between web and TUI; avoid new duplicate side-effect logic and keep web/TUI/daemon behavior aligned through shared packages.
 - Pull history is in `autogitpull_go/internal/db/updates.go`.
 - When `before_rev` and `after_rev` are available, `Update.Changed` should be based on `before_rev != after_rev`, not only pull stdout, because `git pull` may fetch remote branch updates while local HEAD remains unchanged.
@@ -21,15 +22,19 @@
 - AI summary context controls include metadata-only/limited/full code modes, include/exclude file patterns, total/per-file byte limits, and selectable unified-diff context lines (default 20). Excluded file contents must not be read into the request, and the preview should state why files were omitted. Keep common secret-file patterns excluded by default.
 - The AI Summary Test connection action must test the current form values, including unsaved edits, without persisting them.
 - AI summary must bound git diff output while reading it, cap omission diagnostics, reserve code budget separately from metadata, and stop inspecting additional files after the context budget is exhausted.
+- Web and daemon shutdown share one deadline; when it expires, cancel queued/running plugin work and propagate cancellation into plugin HTTP requests and Git diff commands before closing the database.
 - Web change details live at `/update?id=...`; notifications should deep-link there, and the page should show pull text plus all AI summaries with a regenerate button.
 - Notifications plugin records sent/skipped/error diagnostics in `plugin_results`; use `/update?id=...` plugin results to debug missing notifications.
 - Remote ref updates from `git pull` output, such as `branch -> origin/branch` with unchanged local `HEAD`, should not mark `Update.Changed`, but notifications may still send for them.
 - Web plugin UI is a separate `/plugins` page, linked from the main dashboard and repo pages.
 - Keep `/plugins` as a single-column list of compact plugin cards with a responsive settings grid; long prompt/pattern fields may span wider rows, and help text should use compact hints instead of permanently increasing card height.
+- Keep common AI Summary settings visible and place file filters/context byte limits in a collapsed Advanced context controls section.
 - `web.New` calls `plugins.EnsureDefaults(storage)` so built-in plugin defaults are persisted.
 - Notifications are implemented as the built-in `notifications` plugin, default enabled with `title_prefix=Pulled`; do not call `pkg/notifications` directly from web, TUI, or daemon flows.
+- The Notifications plugin Test button sends a standalone OS notification using current form values without saving them.
 - Manual web and TUI pull notifications should fire through the notifications plugin even when the pull has no new changes; other plugins remain changed-only unless they opt into no-change runs.
 - Background service management supports macOS launchd and Linux user systemd (`~/.config/systemd/user/autogitpull.service`); keep CLI help, install scripts, CI release artifact names, and README install commands aligned.
+- Release installers are also updaters: validate and stage the new binary before stopping an active service, atomically replace it, refresh an existing service definition, and ensure an installed service is running afterward.
 - Linux desktop notifications depend on a graphical session and use `notify-send` actions plus `xdg-open` for clickable update links, falling back to `beeep`/D-Bus/`notify-send`/`kdialog` when clickable actions are unavailable; Linux service install/start imports desktop env vars into `systemd --user`.
 - Before finishing code changes, run `go test ./...` from `autogitpull_go`.
 - Keep project memory and docs current: update `AGENTS.md` and `autogitpull_go/README.md` when dashboard pages, plugin behavior, storage, pull flow, TUI/web/daemon alignment, or user-facing commands change.

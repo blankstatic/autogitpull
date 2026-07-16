@@ -34,6 +34,9 @@ bash -c "$(curl -fsSL https://raw.githubusercontent.com/blankstatic/autogitpull/
 
 The installer downloads the latest `autogitpull-macos-arm64` release to
 `/usr/local/bin/autogitpull`.
+Re-running it performs an update. If the launchd service is installed, its
+definition is refreshed and it is started after the atomic binary replacement;
+an active service is stopped first for a clean restart.
 
 Optional, for richer macOS notifications:
 
@@ -56,6 +59,10 @@ Install and start the Linux user `systemd` service in one step:
 ```sh
 bash -c "$(curl -fsSL https://raw.githubusercontent.com/blankstatic/autogitpull/main/tools/install_linux.sh)" -- --start-service
 ```
+
+Re-running the Linux installer also updates an existing user systemd unit and
+starts it after the atomic binary replacement. `VERSION=vX.Y.Z` installs a
+specific release on either platform.
 
 ## Build From Source
 

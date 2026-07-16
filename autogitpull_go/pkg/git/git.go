@@ -122,30 +122,42 @@ func GitHead(path string) (string, error) {
 }
 
 func GitChangedLog(path, fromRev, toRev string) (string, error) {
+	return GitChangedLogContext(context.Background(), path, fromRev, toRev)
+}
+
+func GitChangedLogContext(ctx context.Context, path, fromRev, toRev string) (string, error) {
 	if fromRev == "" || toRev == "" || fromRev == toRev {
 		return "", nil
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), DefaultPullTimeoutSec)
+	ctx, cancel := context.WithTimeout(ctx, DefaultPullTimeoutSec)
 	defer cancel()
 
 	return exc.CommandExec(ctx, DefaultPullTimeoutSec, path, "git", "--no-pager", "log", "--oneline", "--no-decorate", fromRev+".."+toRev)
 }
 
 func GitDiffStat(path, fromRev, toRev string) (string, error) {
+	return GitDiffStatContext(context.Background(), path, fromRev, toRev)
+}
+
+func GitDiffStatContext(ctx context.Context, path, fromRev, toRev string) (string, error) {
 	if fromRev == "" || toRev == "" || fromRev == toRev {
 		return "", nil
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), DefaultPullTimeoutSec)
+	ctx, cancel := context.WithTimeout(ctx, DefaultPullTimeoutSec)
 	defer cancel()
 
 	return exc.CommandExec(ctx, DefaultPullTimeoutSec, path, "git", "--no-pager", "diff", "--stat", fromRev+".."+toRev)
 }
 
 func GitChangedFiles(path, fromRev, toRev string) ([]string, error) {
+	return GitChangedFilesContext(context.Background(), path, fromRev, toRev)
+}
+
+func GitChangedFilesContext(ctx context.Context, path, fromRev, toRev string) ([]string, error) {
 	if fromRev == "" || toRev == "" || fromRev == toRev {
 		return nil, nil
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), DefaultPullTimeoutSec)
+	ctx, cancel := context.WithTimeout(ctx, DefaultPullTimeoutSec)
 	defer cancel()
 
 	output, err := exc.CommandExec(ctx, DefaultPullTimeoutSec, path, "git", "--no-pager", "diff", "--name-only", fromRev+".."+toRev)
@@ -172,6 +184,10 @@ func GitDiffPatchForFileLimited(path, fromRev, toRev, filePath string, maxBytes 
 }
 
 func GitDiffPatchForFileLimitedContext(path, fromRev, toRev, filePath string, maxBytes, contextLines int) (string, bool, error) {
+	return GitDiffPatchForFileLimitedContextWithContext(context.Background(), path, fromRev, toRev, filePath, maxBytes, contextLines)
+}
+
+func GitDiffPatchForFileLimitedContextWithContext(parent context.Context, path, fromRev, toRev, filePath string, maxBytes, contextLines int) (string, bool, error) {
 	if fromRev == "" || toRev == "" || fromRev == toRev || filePath == "" {
 		return "", false, nil
 	}
@@ -181,7 +197,7 @@ func GitDiffPatchForFileLimitedContext(path, fromRev, toRev, filePath string, ma
 	if contextLines > 200 {
 		contextLines = 200
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), DefaultPullTimeoutSec)
+	ctx, cancel := context.WithTimeout(parent, DefaultPullTimeoutSec)
 	defer cancel()
 
 	return exc.CommandExecLimited(ctx, DefaultPullTimeoutSec, path, maxBytes, "git", "--no-pager", "diff", "--find-renames", fmt.Sprintf("--unified=%d", contextLines), fromRev+".."+toRev, "--", filePath)

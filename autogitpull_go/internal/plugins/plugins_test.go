@@ -1,6 +1,7 @@
 package plugins
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -69,6 +70,23 @@ func TestNotificationsPluginAllowsManualSourcesWithoutChanges(t *testing.T) {
 				t.Fatalf("unexpected default config: %+v", def.DefaultConfig)
 			}
 		})
+	}
+}
+
+func TestNotificationsUsesCurrentSettings(t *testing.T) {
+	oldNotify := notifyURL
+	defer func() { notifyURL = oldNotify }()
+	var gotApp, gotTitle, gotBody, gotURL string
+	notifyURL = func(app, title, body, openURL string) error {
+		gotApp, gotTitle, gotBody, gotURL = app, title, body, openURL
+		return nil
+	}
+
+	if err := TestNotifications("autogitpull", map[string]string{"title_prefix": "Custom"}); err != nil {
+		t.Fatal(err)
+	}
+	if gotApp != "autogitpull" || gotTitle != "Custom: Test" || gotBody != "Notifications are working." || gotURL != "" {
+		t.Fatalf("unexpected test notification: app=%q title=%q body=%q url=%q", gotApp, gotTitle, gotBody, gotURL)
 	}
 }
 
@@ -301,6 +319,24 @@ func TestAISummaryPluginIsRegisteredDisabledByDefault(t *testing.T) {
 	}
 	if !foundPrompt || def.DefaultConfig["prompt"] == "" {
 		t.Fatalf("expected editable prompt field: %+v", def.Fields)
+	}
+}
+
+func TestAISummaryAdvancedFieldsAreSeparated(t *testing.T) {
+	def := aiSummaryPlugin()
+	advanced := map[string]bool{}
+	for _, field := range def.Fields {
+		advanced[field.Key] = field.Advanced
+	}
+	for _, key := range []string{"include_patterns", "exclude_patterns", "max_context_bytes", "max_file_diff_bytes", "diff_context_lines"} {
+		if !advanced[key] {
+			t.Fatalf("expected %s to be an advanced field", key)
+		}
+	}
+	for _, key := range []string{"url", "token", "model", "prompt", "code_detail"} {
+		if advanced[key] {
+			t.Fatalf("expected %s to remain in the main settings", key)
+		}
 	}
 }
 
@@ -652,6 +688,46 @@ func TestChatCompletionsSummaryCall(t *testing.T) {
 	}
 	if summary != "Chat completion summary." {
 		t.Fatalf("unexpected summary: %q", summary)
+	}
+}
+
+func TestAISummaryHTTPRespectsContextCancellation(t *testing.T) {
+	oldClient := aiSummaryHTTPClient
+	defer func() { aiSummaryHTTPClient = oldClient }()
+
+	requestStarted := make(chan struct{})
+	releaseHandler := make(chan struct{})
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		close(requestStarted)
+		select {
+		case <-r.Context().Done():
+		case <-releaseHandler:
+		}
+	}))
+	defer server.Close()
+	defer close(releaseHandler)
+	aiSummaryHTTPClient = server.Client()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() {
+		_, err := generateAISummaryContext(ctx, map[string]string{
+			"api_type": "responses",
+			"url":      server.URL,
+			"token":    "key",
+			"model":    "model",
+		}, "repo", "change")
+		done <- err
+	}()
+	<-requestStarted
+	cancel()
+	select {
+	case err := <-done:
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("expected context cancellation, got %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("AI request did not stop after cancellation")
 	}
 }
 

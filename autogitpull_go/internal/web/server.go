@@ -2,6 +2,7 @@ package web
 
 import (
 	"bytes"
+	"context"
 	_ "embed"
 	"errors"
 	"fmt"
@@ -37,10 +38,24 @@ const eventFilterAll = "all"
 var appIcon []byte
 
 type Server struct {
-	store   *db.Store
-	storage *config.StorageManager
-	mux     *http.ServeMux
+	store          *db.Store
+	storage        *config.StorageManager
+	mux            *http.ServeMux
+	httpServer     *http.Server
+	requestWG      sync.WaitGroup
+	bulkWG         sync.WaitGroup
+	pluginTasks    chan func()
+	pluginWG       sync.WaitGroup
+	pluginCtx      context.Context
+	cancelPlugins  context.CancelFunc
+	lifecycleMu    sync.Mutex
+	acceptTasks    bool
+	acceptRequests bool
+	shutdownOnce   sync.Once
 }
+
+const webPluginWorkers = 4
+const webPluginQueueSize = 64
 
 type RepoCard struct {
 	Repo       config.RepoInfo
@@ -165,21 +180,100 @@ func GetDaemonStatus() DaemonStatus {
 func New(store *db.Store, storage *config.StorageManager) *Server {
 	plugins.EnsureDefaults(storage)
 	s := &Server{
-		store:   store,
-		storage: storage,
-		mux:     http.NewServeMux(),
+		store:          store,
+		storage:        storage,
+		mux:            http.NewServeMux(),
+		pluginTasks:    make(chan func(), webPluginQueueSize),
+		acceptTasks:    true,
+		acceptRequests: true,
 	}
+	s.pluginCtx, s.cancelPlugins = context.WithCancel(context.Background())
 	s.routes()
+	for range webPluginWorkers {
+		s.pluginWG.Add(1)
+		go func() {
+			defer s.pluginWG.Done()
+			for task := range s.pluginTasks {
+				task()
+			}
+		}()
+	}
 	return s
 }
 
 func (s *Server) Start() {
+	s.lifecycleMu.Lock()
+	if s.httpServer != nil {
+		s.lifecycleMu.Unlock()
+		return
+	}
+	s.httpServer = &http.Server{Addr: Addr, Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		s.lifecycleMu.Lock()
+		if !s.acceptRequests {
+			s.lifecycleMu.Unlock()
+			http.Error(w, "server shutting down", http.StatusServiceUnavailable)
+			return
+		}
+		s.requestWG.Add(1)
+		s.lifecycleMu.Unlock()
+		defer s.requestWG.Done()
+		s.mux.ServeHTTP(w, r)
+	})}
+	httpServer := s.httpServer
+	s.lifecycleMu.Unlock()
 	go func() {
 		slog.Info("web dashboard started", slog.String("addr", Addr))
-		if err := http.ListenAndServe(Addr, s.mux); err != nil && err != http.ErrServerClosed {
+		if err := httpServer.ListenAndServe(); err != nil && err != http.ErrServerClosed {
 			slog.Error("web dashboard failed", slog.String("err", err.Error()))
 		}
 	}()
+}
+
+func (s *Server) Shutdown(ctx context.Context) error {
+	var shutdownErr error
+	s.shutdownOnce.Do(func() {
+		stopCancelWatch := context.AfterFunc(ctx, s.cancelPlugins)
+		defer stopCancelWatch()
+		s.lifecycleMu.Lock()
+		httpServer := s.httpServer
+		s.lifecycleMu.Unlock()
+		if httpServer != nil {
+			shutdownErr = httpServer.Shutdown(ctx)
+		}
+		s.lifecycleMu.Lock()
+		s.acceptRequests = false
+		s.lifecycleMu.Unlock()
+		s.requestWG.Wait()
+		s.bulkWG.Wait()
+		s.lifecycleMu.Lock()
+		s.acceptTasks = false
+		close(s.pluginTasks)
+		s.lifecycleMu.Unlock()
+		if !waitGroupWithContext(ctx, &s.pluginWG) {
+			s.cancelPlugins()
+			s.pluginWG.Wait()
+		} else {
+			s.cancelPlugins()
+		}
+		if shutdownErr == nil && ctx.Err() != nil {
+			shutdownErr = ctx.Err()
+		}
+	})
+	return shutdownErr
+}
+
+func waitGroupWithContext(ctx context.Context, wg *sync.WaitGroup) bool {
+	done := make(chan struct{})
+	go func() {
+		wg.Wait()
+		close(done)
+	}()
+	select {
+	case <-done:
+		return true
+	case <-ctx.Done():
+		return false
+	}
 }
 
 func (s *Server) routes() {
@@ -201,6 +295,7 @@ func (s *Server) routes() {
 	s.mux.HandleFunc("/plugins/save", s.savePlugin)
 	s.mux.HandleFunc("/plugins/remove-repo", s.removePluginRepo)
 	s.mux.HandleFunc("/plugins/test-ai-summary", s.testAISummaryPlugin)
+	s.mux.HandleFunc("/plugins/test-notifications", s.testNotificationsPlugin)
 	s.mux.HandleFunc("/favicon.ico", s.icon)
 	s.mux.HandleFunc("/assets/app-icon.png", s.icon)
 }
@@ -717,6 +812,25 @@ func (s *Server) testAISummaryPlugin(w http.ResponseWriter, r *http.Request) {
 	http.Redirect(w, r, flashURL("/plugins", "AI summary test: "+firstLine(result), "success"), http.StatusSeeOther)
 }
 
+func (s *Server) testNotificationsPlugin(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	if err := r.ParseForm(); err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+	cfg := map[string]string{
+		"title_prefix": strings.TrimSpace(r.FormValue("config_title_prefix")),
+	}
+	if err := plugins.TestNotifications(config.AppName, cfg); err != nil {
+		http.Redirect(w, r, flashURL("/plugins", "Notification test failed: "+err.Error(), "error"), http.StatusSeeOther)
+		return
+	}
+	http.Redirect(w, r, flashURL("/plugins", "Test notification sent", "success"), http.StatusSeeOther)
+}
+
 func (s *Server) bulkRepos(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
@@ -786,7 +900,9 @@ func (s *Server) pullReposAsync(repos []config.RepoInfo) int {
 	if len(pending) == 0 {
 		return 0
 	}
+	s.bulkWG.Add(1)
 	go func() {
+		defer s.bulkWG.Done()
 		sem := make(chan struct{}, maxConcurrentPulls)
 		var wg sync.WaitGroup
 		for i := range pending {
@@ -822,6 +938,7 @@ func (s *Server) pullRepoRecord(repo *config.RepoInfo) {
 	result, beforeRev, afterRev, pullErr := performPull(repo)
 	if err := s.store.FinishUpdateWithRevisions(updateID, result, pullErr, beforeRev, afterRev); err != nil {
 		slog.Error("failed to record bulk pull result", slog.String("repo", repo.Name), slog.String("err", err.Error()))
+		return
 	}
 	if pullErr == nil {
 		_ = s.storage.UpdateLastSync(repo.Path)
@@ -1126,6 +1243,7 @@ func (s *Server) runPluginsAfterChange(repo *config.RepoInfo, updateID int64, no
 	}
 	openURL := "http://localhost" + Addr + updateURL(update.ID)
 	plugins.RunAfterChange(plugins.Context{
+		Ctx:       s.pluginCtx,
 		Repo:      repo,
 		Update:    update,
 		Store:     s.store,
@@ -1143,7 +1261,19 @@ func (s *Server) runPluginsAfterChangeAsync(repo *config.RepoInfo, updateID int6
 		return
 	}
 	repoCopy := *repo
-	go s.runPluginsAfterChange(&repoCopy, updateID, notify, source)
+	if !s.enqueuePluginTask(func() { s.runPluginsAfterChange(&repoCopy, updateID, notify, source) }) {
+		slog.Warn("skipping plugin task during web shutdown", slog.String("repo", repo.Name), slog.Int64("update_id", updateID))
+	}
+}
+
+func (s *Server) enqueuePluginTask(task func()) bool {
+	s.lifecycleMu.Lock()
+	defer s.lifecycleMu.Unlock()
+	if !s.acceptTasks {
+		return false
+	}
+	s.pluginTasks <- task
+	return true
 }
 
 func pullFlashType(pullErr error) string {
@@ -1718,6 +1848,12 @@ var baseCSS = template.CSS(`
 	.plugin-enable { flex: 0 0 auto; padding-top: 1px; }
 	.plugin-card-body { padding: 14px 16px 16px; }
 	.plugin-settings { display: grid; grid-template-columns: repeat(12, minmax(0, 1fr)); gap: 12px; margin-top: 14px; }
+	.plugin-section-title { margin-top: 14px; color: var(--text); font-size: 12px; font-weight: 700; }
+	.plugin-advanced { margin-top: 14px; border: 1px solid var(--border-muted); border-radius: 9px; background: var(--subtle); }
+	.plugin-advanced > summary { display: flex; justify-content: space-between; gap: 12px; padding: 10px 12px; cursor: pointer; color: var(--text); font-size: 12px; font-weight: 700; }
+	.plugin-advanced > summary span { color: var(--muted); font-weight: 500; }
+	.plugin-advanced[open] > summary { border-bottom: 1px solid var(--border-muted); }
+	.plugin-advanced .plugin-settings { margin: 0; padding: 12px; background: #fff; border-radius: 0 0 9px 9px; }
 	.plugin-field { display: grid; grid-column: span 4; gap: 6px; min-width: 0; margin: 0; }
 	.plugin-field-label { display: flex; align-items: center; gap: 5px; min-height: 20px; color: var(--muted); font-size: 11px; font-weight: 650; }
 	.plugin-help { display: inline-flex; align-items: center; justify-content: center; width: 16px; height: 16px; border: 1px solid var(--border); border-radius: 50%; color: var(--muted); font-size: 10px; cursor: help; }
@@ -1829,7 +1965,25 @@ var templateFuncs = template.FuncMap{
 	"humanDuration": humanDurationUnit,
 	"join":          strings.Join,
 	"humanNumber":   humanizeNumber,
-	"updateURL":     updateURL,
+	"basicFields": func(fields []plugins.Field) []plugins.Field {
+		out := make([]plugins.Field, 0, len(fields))
+		for _, field := range fields {
+			if !field.Advanced {
+				out = append(out, field)
+			}
+		}
+		return out
+	},
+	"advancedFields": func(fields []plugins.Field) []plugins.Field {
+		out := make([]plugins.Field, 0, len(fields))
+		for _, field := range fields {
+			if field.Advanced {
+				out = append(out, field)
+			}
+		}
+		return out
+	},
+	"updateURL": updateURL,
 	"shortHash": func(hash string) string {
 		if len(hash) <= 12 {
 			return hash
@@ -1986,11 +2140,12 @@ var pluginsTemplate = template.Must(template.New("plugins").Funcs(templateFuncs)
 	<input type="hidden" name="id" value="{{.ID}}">
 	<div class="plugin-card-head"><div><div class="plugin-card-title"><strong>{{.Name}}</strong>{{if .Enabled}}<span class="badge success">enabled</span>{{else}}<span class="badge paused">disabled</span>{{end}}</div><div class="plugin-description">{{.Description}}</div></div><label class="select-all plugin-enable"><input type="checkbox" name="enabled" value="1" {{if .Enabled}}checked{{end}}> Enabled</label></div>
 	<div class="plugin-card-body"><div class="plugin-repos">Selected repos: {{if .SelectedRepos}}<span class="plugin-repo-list">{{range .SelectedRepos}}<span class="plugin-repo-chip"><span class="plugin-repo-path" title="{{.}}">{{compactPath .}}</span><button class="chip-remove" type="submit" formaction="/plugins/remove-repo" formmethod="post" name="repo" value="{{.}}" title="Remove selected repo" aria-label="Remove selected repo">x</button></span>{{end}}</span>{{else}}none{{end}}</div>
-	<div class="plugin-settings">{{range .Fields}}{{$field := .}}<label class="plugin-field plugin-field-{{.Key}}"><span class="plugin-field-label">{{.Label}}{{if .Help}}<span class="plugin-help" title="{{.Help}}" aria-label="{{.Help}}">?</span>{{end}}</span>{{if eq .Type "select"}}<select class="input" name="config_{{.Key}}">{{range .Options}}<option value="{{.Value}}" {{if eq (configValue $plugin.Config $field.Key) .Value}}selected{{end}}>{{.Label}}</option>{{end}}</select>{{else if eq .Type "textarea"}}<textarea class="input" name="config_{{.Key}}">{{configValue $plugin.Config .Key}}</textarea>{{else}}<input class="input" type="{{inputType .Type}}" name="config_{{.Key}}" value="{{configValue $plugin.Config .Key}}">{{end}}</label>{{end}}</div>
-	<div class="plugin-actions"><button class="button primary" type="submit">Save</button>{{if eq .ID "ai_summary"}}<button class="button" type="submit" formaction="/plugins/test-ai-summary">Test connection</button>{{end}}</div></div>
+	<div class="plugin-section-title">Settings</div><div class="plugin-settings">{{range basicFields .Fields}}{{$field := .}}<label class="plugin-field plugin-field-{{.Key}}"><span class="plugin-field-label">{{.Label}}{{if .Help}}<span class="plugin-help" title="{{.Help}}" aria-label="{{.Help}}">?</span>{{end}}</span>{{if eq .Type "select"}}<select class="input" name="config_{{.Key}}">{{range .Options}}<option value="{{.Value}}" {{if eq (configValue $plugin.Config $field.Key) .Value}}selected{{end}}>{{.Label}}</option>{{end}}</select>{{else if eq .Type "textarea"}}<textarea class="input" name="config_{{.Key}}">{{configValue $plugin.Config .Key}}</textarea>{{else}}<input class="input" type="{{inputType .Type}}" name="config_{{.Key}}" value="{{configValue $plugin.Config .Key}}">{{end}}</label>{{end}}</div>
+	{{with advancedFields .Fields}}<details class="plugin-advanced"><summary>Advanced context controls <span>File filters and size limits</span></summary><div class="plugin-settings">{{range .}}{{$field := .}}<label class="plugin-field plugin-field-{{.Key}}"><span class="plugin-field-label">{{.Label}}{{if .Help}}<span class="plugin-help" title="{{.Help}}" aria-label="{{.Help}}">?</span>{{end}}</span>{{if eq .Type "select"}}<select class="input" name="config_{{.Key}}">{{range .Options}}<option value="{{.Value}}" {{if eq (configValue $plugin.Config $field.Key) .Value}}selected{{end}}>{{.Label}}</option>{{end}}</select>{{else}}<input class="input" type="{{inputType .Type}}" name="config_{{.Key}}" value="{{configValue $plugin.Config .Key}}">{{end}}</label>{{end}}</div></details>{{end}}
+	<div class="plugin-actions"><button class="button primary" type="submit">Save</button>{{if eq .ID "ai_summary"}}<button class="button" type="submit" formaction="/plugins/test-ai-summary">Test connection</button>{{else if eq .ID "notifications"}}<button class="button" type="submit" formaction="/plugins/test-notifications">Send test notification</button>{{end}}</div></div>
 	</form>{{end}}</div>{{else}}<div class="empty">No plugins available.</div>{{end}}
 </div></section>
-</main><script>document.querySelectorAll('form').forEach(form => form.addEventListener('submit', () => { const b = document.activeElement; if (b && b.tagName === 'BUTTON') b.textContent = b.formAction && b.formAction.includes('/plugins/test-ai-summary') ? 'Testing...' : 'Saving...'; }));</script></body></html>`))
+</main><script>document.querySelectorAll('form').forEach(form => form.addEventListener('submit', () => { const b = document.activeElement; if (b && b.tagName === 'BUTTON') b.textContent = b.formAction && b.formAction.includes('/plugins/test-') ? 'Testing...' : 'Saving...'; }));</script></body></html>`))
 
 var updateTemplate = template.Must(template.New("update").Funcs(templateFuncs).Parse(`
 <!doctype html><html><head><meta charset="utf-8"><title>Change {{.Update.ID}} - autogitpull</title><link rel="icon" type="image/png" href="/favicon.ico"><style>` + string(baseCSS) + `</style></head>

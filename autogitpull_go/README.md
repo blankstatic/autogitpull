@@ -36,6 +36,9 @@ bash -c "$(curl -fsSL https://raw.githubusercontent.com/blankstatic/autogitpull/
 
 The installer downloads the latest `autogitpull-macos-arm64` release to
 `/usr/local/bin/autogitpull`.
+Re-running it performs an update. If the launchd service is installed, its
+definition is refreshed and it is started after the atomic binary replacement;
+an active service is stopped first for a clean restart.
 
 Optional, for richer macOS notifications:
 
@@ -58,6 +61,10 @@ Install and start the Linux user `systemd` service in one step:
 ```sh
 bash -c "$(curl -fsSL https://raw.githubusercontent.com/blankstatic/autogitpull/main/tools/install_linux.sh)" -- --start-service
 ```
+
+Re-running the Linux installer also updates an existing user systemd unit and
+starts it after the atomic binary replacement. `VERSION=vX.Y.Z` installs a
+specific release on either platform.
 
 ## Build From Source
 
@@ -278,10 +285,16 @@ By default, plugins run only when the saved update has `changed = true`. A plugi
 can opt into no-change runs. The built-in Notifications plugin is enabled by
 default with `title_prefix=Pulled` and also runs for manual web and TUI pulls
 that complete without new changes.
+Its plugin card has a test button that sends a standalone OS notification using
+the current title prefix without saving the form.
 Web and daemon after-pull plugin processing runs after the update is saved and
 does not block pull completion, so slow providers such as AI summary APIs cannot
-stall the pull loop. Daemon shutdown waits for those async plugin tasks before
-closing the shared database.
+normally stall the pull loop. Web and daemon use bounded plugin worker queues
+with backpressure instead of unbounded goroutines. Shutdown stops accepting HTTP
+work, waits for active handlers and web bulk pulls, and drains both plugin queues.
+Web and daemon shutdown use one shared deadline. If it expires, queued plugin
+work is skipped and running plugin HTTP requests and Git diff commands receive
+context cancellation before the shared database is closed.
 
 The built-in AI Summary plugin is disabled by default. When enabled, it uses the
 saved `before_rev` and `after_rev` range to collect a compact commit log and
@@ -289,6 +302,8 @@ saved `before_rev` and `after_rev` range to collect a compact commit log and
 stores the generated summary in plugin results.
 Configure a provider name, API key, model, prompt, API type, and API URL on the
 plugin settings page. Plugin cards use a compact responsive settings grid;
+AI Summary keeps connection, model, prompt, and code-detail choices visible while
+file filters and context limits live under a collapsed Advanced context controls section.
 long prompts and file patterns receive wider rows, while field explanations are
 available from the `?` hints without permanently expanding the page. Any OpenAI-compatible provider can use either Responses API
 or Chat Completions by changing the API type and URL. Use the AI Summary `Test`

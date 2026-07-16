@@ -1,6 +1,7 @@
 package plugins
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -27,11 +28,12 @@ var repoScopeField = Field{Key: RepoScopeConfigKey, Label: "Repos", Type: "selec
 }}
 
 type Field struct {
-	Key     string
-	Label   string
-	Type    string
-	Help    string
-	Options []FieldOption
+	Key      string
+	Label    string
+	Type     string
+	Help     string
+	Advanced bool
+	Options  []FieldOption
 }
 
 type FieldOption struct {
@@ -59,6 +61,7 @@ type View struct {
 }
 
 type Context struct {
+	Ctx       context.Context
 	Repo      *config.RepoInfo
 	Update    db.Update
 	Store     *db.Store
@@ -143,10 +146,17 @@ func EnsureDefaults(storage *config.StorageManager) {
 }
 
 func RunAfterChange(ctx Context, states map[string]config.PluginState) {
+	if ctx.Ctx == nil {
+		ctx.Ctx = context.Background()
+	}
 	if ctx.Logger == nil {
 		ctx.Logger = slog.Default()
 	}
 	for _, view := range Views(states) {
+		if err := ctx.Ctx.Err(); err != nil {
+			ctx.Logger.Warn("plugin pipeline cancelled", slog.String("err", err.Error()))
+			return
+		}
 		if !ctx.Update.Changed && !view.RunOnNoChange {
 			continue
 		}
@@ -169,6 +179,9 @@ func RunAfterChange(ctx Context, states map[string]config.PluginState) {
 }
 
 func RunOne(id string, ctx Context, states map[string]config.PluginState) error {
+	if ctx.Ctx == nil {
+		ctx.Ctx = context.Background()
+	}
 	if ctx.Logger == nil {
 		ctx.Logger = slog.Default()
 	}
