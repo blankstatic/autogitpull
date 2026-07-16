@@ -20,7 +20,7 @@ if [[ "$ARCH" != "arm64" ]]; then
 fi
 
 if [ "$VERSION" = "latest" ]; then
-    LATEST_TAG=$(curl -s "https://api.github.com/repos/$REPO_OWNER/$REPO_NAME/releases/latest" | grep '"tag_name":' | sed -E 's/.*"([^"]+)".*/\1/')
+    LATEST_TAG=$(curl -s --retry 3 --retry-delay 2 "https://api.github.com/repos/$REPO_OWNER/$REPO_NAME/releases/latest" | grep '"tag_name":' | sed -E 's/.*"([^"]+)".*/\1/')
 
     if [ -z "$LATEST_TAG" ]; then
         echo "❌ Не удалось определить последнюю версию"
@@ -35,7 +35,7 @@ fi
 
 echo "📥 Загрузка $BINARY_NAME из $DOWNLOAD_URL..."
 
-curl -L -o "/tmp/$BINARY_NAME" "$DOWNLOAD_URL"
+curl -L --retry 3 --retry-delay 2 -o "/tmp/$BINARY_NAME" "$DOWNLOAD_URL"
 
 if [ $? -ne 0 ]; then
     echo "❌ Ошибка при загрузке файла"
@@ -69,8 +69,8 @@ if command -v terminal-notifier >/dev/null 2>&1; then
     NOTIFIER_TMP_DIR=$(mktemp -d "${TMPDIR:-/tmp}/autogitpull-notifier.XXXXXX")
     trap 'rm -rf "$NOTIFIER_TMP_DIR"' EXIT
 
-    if curl -fsSL "$RAW_BASE_URL/tools/featurehub-build.sh" -o "$NOTIFIER_TMP_DIR/featurehub-build.sh" \
-        && curl -fsSL "$RAW_BASE_URL/tools/featurehub.icns" -o "$NOTIFIER_TMP_DIR/featurehub.icns" \
+    if curl -fsSL --retry 3 --retry-delay 2 "$RAW_BASE_URL/tools/featurehub-build.sh" -o "$NOTIFIER_TMP_DIR/featurehub-build.sh" \
+        && curl -fsSL --retry 3 --retry-delay 2 "$RAW_BASE_URL/tools/featurehub.icns" -o "$NOTIFIER_TMP_DIR/featurehub.icns" \
         && chmod +x "$NOTIFIER_TMP_DIR/featurehub-build.sh" \
         && "$NOTIFIER_TMP_DIR/featurehub-build.sh" --no-notify; then
         echo "✅ Feature Hub notifier установлен"

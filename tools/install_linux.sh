@@ -64,7 +64,7 @@ case "$(uname -m)" in
 esac
 
 if [[ "$VERSION" == "latest" ]]; then
-    LATEST_TAG="$(curl -fsSL "https://api.github.com/repos/$REPO_OWNER/$REPO_NAME/releases/latest" | sed -n 's/.*"tag_name": *"\([^"]*\)".*/\1/p' | head -n 1)"
+    LATEST_TAG="$(curl -fsSL --retry 3 --retry-delay 2 "https://api.github.com/repos/$REPO_OWNER/$REPO_NAME/releases/latest" | sed -n 's/.*"tag_name": *"\([^"]*\)".*/\1/p' | head -n 1)"
     if [[ -z "$LATEST_TAG" ]]; then
         echo "Failed to determine latest release" >&2
         exit 1
@@ -78,7 +78,7 @@ TMP_FILE="$(mktemp "${TMPDIR:-/tmp}/$BINARY_NAME.XXXXXX")"
 trap 'rm -f "$TMP_FILE"' EXIT
 
 echo "Downloading $ASSET_NAME from $VERSION..."
-curl -fL -o "$TMP_FILE" "$DOWNLOAD_URL"
+curl -fL --retry 3 --retry-delay 2 -o "$TMP_FILE" "$DOWNLOAD_URL"
 chmod +x "$TMP_FILE"
 
 echo "Installing to $TARGET_DIR/$BINARY_NAME..."
