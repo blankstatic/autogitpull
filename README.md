@@ -291,10 +291,16 @@ This avoids pulling into feature branches or overwriting active local work.
 
 ## Notifications
 
-On macOS, `autogitpull` sends notifications for registration actions and for
-successful pulls that bring changes.
+Pull notifications are handled by the built-in Notifications plugin. It sends
+notifications for changed daemon/web/TUI pulls, and also for successful manual
+web/TUI pulls even when there are no new changes.
 
-By default it looks for:
+On Linux, pull notifications use the desktop notification stack. Clickable
+change links are attempted through `notify-send` actions plus `xdg-open`;
+otherwise `autogitpull` falls back to a normal `beeep` notification through
+session D-Bus, `notify-send`, or `kdialog`. A graphical user session is required.
+
+On macOS, by default it looks for:
 
 ```sh
 ~/Applications/FeatureHubLauncher.app
@@ -322,10 +328,12 @@ autogitpull register --silently ~/work/project
 
 ## Release Artifacts
 
-GitHub Actions builds the macOS ARM64 binary:
+GitHub Actions builds release binaries:
 
 ```text
 autogitpull-macos-arm64
+autogitpull-linux-amd64
+autogitpull-linux-arm64
 ```
 
-The installer expects the release asset to use that exact name.
+The installers expect the release assets to use those exact names.

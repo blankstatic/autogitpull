@@ -369,7 +369,12 @@ notifications even when the local `HEAD` did not change. Those events are not
 treated as AI-summary code changes because there is no local revision range to
 summarize.
 
-By default it looks for:
+On Linux, pull notifications use the desktop notification stack. Clickable
+change links are attempted through `notify-send` actions plus `xdg-open`;
+otherwise `autogitpull` falls back to a normal `beeep` notification through
+session D-Bus, `notify-send`, or `kdialog`. A graphical user session is required.
+
+On macOS, by default it looks for:
 
 ```sh
 ~/Applications/FeatureHubLauncher.app
@@ -397,12 +402,14 @@ autogitpull register --silently ~/work/project
 
 ## Release Artifacts
 
-GitHub Actions builds the macOS ARM64 binary:
+GitHub Actions builds release binaries:
 
 ```text
 autogitpull-macos-arm64
+autogitpull-linux-amd64
+autogitpull-linux-arm64
 ```
 
-The installer expects the release asset to use that exact name.
+The installers expect the release assets to use those exact names.
 
 <test commit>
