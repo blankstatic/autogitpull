@@ -3,6 +3,7 @@ package plugins
 import (
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"path/filepath"
@@ -451,7 +452,7 @@ func TestAISummaryInputAndContextTruncation(t *testing.T) {
 
 	large := strings.Repeat("x", maxAIChangeContextBytes+10)
 	truncated := truncateAIChangeContext(large)
-	if len(truncated) <= maxAIChangeContextBytes || !strings.Contains(truncated, "[truncated:") {
+	if len(truncated) != maxAIChangeContextBytes || !strings.Contains(truncated, "[truncated:") {
 		t.Fatalf("expected truncation marker, got len=%d", len(truncated))
 	}
 }
@@ -471,13 +472,153 @@ func TestBuildAISummaryChangeContextSelectsFileDiffsWithinBudget(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	for _, want := range []string{"Commits and file stats", "Diff summary", "File diff: small.go", "+small change", "Omitted files", "large.go"} {
+	for _, want := range []string{"Commits", "Diff summary", "File diff: small.go", "+small change", "File diff: large.go", "exceeded available budget"} {
 		if !strings.Contains(context, want) {
 			t.Fatalf("expected context to contain %q:\n%s", want, context)
 		}
 	}
-	if strings.Contains(context, "+large change") {
-		t.Fatalf("expected large diff to be omitted")
+	if len(context) > maxAIChangeContextBytes {
+		t.Fatalf("context exceeded limit: %d", len(context))
+	}
+}
+
+func TestAISummaryLargeMetadataStillIncludesCode(t *testing.T) {
+	context, err := buildAISummaryChangeContextWithConfig(
+		strings.Repeat("commit metadata\n", 1000),
+		strings.Repeat("file.go | 1 +\n", 1000),
+		[]string{"file.go"},
+		func(string) (string, error) { return "+important code", nil },
+		map[string]string{"code_detail": "limited", "max_context_bytes": "1000", "max_file_diff_bytes": "200"},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(context, "File diff: file.go") || !strings.Contains(context, "+important code") {
+		t.Fatalf("large metadata displaced all code:\n%s", context)
+	}
+	if len(context) > 1000 {
+		t.Fatalf("context exceeded limit: %d", len(context))
+	}
+}
+
+func TestBuildAISummaryChangeContextRespectsCodeControls(t *testing.T) {
+	called := []string{}
+	context, err := buildAISummaryChangeContextWithConfig(
+		"abc123 change",
+		"main.go | 10 +\n.env | 1 +",
+		[]string{"main.go", ".env", "README.md"},
+		func(filePath string) (string, error) {
+			called = append(called, filePath)
+			return strings.Repeat("+code\n", 20), nil
+		},
+		map[string]string{
+			"code_detail":         "limited",
+			"include_patterns":    "**/*.go,.env",
+			"exclude_patterns":    ".env*",
+			"max_file_diff_bytes": "80",
+		},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(called) != 1 || called[0] != "main.go" {
+		t.Fatalf("unexpected files read for diff: %v", called)
+	}
+	for _, want := range []string{"File diff: main.go", "file diff exceeded per-file limit", ".env — matched exclude patterns", "README.md — not matched by include patterns"} {
+		if !strings.Contains(context, want) {
+			t.Fatalf("expected context to contain %q:\n%s", want, context)
+		}
+	}
+}
+
+func TestBuildAISummaryChangeContextMetadataOnlyDoesNotReadDiffs(t *testing.T) {
+	context, err := buildAISummaryChangeContextWithConfig("change", "file.go | 1 +", []string{"file.go"}, func(string) (string, error) {
+		t.Fatal("metadata-only mode must not read file diffs")
+		return "", nil
+	}, map[string]string{"code_detail": "none"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(context, "file.go — code sending disabled") {
+		t.Fatalf("expected omission reason: %s", context)
+	}
+}
+
+func TestAISummaryContextStrictlyRespectsTotalLimit(t *testing.T) {
+	files := make([]string, 200)
+	for i := range files {
+		files[i] = fmt.Sprintf("excluded/file-%03d.go", i)
+	}
+	context, err := buildAISummaryChangeContextWithConfig("change", "stats", files, func(string) (string, error) {
+		t.Fatal("excluded files must not be read")
+		return "", nil
+	}, map[string]string{
+		"code_detail":       "limited",
+		"exclude_patterns":  "excluded/**",
+		"max_context_bytes": "300",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(context) > 300 {
+		t.Fatalf("context exceeds configured limit: %d", len(context))
+	}
+}
+
+func TestAISummaryGlobPatterns(t *testing.T) {
+	tests := []struct {
+		pattern string
+		file    string
+		want    bool
+	}{
+		{"**/*.go", "main.go", true},
+		{"**/*.go", "internal/web/server.go", true},
+		{"docs/**", "docs/nested/readme.md", true},
+		{"**/foo/*.go", "a/foo/direct.go", true},
+		{"**/foo/*.go", "a/foo/nested/not-direct.go", false},
+		{"vendor/**", "internal/vendor/pkg/file.go", false},
+		{"документы/**", "документы/описание.md", true},
+	}
+	for _, tt := range tests {
+		if got := matchesAnyPattern(tt.file, tt.pattern); got != tt.want {
+			t.Errorf("pattern %q file %q: got %v, want %v", tt.pattern, tt.file, got, tt.want)
+		}
+	}
+}
+
+func TestAISummaryUnknownCodeDetailIsLimited(t *testing.T) {
+	context, err := buildAISummaryChangeContextWithConfig("change", "stats", []string{"file.go"}, func(string) (string, error) {
+		return strings.Repeat("x", 200), nil
+	}, map[string]string{"code_detail": "unexpected", "max_file_diff_bytes": "80"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(context, "file diff exceeded per-file limit") {
+		t.Fatalf("unknown mode should fail safely to limited mode: %s", context)
+	}
+}
+
+func TestValidateAISummaryConfig(t *testing.T) {
+	valid := map[string]string{
+		"code_detail":         "limited",
+		"max_context_bytes":   "120000",
+		"max_file_diff_bytes": "20000",
+		"diff_context_lines":  "20",
+	}
+	if err := validateAISummaryConfig(valid); err != nil {
+		t.Fatalf("valid config rejected: %v", err)
+	}
+	for name, cfg := range map[string]map[string]string{
+		"unknown mode":      {"code_detail": "everything", "max_context_bytes": "120000", "max_file_diff_bytes": "20000"},
+		"huge context":      {"code_detail": "limited", "max_context_bytes": "999999999", "max_file_diff_bytes": "20000"},
+		"file over context": {"code_detail": "limited", "max_context_bytes": "1000", "max_file_diff_bytes": "2000"},
+		"bad context lines": {"code_detail": "limited", "max_context_bytes": "120000", "max_file_diff_bytes": "20000", "diff_context_lines": "500"},
+	} {
+		t.Run(name, func(t *testing.T) {
+			if err := validateAISummaryConfig(cfg); err == nil {
+				t.Fatal("invalid config was accepted")
+			}
+		})
 	}
 }
 

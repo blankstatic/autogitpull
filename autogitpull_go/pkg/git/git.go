@@ -2,6 +2,7 @@ package git
 
 import (
 	"context"
+	"fmt"
 	"net/url"
 	"path/filepath"
 	"strings"
@@ -127,7 +128,7 @@ func GitChangedLog(path, fromRev, toRev string) (string, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), DefaultPullTimeoutSec)
 	defer cancel()
 
-	return exc.CommandExec(ctx, DefaultPullTimeoutSec, path, "git", "--no-pager", "log", "--stat", "--oneline", fromRev+".."+toRev)
+	return exc.CommandExec(ctx, DefaultPullTimeoutSec, path, "git", "--no-pager", "log", "--oneline", "--no-decorate", fromRev+".."+toRev)
 }
 
 func GitDiffStat(path, fromRev, toRev string) (string, error) {
@@ -162,13 +163,28 @@ func GitChangedFiles(path, fromRev, toRev string) ([]string, error) {
 }
 
 func GitDiffPatchForFile(path, fromRev, toRev, filePath string) (string, error) {
+	output, _, err := GitDiffPatchForFileLimited(path, fromRev, toRev, filePath, 0)
+	return output, err
+}
+
+func GitDiffPatchForFileLimited(path, fromRev, toRev, filePath string, maxBytes int) (string, bool, error) {
+	return GitDiffPatchForFileLimitedContext(path, fromRev, toRev, filePath, maxBytes, 80)
+}
+
+func GitDiffPatchForFileLimitedContext(path, fromRev, toRev, filePath string, maxBytes, contextLines int) (string, bool, error) {
 	if fromRev == "" || toRev == "" || fromRev == toRev || filePath == "" {
-		return "", nil
+		return "", false, nil
+	}
+	if contextLines < 0 {
+		contextLines = 0
+	}
+	if contextLines > 200 {
+		contextLines = 200
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), DefaultPullTimeoutSec)
 	defer cancel()
 
-	return exc.CommandExec(ctx, DefaultPullTimeoutSec, path, "git", "--no-pager", "diff", "--find-renames", "--unified=80", fromRev+".."+toRev, "--", filePath)
+	return exc.CommandExecLimited(ctx, DefaultPullTimeoutSec, path, maxBytes, "git", "--no-pager", "diff", "--find-renames", fmt.Sprintf("--unified=%d", contextLines), fromRev+".."+toRev, "--", filePath)
 }
 
 func GitGetUncommitedChanges(path string) (string, error) {

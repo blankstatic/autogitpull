@@ -284,20 +284,33 @@ stall the pull loop. Daemon shutdown waits for those async plugin tasks before
 closing the shared database.
 
 The built-in AI Summary plugin is disabled by default. When enabled, it uses the
-saved `before_rev` and `after_rev` range to collect `git log --stat` and
+saved `before_rev` and `after_rev` range to collect a compact commit log and
 `git diff --stat` metadata plus selected per-file unified code diffs, then
 stores the generated summary in plugin results.
 Configure a provider name, API key, model, prompt, API type, and API URL on the
-plugin settings page. Any OpenAI-compatible provider can use either Responses API
+plugin settings page. Plugin cards use a compact responsive settings grid;
+long prompts and file patterns receive wider rows, while field explanations are
+available from the `?` hints without permanently expanding the page. Any OpenAI-compatible provider can use either Responses API
 or Chat Completions by changing the API type and URL. Use the AI Summary `Test`
-button on the plugin settings page to send `hello` and verify the configured
-provider response. API URL, API key, and model must be filled before the plugin
+button on the plugin settings page to send `hello` and verify the values currently
+shown in the form, including unsaved edits; testing does not save them. API URL,
+API key, and model must be filled before the plugin
 will call a provider. The configured prompt is sent as the system
-prompt/instructions. The user input is the repository name plus `git log --stat`
+prompt/instructions. The user input is the repository name plus a compact commit log,
 metadata, `git diff --stat`, and a unified code diff for the saved
 `before_rev..after_rev` range. For large changes, metadata is kept first, file
-diffs are added until the context budget is exhausted, and omitted files are
-listed explicitly. Each generated summary is stored as a separate plugin result,
+metadata uses a bounded part of the request so code retains its own budget, diffs
+are added until the context budget is exhausted, and omitted files are
+listed explicitly. The plugin settings control whether code diffs are disabled,
+limited per file, or sent in full; optional include/exclude patterns control which
+files are eligible. Common secret, dependency, build, and lock-file patterns are
+excluded by default. Total-context and per-file byte limits are editable, and the
+input preview states why each excluded file was omitted. Values are bounded to
+safe ranges (256–2000000 bytes total and at least 64 bytes per file). Git diff
+output is capped while it is read, so a very large changed file cannot cause
+unbounded memory use. The context-around-changes setting controls how many
+unchanged lines surround each diff block (3, 10, 20, 40, or 80; default 20),
+trading local detail for coverage of more files. Each generated summary is stored as a separate plugin result,
 so a change can have multiple AI summaries.
 It can be run manually from a repo page, scoped to selected repositories through
 the generic repo plugin controls, or run globally for all changed updates from

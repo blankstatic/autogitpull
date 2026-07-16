@@ -30,6 +30,7 @@ type Field struct {
 	Key     string
 	Label   string
 	Type    string
+	Help    string
 	Options []FieldOption
 }
 
@@ -39,14 +40,15 @@ type FieldOption struct {
 }
 
 type Definition struct {
-	ID            string
-	Name          string
-	Description   string
-	DefaultOn     bool
-	DefaultConfig map[string]string
-	RunOnNoChange bool
-	Fields        []Field
-	Run           func(Context) error
+	ID             string
+	Name           string
+	Description    string
+	DefaultOn      bool
+	DefaultConfig  map[string]string
+	RunOnNoChange  bool
+	Fields         []Field
+	ValidateConfig func(map[string]string) error
+	Run            func(Context) error
 }
 
 type View struct {

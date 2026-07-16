@@ -630,6 +630,12 @@ func (s *Server) savePlugin(w http.ResponseWriter, r *http.Request) {
 		}
 		state.Config[field.Key] = strings.TrimSpace(r.FormValue(formKey))
 	}
+	if def.ValidateConfig != nil {
+		if err := def.ValidateConfig(state.Config); err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+	}
 	if err := s.storage.SetPluginState(state); err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
@@ -677,6 +683,27 @@ func (s *Server) testAISummaryPlugin(w http.ResponseWriter, r *http.Request) {
 		if item.ID == plugins.AISummaryID {
 			cfg = item.Config
 			break
+		}
+	}
+	if err := r.ParseForm(); err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+	def, err := plugins.ValidateID(plugins.AISummaryID)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	for _, field := range plugins.ConfigFields(def) {
+		formKey := "config_" + field.Key
+		if _, ok := r.Form[formKey]; ok {
+			cfg[field.Key] = strings.TrimSpace(r.FormValue(formKey))
+		}
+	}
+	if def.ValidateConfig != nil {
+		if err := def.ValidateConfig(cfg); err != nil {
+			http.Redirect(w, r, flashURL("/plugins", "AI summary test failed: "+err.Error(), "skipped"), http.StatusSeeOther)
+			return
 		}
 	}
 	result, err := plugins.TestAISummary(cfg)
@@ -950,7 +977,7 @@ func (s *Server) aiSummaryInputPreview(update db.Update) AISummaryInputPreview {
 		preview.Error = "missing revision range"
 		return preview
 	}
-	context, err := plugins.BuildAISummaryChangeContext(update.RepoPath, update.BeforeRev, update.AfterRev)
+	context, err := plugins.BuildAISummaryChangeContext(update.RepoPath, update.BeforeRev, update.AfterRev, cfg)
 	if err != nil {
 		preview.Error = err.Error()
 		return preview
@@ -1681,6 +1708,25 @@ var baseCSS = template.CSS(`
 	.action-form { display: inline-flex; align-items: center; gap: 8px; margin: 0; }
 	.toolbar { display: flex; justify-content: space-between; align-items: center; gap: 12px; margin-bottom: 14px; flex-wrap: wrap; }
 	.toolbar-group { display: inline-flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+	.plugin-list { display: grid; gap: 14px; }
+	.plugin-card { padding: 0; overflow: hidden; }
+	.plugin-card:hover { transform: none; }
+	.plugin-card-head { display: flex; justify-content: space-between; align-items: flex-start; gap: 16px; padding: 14px 16px 12px; border-bottom: 1px solid var(--border-muted); background: var(--subtle); }
+	.plugin-card-title { display: flex; align-items: center; gap: 8px; margin-bottom: 4px; }
+	.plugin-card-title strong { font-size: 14px; }
+	.plugin-description { color: var(--muted); font-size: 12px; }
+	.plugin-enable { flex: 0 0 auto; padding-top: 1px; }
+	.plugin-card-body { padding: 14px 16px 16px; }
+	.plugin-settings { display: grid; grid-template-columns: repeat(12, minmax(0, 1fr)); gap: 12px; margin-top: 14px; }
+	.plugin-field { display: grid; grid-column: span 4; gap: 6px; min-width: 0; margin: 0; }
+	.plugin-field-label { display: flex; align-items: center; gap: 5px; min-height: 20px; color: var(--muted); font-size: 11px; font-weight: 650; }
+	.plugin-help { display: inline-flex; align-items: center; justify-content: center; width: 16px; height: 16px; border: 1px solid var(--border); border-radius: 50%; color: var(--muted); font-size: 10px; cursor: help; }
+	.plugin-field .input { width: 100%; }
+	.plugin-field-prompt { grid-column: span 12; }
+	.plugin-field-url, .plugin-field-token, .plugin-field-include_patterns, .plugin-field-exclude_patterns { grid-column: span 6; }
+	.plugin-field-max_context_bytes, .plugin-field-max_file_diff_bytes { grid-column: span 3; }
+	.plugin-field textarea.input { min-height: 76px; }
+	.plugin-actions { display: flex; justify-content: flex-end; gap: 8px; margin-top: 14px; padding-top: 12px; border-top: 1px solid var(--border-muted); }
 	.search { width: min(360px, 100%); }
 	.repo-select { margin-right: 8px; accent-color: var(--accent); }
 	.select-all { display: inline-flex; align-items: center; gap: 6px; color: var(--muted); font-size: 12px; font-weight: 600; user-select: none; }
@@ -1740,6 +1786,8 @@ var baseCSS = template.CSS(`
 		.revision-grid { grid-template-columns: 1fr; }
 		.context-grid { grid-template-columns: 1fr; }
 		.repo-list { grid-template-columns: 1fr; }
+		.plugin-field, .plugin-field-url, .plugin-field-token, .plugin-field-include_patterns, .plugin-field-exclude_patterns, .plugin-field-max_context_bytes, .plugin-field-max_file_diff_bytes { grid-column: span 12; }
+		.plugin-card-head { align-items: center; }
 		.activity-meta { align-items: flex-start; flex-direction: column; }
 		th:nth-child(4), td:nth-child(4) { display: none; }
 	}
@@ -1934,16 +1982,13 @@ var pluginsTemplate = template.Must(template.New("plugins").Funcs(templateFuncs)
 <body><header><div class="header-inner"><a class="brand" href="/"><img class="brand-icon" src="/assets/app-icon.png" alt=""><h1>Plugins</h1></a><a class="badge" href="/">Back</a></div></header><main class="grid">
 {{if .Flash.Text}}<div class="flash {{.Flash.Class}}">{{.Flash.Text}}</div>{{end}}
 <section class="panel"><div class="panel-head"><h2>Change plugins</h2></div><div class="panel-body">
-{{if .Plugins}}<div class="repo-list">{{range .Plugins}}{{$plugin := .}}<form class="repo" method="post" action="/plugins/save">
+{{if .Plugins}}<div class="plugin-list">{{range .Plugins}}{{$plugin := .}}<form class="repo plugin-card" method="post" action="/plugins/save">
 	<input type="hidden" name="id" value="{{.ID}}">
-	<div class="repo-title"><strong>{{.Name}}</strong>{{if .Enabled}}<span class="badge success">enabled</span>{{else}}<span class="badge paused">disabled</span>{{end}}</div>
-	<div class="plugin-description">{{.Description}}</div>
-	<div class="plugin-repos">Selected repos: {{if .SelectedRepos}}<span class="plugin-repo-list">{{range .SelectedRepos}}<span class="plugin-repo-chip"><span class="plugin-repo-path" title="{{.}}">{{compactPath .}}</span><button class="chip-remove" type="submit" formaction="/plugins/remove-repo" formmethod="post" name="repo" value="{{.}}" title="Remove selected repo" aria-label="Remove selected repo">x</button></span>{{end}}</span>{{else}}none{{end}}</div>
-	<div class="toolbar" style="margin-top:12px;margin-bottom:0"><div class="toolbar-group">
-		<label class="select-all"><input type="checkbox" name="enabled" value="1" {{if .Enabled}}checked{{end}}> Enabled</label>
-		{{range .Fields}}{{$field := .}}<label class="action-form"><span class="badge paused">{{.Label}}</span>{{if eq .Type "select"}}<select class="input wide" name="config_{{.Key}}">{{range .Options}}<option value="{{.Value}}" {{if eq (configValue $plugin.Config $field.Key) .Value}}selected{{end}}>{{.Label}}</option>{{end}}</select>{{else if eq .Type "textarea"}}<textarea class="input wide" name="config_{{.Key}}">{{configValue $plugin.Config .Key}}</textarea>{{else}}<input class="input wide" type="{{inputType .Type}}" name="config_{{.Key}}" value="{{configValue $plugin.Config .Key}}">{{end}}</label>{{end}}
-	</div><button class="button primary" type="submit">Save</button>{{if eq .ID "ai_summary"}}<button class="button" type="submit" form="ai-summary-test-form">Test</button>{{end}}</div>
-</form>{{end}}</div><form id="ai-summary-test-form" method="post" action="/plugins/test-ai-summary"></form>{{else}}<div class="empty">No plugins available.</div>{{end}}
+	<div class="plugin-card-head"><div><div class="plugin-card-title"><strong>{{.Name}}</strong>{{if .Enabled}}<span class="badge success">enabled</span>{{else}}<span class="badge paused">disabled</span>{{end}}</div><div class="plugin-description">{{.Description}}</div></div><label class="select-all plugin-enable"><input type="checkbox" name="enabled" value="1" {{if .Enabled}}checked{{end}}> Enabled</label></div>
+	<div class="plugin-card-body"><div class="plugin-repos">Selected repos: {{if .SelectedRepos}}<span class="plugin-repo-list">{{range .SelectedRepos}}<span class="plugin-repo-chip"><span class="plugin-repo-path" title="{{.}}">{{compactPath .}}</span><button class="chip-remove" type="submit" formaction="/plugins/remove-repo" formmethod="post" name="repo" value="{{.}}" title="Remove selected repo" aria-label="Remove selected repo">x</button></span>{{end}}</span>{{else}}none{{end}}</div>
+	<div class="plugin-settings">{{range .Fields}}{{$field := .}}<label class="plugin-field plugin-field-{{.Key}}"><span class="plugin-field-label">{{.Label}}{{if .Help}}<span class="plugin-help" title="{{.Help}}" aria-label="{{.Help}}">?</span>{{end}}</span>{{if eq .Type "select"}}<select class="input" name="config_{{.Key}}">{{range .Options}}<option value="{{.Value}}" {{if eq (configValue $plugin.Config $field.Key) .Value}}selected{{end}}>{{.Label}}</option>{{end}}</select>{{else if eq .Type "textarea"}}<textarea class="input" name="config_{{.Key}}">{{configValue $plugin.Config .Key}}</textarea>{{else}}<input class="input" type="{{inputType .Type}}" name="config_{{.Key}}" value="{{configValue $plugin.Config .Key}}">{{end}}</label>{{end}}</div>
+	<div class="plugin-actions"><button class="button primary" type="submit">Save</button>{{if eq .ID "ai_summary"}}<button class="button" type="submit" formaction="/plugins/test-ai-summary">Test connection</button>{{end}}</div></div>
+	</form>{{end}}</div>{{else}}<div class="empty">No plugins available.</div>{{end}}
 </div></section>
 </main><script>document.querySelectorAll('form').forEach(form => form.addEventListener('submit', () => { const b = document.activeElement; if (b && b.tagName === 'BUTTON') b.textContent = b.formAction && b.formAction.includes('/plugins/test-ai-summary') ? 'Testing...' : 'Saving...'; }));</script></body></html>`))
 

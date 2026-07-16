@@ -213,11 +213,16 @@ func TestPluginsPageRendersBuiltInPlugins(t *testing.T) {
 	if !strings.Contains(rec.Body.String(), "Notifications") {
 		t.Fatalf("expected notifications plugin in response")
 	}
-	if !strings.Contains(rec.Body.String(), `action="/plugins/test-ai-summary"`) || !strings.Contains(rec.Body.String(), ">Test</button>") {
+	if !strings.Contains(rec.Body.String(), `formaction="/plugins/test-ai-summary"`) || !strings.Contains(rec.Body.String(), ">Test connection</button>") {
 		t.Fatalf("expected AI summary test button in response")
 	}
-	if !strings.Contains(rec.Body.String(), `<textarea class="input wide" name="config_prompt">`) {
+	if !strings.Contains(rec.Body.String(), `<textarea class="input" name="config_prompt">`) {
 		t.Fatalf("expected AI summary prompt textarea in response")
+	}
+	for _, want := range []string{"plugin-list", "plugin-settings", "plugin-field-prompt", "plugin-help"} {
+		if !strings.Contains(rec.Body.String(), want) {
+			t.Fatalf("expected compact plugin layout marker %q", want)
+		}
 	}
 	if !strings.Contains(rec.Body.String(), "plugin-repo-path") || !strings.Contains(rec.Body.String(), `title="/Users/dmitry/proj/autogitpull_source"`) {
 		t.Fatalf("expected selected repo path to render in wrapping container")
@@ -559,9 +564,9 @@ func TestAISummaryTestEndpoint(t *testing.T) {
 		Config: map[string]string{
 			"provider": "OpenAI account",
 			"api_type": "responses",
-			"url":      provider.URL + "/v1",
-			"token":    "test-key",
-			"model":    "gpt-test",
+			"url":      "http://saved.invalid/v1",
+			"token":    "saved-key",
+			"model":    "saved-model",
 		},
 	}); err != nil {
 		t.Fatal(err)
@@ -569,7 +574,18 @@ func TestAISummaryTestEndpoint(t *testing.T) {
 
 	server := New(store, storage)
 	rec := httptest.NewRecorder()
-	req := httptest.NewRequest("POST", "/plugins/test-ai-summary", nil)
+	form := url.Values{
+		"config_api_type":            {"responses"},
+		"config_url":                 {provider.URL + "/v1"},
+		"config_token":               {"test-key"},
+		"config_model":               {"gpt-test"},
+		"config_code_detail":         {"limited"},
+		"config_max_context_bytes":   {"120000"},
+		"config_max_file_diff_bytes": {"20000"},
+		"config_diff_context_lines":  {"20"},
+	}
+	req := httptest.NewRequest("POST", "/plugins/test-ai-summary", strings.NewReader(form.Encode()))
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
 	server.mux.ServeHTTP(rec, req)
 
 	if rec.Code != http.StatusSeeOther {
@@ -578,6 +594,9 @@ func TestAISummaryTestEndpoint(t *testing.T) {
 	location := rec.Header().Get("Location")
 	if !strings.Contains(location, "AI+summary+test%3A+hello+back") {
 		t.Fatalf("expected test response in flash, got %q", location)
+	}
+	if got := storage.GetPluginStates()[plugins.AISummaryID].Config["url"]; got != "http://saved.invalid/v1" {
+		t.Fatalf("test connection unexpectedly saved form values: %q", got)
 	}
 }
 
