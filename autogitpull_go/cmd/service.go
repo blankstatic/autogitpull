@@ -7,8 +7,8 @@ import (
 
 var serviceCmd = &cobra.Command{
 	Use:   "service [install|start|stop|uninstall|status]",
-	Short: "Manage the auto-pull macOS launchd service",
-	Long:  `Install, start, stop, uninstall or check status of the background launchd service on macOS`,
+	Short: "Manage the auto-pull background service",
+	Long:  `Install, start, stop, uninstall or check status of the background service on macOS launchd or Linux systemd.`,
 	Args:  cobra.ExactArgs(1),
 	Run:   logic.ServiceCommandHandler,
 }

@@ -77,7 +77,7 @@ func printServiceUsage() {
 	fmt.Println(`Usage: autogitpull service <command>
 
 Commands:
-    install    - Install the launchd service
+    install    - Install the background service
     start      - Start the service
     stop       - Stop the service
     uninstall  - Uninstall the service

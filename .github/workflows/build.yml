@@ -1,4 +1,4 @@
-name: Build macOS Binary
+name: Build
 
 on:
   push:
@@ -7,6 +7,24 @@ on:
     branches: [ main, master ]
 
 jobs:
+  test:
+    name: Test
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v4
+        with:
+          go-version: '1.23.5'
+
+      - name: Run tests
+        run: |
+          cd autogitpull_go
+          go test ./...
+
   build-macos:
     name: Build on macOS
     runs-on: macos-latest
@@ -36,3 +54,42 @@ jobs:
           path: |
             autogitpull_go/autogitpull-macos-arm64
             autogitpull_go/autogitpull-macos-arm64.tar.gz
+
+  build-linux:
+    name: Build on Linux
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v4
+        with:
+          go-version: '1.23.5'
+
+      - name: Install arm64 cross compiler
+        run: sudo apt-get update && sudo apt-get install -y gcc-aarch64-linux-gnu
+
+      - name: Build for Linux
+        env:
+          APP_VERSION: ${{ github.ref_name }}
+        run: |
+          cd autogitpull_go
+          GOOS=linux GOARCH=amd64 go build -ldflags "-X github.com/blankstatic/autogitpull/autogitpull_go/internal/version.AppVersion=${APP_VERSION}" -o autogitpull-linux-amd64 .
+          chmod +x autogitpull-linux-amd64
+          tar -czf autogitpull-linux-amd64.tar.gz autogitpull-linux-amd64
+
+          CC=aarch64-linux-gnu-gcc GOOS=linux GOARCH=arm64 CGO_ENABLED=1 go build -ldflags "-X github.com/blankstatic/autogitpull/autogitpull_go/internal/version.AppVersion=${APP_VERSION}" -o autogitpull-linux-arm64 .
+          chmod +x autogitpull-linux-arm64
+          tar -czf autogitpull-linux-arm64.tar.gz autogitpull-linux-arm64
+
+      - name: Upload build artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: linux-binaries
+          path: |
+            autogitpull_go/autogitpull-linux-amd64
+            autogitpull_go/autogitpull-linux-amd64.tar.gz
+            autogitpull_go/autogitpull-linux-arm64
+            autogitpull_go/autogitpull-linux-arm64.tar.gz

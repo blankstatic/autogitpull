@@ -17,8 +17,9 @@ you work.
 - Records update history in `~/.autogitpull/updates.sqlite`.
 - Shows registered repositories in a terminal UI.
 - Starts a local dashboard at `http://localhost:9009` while the daemon runs.
-- Sends macOS notifications when a pull brings new changes.
-- Can be installed as a macOS `launchd` service.
+- Sends desktop notifications when a pull brings new changes.
+- Can be installed as a macOS `launchd` service or Linux user `systemd`
+  service.
 
 The safety rule is intentionally simple: `autogitpull` only pulls when the repo
 is on its detected default branch and `git status --porcelain` is clean.
@@ -43,6 +44,18 @@ brew install terminal-notifier
 When `terminal-notifier` is available, the installer also builds
 `~/Applications/FeatureHubLauncher.app` and uses it for clickable
 notifications.
+
+Linux amd64/arm64:
+
+```sh
+bash -c "$(curl -fsSL https://raw.githubusercontent.com/blankstatic/autogitpull/main/tools/install_linux.sh)"
+```
+
+Install and start the Linux user `systemd` service in one step:
+
+```sh
+bash -c "$(curl -fsSL https://raw.githubusercontent.com/blankstatic/autogitpull/main/tools/install_linux.sh)" -- --start-service
+```
 
 ## Build From Source
 
@@ -135,7 +148,7 @@ unregister [paths...]     Remove repositories. With no path, removes the current
 discover [paths...]       Recursively find Git repositories and register them.
 status                    Open the terminal UI. This is also the default command.
 daemon                    Run the auto-pull loop and web dashboard in the foreground.
-service <command>         Manage the macOS launchd service.
+service <command>         Manage the macOS launchd or Linux systemd service.
 version                   Print the version.
 ```
 
@@ -156,7 +169,7 @@ autogitpull status
 autogitpull version
 ```
 
-## macOS Service
+## Background Service
 
 Install and start the background service:
 
@@ -184,7 +197,7 @@ The service runs:
 autogitpull daemon
 ```
 
-It uses launchd label:
+On macOS it uses launchd label:
 
 ```text
 com.blankstatic.autogitpull
@@ -197,9 +210,27 @@ cat /tmp/com.blankstatic.autogitpull.log
 cat /tmp/com.blankstatic.autogitpull.error.log
 ```
 
+On Linux it installs a user `systemd` unit:
+
+```text
+~/.config/systemd/user/autogitpull.service
+```
+
+Linux logs:
+
+```sh
+journalctl --user -u autogitpull.service -f
+```
+
+To keep the Linux user service running after logout, enable lingering once:
+
+```sh
+sudo loginctl enable-linger "$USER"
+```
+
 ## Dashboard
 
-When `autogitpull daemon` or the macOS service is running, the dashboard is
+When `autogitpull daemon` or the background service is running, the dashboard is
 available at:
 
 ```text
@@ -298,4 +329,3 @@ autogitpull-macos-arm64
 ```
 
 The installer expects the release asset to use that exact name.
-
