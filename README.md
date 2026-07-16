@@ -35,7 +35,7 @@ and failed pulls.
 
 ### Desktop notifications
 
-![autogitpull desktop notifications](assets/notifications.jpg)
+![autogitpull desktop notifications](assets/notification.jpg)
 
 ## Install
 
