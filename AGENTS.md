@@ -25,5 +25,7 @@
 - `web.New` calls `plugins.EnsureDefaults(storage)` so built-in plugin defaults are persisted.
 - Notifications are implemented as the built-in `notifications` plugin, default enabled with `title_prefix=Pulled`; do not call `pkg/notifications` directly from web, TUI, or daemon flows.
 - Manual web and TUI pull notifications should fire through the notifications plugin even when the pull has no new changes; other plugins remain changed-only unless they opt into no-change runs.
+- Background service management supports macOS launchd and Linux user systemd (`~/.config/systemd/user/autogitpull.service`); keep CLI help, install scripts, CI release artifact names, and README install commands aligned.
+- Linux desktop notifications depend on a graphical session and use `notify-send` actions plus `xdg-open` for clickable update links, falling back to `beeep`/D-Bus/`notify-send`/`kdialog` when clickable actions are unavailable; Linux service install/start imports desktop env vars into `systemd --user`.
 - Before finishing code changes, run `go test ./...` from `autogitpull_go`.
 - Keep project memory and docs current: update `AGENTS.md` and `autogitpull_go/README.md` when dashboard pages, plugin behavior, storage, pull flow, TUI/web/daemon alignment, or user-facing commands change.

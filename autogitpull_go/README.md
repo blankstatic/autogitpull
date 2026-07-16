@@ -18,9 +18,10 @@ you work.
 - Shows registered repositories in a terminal UI.
 - Starts a local dashboard at `http://localhost:9009` while the daemon runs.
 - Runs change-processing plugins after recorded pulls.
-- Sends macOS notifications through the built-in Notifications plugin.
+- Sends desktop notifications through the built-in Notifications plugin.
 - Can store plugin output, including prepared AI-summary context, per update.
-- Can be installed as a macOS `launchd` service.
+- Can be installed as a macOS `launchd` service or Linux user `systemd`
+  service.
 
 The safety rule is intentionally simple: `autogitpull` only pulls when the repo
 is on its detected default branch and `git status --porcelain` is clean.
@@ -45,6 +46,18 @@ brew install terminal-notifier
 When `terminal-notifier` is available, the installer also builds
 `~/Applications/FeatureHubLauncher.app` and uses it for clickable
 notifications.
+
+Linux amd64/arm64:
+
+```sh
+bash -c "$(curl -fsSL https://raw.githubusercontent.com/blankstatic/autogitpull/main/tools/install_linux.sh)"
+```
+
+Install and start the Linux user `systemd` service in one step:
+
+```sh
+bash -c "$(curl -fsSL https://raw.githubusercontent.com/blankstatic/autogitpull/main/tools/install_linux.sh)" -- --start-service
+```
 
 ## Build From Source
 
@@ -141,7 +154,7 @@ unregister [paths...]     Remove repositories. With no path, removes the current
 discover [paths...]       Recursively find Git repositories and register them.
 status                    Open the terminal UI. This is also the default command.
 daemon                    Run the auto-pull loop and web dashboard in the foreground.
-service <command>         Manage the macOS launchd service.
+service <command>         Manage the macOS launchd or Linux systemd service.
 version                   Print the version.
 ```
 
@@ -162,7 +175,7 @@ autogitpull status
 autogitpull version
 ```
 
-## macOS Service
+## Background Service
 
 Install and start the background service:
 
@@ -190,7 +203,7 @@ The service runs:
 autogitpull daemon
 ```
 
-It uses launchd label:
+On macOS it uses launchd label:
 
 ```text
 com.blankstatic.autogitpull
@@ -203,9 +216,27 @@ cat /tmp/com.blankstatic.autogitpull.log
 cat /tmp/com.blankstatic.autogitpull.error.log
 ```
 
+On Linux it installs a user `systemd` unit:
+
+```text
+~/.config/systemd/user/autogitpull.service
+```
+
+Linux logs:
+
+```sh
+journalctl --user -u autogitpull.service -f
+```
+
+To keep the Linux user service running after logout, enable lingering once:
+
+```sh
+sudo loginctl enable-linger "$USER"
+```
+
 ## Dashboard
 
-When `autogitpull daemon` or the macOS service is running, the dashboard is
+When `autogitpull daemon` or the background service is running, the dashboard is
 available at:
 
 ```text
@@ -338,7 +369,14 @@ notifications even when the local `HEAD` did not change. Those events are not
 treated as AI-summary code changes because there is no local revision range to
 summarize.
 
-By default it looks for:
+On Linux, pull notifications use the desktop notification stack. Clickable
+change links are attempted through `notify-send` actions plus `xdg-open`;
+otherwise `autogitpull` falls back to a normal `beeep` notification through
+session D-Bus, `notify-send`, or `kdialog`. A graphical user session is required.
+When the Linux service is installed or started, it imports the current desktop
+environment into `systemd --user` so notifications and `xdg-open` can see it.
+
+On macOS, by default it looks for:
 
 ```sh
 ~/Applications/FeatureHubLauncher.app
@@ -366,12 +404,14 @@ autogitpull register --silently ~/work/project
 
 ## Release Artifacts
 
-GitHub Actions builds the macOS ARM64 binary:
+GitHub Actions builds release binaries:
 
 ```text
 autogitpull-macos-arm64
+autogitpull-linux-amd64
+autogitpull-linux-arm64
 ```
 
-The installer expects the release asset to use that exact name.
+The installers expect the release assets to use those exact names.
 
 <test commit>
