@@ -304,8 +304,10 @@ func (s *Server) repo(w http.ResponseWriter, r *http.Request) {
 	}
 
 	pluginStates := s.storage.GetPluginStates()
+	remoteURL, _ := git.GetRemoteWebURL(repoPath)
 	renderTemplate(w, repoTemplate, map[string]any{
 		"Repo":           repo,
+		"RemoteURL":      remoteURL,
 		"PluginControls": pluginRepoControls(pluginStates, repo.Path),
 		"Updates":        updates,
 		"Activity":       activity,
@@ -1906,6 +1908,7 @@ var repoTemplate = template.Must(template.New("repo").Funcs(templateFuncs).Parse
 {{if .Flash.Text}}<div class="flash {{.Flash.Class}}">{{.Flash.Text}}</div>{{end}}
 <section class="summary">
 	<div class="metric"><div class="metric-label">Default branch</div><div class="metric-value">{{.Repo.DefaultBranch}}</div></div>
+	{{if .RemoteURL}}<div class="metric"><div class="metric-label">Remote repository</div><div class="metric-value"><a href="{{.RemoteURL}}" target="_blank" rel="noopener noreferrer">Open repository</a></div></div>{{end}}
 	<div class="metric"><div class="metric-label">Last sync</div><div class="metric-value">{{humanTime .Repo.LastSync}}</div><div class="metric-detail">{{formatTime .Repo.LastSync}}</div></div>
 	<div class="metric"><div class="metric-label">Recorded events</div><div class="metric-value">{{humanNumber .TotalUpdates}}</div></div>
 	<div class="metric"><div class="metric-label">Auto pull</div><div class="metric-value">{{if .Repo.Paused}}<span class="badge paused">paused</span>{{else}}<span class="badge success">enabled</span>{{end}}</div></div>

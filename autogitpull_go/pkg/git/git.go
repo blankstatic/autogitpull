@@ -2,6 +2,7 @@ package git
 
 import (
 	"context"
+	"net/url"
 	"path/filepath"
 	"strings"
 	"time"
@@ -60,6 +61,45 @@ func GetRemoteDefaultBranch(path string) (string, error) {
 	}
 
 	return "", nil
+}
+
+func GetRemoteWebURL(path string) (string, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), DefaultPullTimeoutSec)
+	defer cancel()
+
+	output, err := exc.CommandExec(ctx, DefaultPullTimeoutSec, path, "git", "remote", "get-url", "origin")
+	if err != nil {
+		return "", err
+	}
+	return RemoteWebURL(strings.TrimSpace(output)), nil
+}
+
+func RemoteWebURL(remote string) string {
+	remote = strings.TrimSpace(remote)
+	if strings.HasPrefix(remote, "git@") {
+		parts := strings.SplitN(strings.TrimPrefix(remote, "git@"), ":", 2)
+		if len(parts) != 2 || parts[0] == "" || parts[1] == "" {
+			return ""
+		}
+		return "https://" + parts[0] + "/" + strings.TrimSuffix(parts[1], ".git")
+	}
+
+	parsed, err := url.Parse(remote)
+	if err != nil || parsed.Host == "" {
+		return ""
+	}
+	switch parsed.Scheme {
+	case "http", "https":
+		parsed.Path = strings.TrimSuffix(parsed.Path, ".git")
+		return parsed.String()
+	case "ssh":
+		parsed.Scheme = "https"
+		parsed.User = nil
+		parsed.Path = strings.TrimSuffix(parsed.Path, ".git")
+		return parsed.String()
+	default:
+		return ""
+	}
 }
 
 func GitPull(path string) (string, error) {
