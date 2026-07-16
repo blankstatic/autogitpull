@@ -299,6 +299,8 @@ On Linux, pull notifications use the desktop notification stack. Clickable
 change links are attempted through `notify-send` actions plus `xdg-open`;
 otherwise `autogitpull` falls back to a normal `beeep` notification through
 session D-Bus, `notify-send`, or `kdialog`. A graphical user session is required.
+When the Linux service is installed or started, it imports the current desktop
+environment into `systemd --user` so notifications and `xdg-open` can see it.
 
 On macOS, by default it looks for:
 

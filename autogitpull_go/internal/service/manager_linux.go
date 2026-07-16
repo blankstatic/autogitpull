@@ -76,6 +76,7 @@ func (lm *linuxManager) Install() error {
 	if err := lm.systemctl("daemon-reload"); err != nil {
 		return err
 	}
+	lm.importDesktopEnvironment()
 	if err := lm.systemctl("enable", systemdUnitName); err != nil {
 		return err
 	}
@@ -117,6 +118,7 @@ func (lm *linuxManager) Start() error {
 	if err := lm.systemctl("daemon-reload"); err != nil {
 		return err
 	}
+	lm.importDesktopEnvironment()
 	return lm.systemctl("start", systemdUnitName)
 }
 
@@ -171,6 +173,18 @@ func (lm *linuxManager) systemctl(args ...string) error {
 		return fmt.Errorf("systemctl --user %s failed: %s - %w", strings.Join(args, " "), strings.TrimSpace(string(output)), err)
 	}
 	return nil
+}
+
+func (lm *linuxManager) importDesktopEnvironment() {
+	_ = lm.systemctl(
+		"import-environment",
+		"DISPLAY",
+		"WAYLAND_DISPLAY",
+		"XAUTHORITY",
+		"DBUS_SESSION_BUS_ADDRESS",
+		"XDG_CURRENT_DESKTOP",
+		"DESKTOP_SESSION",
+	)
 }
 
 func systemdQuote(value string) string {
