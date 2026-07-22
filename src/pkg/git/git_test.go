@@ -8,6 +8,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 )
 
 func TestGitCommandsRespectContextCancellation(t *testing.T) {
@@ -17,6 +18,40 @@ func TestGitCommandsRespectContextCancellation(t *testing.T) {
 	_, err := GitChangedLogContext(ctx, t.TempDir(), "before", "after")
 	if !errors.Is(err, context.Canceled) {
 		t.Fatalf("expected context cancellation, got %v", err)
+	}
+}
+
+func TestRemoveStaleIndexLock(t *testing.T) {
+	repo := t.TempDir()
+	cmd := exec.Command("git", "init", "-q")
+	cmd.Dir = repo
+	if out, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("git init: %v: %s", err, out)
+	}
+	lockPath := filepath.Join(repo, ".git", "index.lock")
+	if err := os.WriteFile(lockPath, nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now()
+	if removed, err := removeStaleIndexLock(repo, now); err != nil || removed {
+		t.Fatalf("fresh lock removed=%v err=%v", removed, err)
+	}
+	old := now.Add(-staleIndexLockMinAge - time.Second)
+	if err := os.Chtimes(lockPath, old, old); err != nil {
+		t.Fatal(err)
+	}
+	if removed, err := removeStaleIndexLock(repo, now); err != nil || !removed {
+		t.Fatalf("stale lock removed=%v err=%v", removed, err)
+	}
+}
+
+func TestIsIndexLockError(t *testing.T) {
+	err := errors.New("command execution failed")
+	if !isIndexLockError("fatal: Unable to create '.git/index.lock': File exists.", err) {
+		t.Fatal("expected index lock error")
+	}
+	if isIndexLockError("fatal: authentication failed", err) {
+		t.Fatal("authentication error must not be treated as index lock")
 	}
 }
 

@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"net/url"
+	"os"
 	"path/filepath"
 	"strings"
 	"time"
@@ -13,7 +14,11 @@ import (
 )
 
 const GitDirName = ".git"
-const DefaultPullTimeoutSec = 5 * time.Second
+const (
+	DefaultCommandTimeout = 5 * time.Second
+	DefaultPullTimeout    = 5 * time.Minute
+	staleIndexLockMinAge  = time.Hour
+)
 
 func DetectRepository(path string) error {
 	err := fs.CheckDirectoryExist(path)
@@ -26,10 +31,10 @@ func DetectRepository(path string) error {
 }
 
 func GetCurrentBranch(path string) (string, error) {
-	ctx, cancel := context.WithTimeout(context.Background(), DefaultPullTimeoutSec)
+	ctx, cancel := context.WithTimeout(context.Background(), DefaultCommandTimeout)
 	defer cancel()
 
-	output, err := exc.CommandExec(ctx, DefaultPullTimeoutSec, path, "git", "branch", "--show-current")
+	output, err := exc.CommandExec(ctx, DefaultCommandTimeout, path, "git", "branch", "--show-current")
 	if err != nil {
 		return "", err
 	}
@@ -39,10 +44,10 @@ func GetCurrentBranch(path string) (string, error) {
 }
 
 func GetRemoteDefaultBranch(path string) (string, error) {
-	ctx, cancel := context.WithTimeout(context.Background(), DefaultPullTimeoutSec)
+	ctx, cancel := context.WithTimeout(context.Background(), DefaultCommandTimeout)
 	defer cancel()
 
-	output, err := exc.CommandExec(ctx, DefaultPullTimeoutSec, path, "git", "--no-pager", "branch", "-r")
+	output, err := exc.CommandExec(ctx, DefaultCommandTimeout, path, "git", "--no-pager", "branch", "-r")
 	if err != nil {
 		return "", err
 	}
@@ -65,10 +70,10 @@ func GetRemoteDefaultBranch(path string) (string, error) {
 }
 
 func GetRemoteWebURL(path string) (string, error) {
-	ctx, cancel := context.WithTimeout(context.Background(), DefaultPullTimeoutSec)
+	ctx, cancel := context.WithTimeout(context.Background(), DefaultCommandTimeout)
 	defer cancel()
 
-	output, err := exc.CommandExec(ctx, DefaultPullTimeoutSec, path, "git", "remote", "get-url", "origin")
+	output, err := exc.CommandExec(ctx, DefaultCommandTimeout, path, "git", "remote", "get-url", "origin")
 	if err != nil {
 		return "", err
 	}
@@ -104,17 +109,74 @@ func RemoteWebURL(remote string) string {
 }
 
 func GitPull(path string) (string, error) {
-	ctx, cancel := context.WithTimeout(context.Background(), DefaultPullTimeoutSec)
+	output, err := gitPullOnce(path)
+	if err == nil || !isIndexLockError(output, err) {
+		return output, err
+	}
+	removed, cleanupErr := removeStaleIndexLock(path, time.Now())
+	if cleanupErr != nil || !removed {
+		return output, err
+	}
+
+	time.Sleep(100 * time.Millisecond)
+	retryOutput, retryErr := gitPullOnce(path)
+	if retryErr == nil {
+		return "Recovered a stale Git index lock and retried the pull.\n" + retryOutput, nil
+	}
+	if output != "" && retryOutput != "" {
+		output += "\n"
+	}
+	return output + retryOutput, retryErr
+}
+
+func gitPullOnce(path string) (string, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), DefaultPullTimeout)
 	defer cancel()
 
-	return exc.CommandExec(ctx, DefaultPullTimeoutSec, path, "git", "pull", "origin")
+	return exc.CommandExec(ctx, DefaultPullTimeout, path, "git", "pull", "origin")
+}
+
+func isIndexLockError(output string, err error) bool {
+	if err == nil {
+		return false
+	}
+	message := strings.ToLower(output + "\n" + err.Error())
+	return strings.Contains(message, "index.lock") &&
+		(strings.Contains(message, "unable to create") || strings.Contains(message, "file exists"))
+}
+
+func removeStaleIndexLock(repoPath string, now time.Time) (bool, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), DefaultCommandTimeout)
+	defer cancel()
+	lockPath, err := exc.CommandExec(ctx, DefaultCommandTimeout, repoPath, "git", "rev-parse", "--git-path", "index.lock")
+	if err != nil {
+		return false, err
+	}
+	lockPath = strings.TrimSpace(lockPath)
+	if !filepath.IsAbs(lockPath) {
+		lockPath = filepath.Join(repoPath, lockPath)
+	}
+	info, err := os.Lstat(lockPath)
+	if os.IsNotExist(err) {
+		return false, nil
+	}
+	if err != nil {
+		return false, err
+	}
+	if !info.Mode().IsRegular() || now.Sub(info.ModTime()) < staleIndexLockMinAge {
+		return false, nil
+	}
+	if err := os.Remove(lockPath); err != nil {
+		return false, err
+	}
+	return true, nil
 }
 
 func GitHead(path string) (string, error) {
-	ctx, cancel := context.WithTimeout(context.Background(), DefaultPullTimeoutSec)
+	ctx, cancel := context.WithTimeout(context.Background(), DefaultCommandTimeout)
 	defer cancel()
 
-	output, err := exc.CommandExec(ctx, DefaultPullTimeoutSec, path, "git", "rev-parse", "HEAD")
+	output, err := exc.CommandExec(ctx, DefaultCommandTimeout, path, "git", "rev-parse", "HEAD")
 	if err != nil {
 		return "", err
 	}
@@ -129,10 +191,10 @@ func GitChangedLogContext(ctx context.Context, path, fromRev, toRev string) (str
 	if fromRev == "" || toRev == "" || fromRev == toRev {
 		return "", nil
 	}
-	ctx, cancel := context.WithTimeout(ctx, DefaultPullTimeoutSec)
+	ctx, cancel := context.WithTimeout(ctx, DefaultCommandTimeout)
 	defer cancel()
 
-	return exc.CommandExec(ctx, DefaultPullTimeoutSec, path, "git", "--no-pager", "log", "--oneline", "--no-decorate", fromRev+".."+toRev)
+	return exc.CommandExec(ctx, DefaultCommandTimeout, path, "git", "--no-pager", "log", "--oneline", "--no-decorate", fromRev+".."+toRev)
 }
 
 func GitDiffStat(path, fromRev, toRev string) (string, error) {
@@ -143,10 +205,10 @@ func GitDiffStatContext(ctx context.Context, path, fromRev, toRev string) (strin
 	if fromRev == "" || toRev == "" || fromRev == toRev {
 		return "", nil
 	}
-	ctx, cancel := context.WithTimeout(ctx, DefaultPullTimeoutSec)
+	ctx, cancel := context.WithTimeout(ctx, DefaultCommandTimeout)
 	defer cancel()
 
-	return exc.CommandExec(ctx, DefaultPullTimeoutSec, path, "git", "--no-pager", "diff", "--stat", fromRev+".."+toRev)
+	return exc.CommandExec(ctx, DefaultCommandTimeout, path, "git", "--no-pager", "diff", "--stat", fromRev+".."+toRev)
 }
 
 func GitChangedFiles(path, fromRev, toRev string) ([]string, error) {
@@ -157,10 +219,10 @@ func GitChangedFilesContext(ctx context.Context, path, fromRev, toRev string) ([
 	if fromRev == "" || toRev == "" || fromRev == toRev {
 		return nil, nil
 	}
-	ctx, cancel := context.WithTimeout(ctx, DefaultPullTimeoutSec)
+	ctx, cancel := context.WithTimeout(ctx, DefaultCommandTimeout)
 	defer cancel()
 
-	output, err := exc.CommandExec(ctx, DefaultPullTimeoutSec, path, "git", "--no-pager", "diff", "--name-only", fromRev+".."+toRev)
+	output, err := exc.CommandExec(ctx, DefaultCommandTimeout, path, "git", "--no-pager", "diff", "--name-only", fromRev+".."+toRev)
 	if err != nil {
 		return nil, err
 	}
@@ -197,17 +259,17 @@ func GitDiffPatchForFileLimitedContextWithContext(parent context.Context, path, 
 	if contextLines > 200 {
 		contextLines = 200
 	}
-	ctx, cancel := context.WithTimeout(parent, DefaultPullTimeoutSec)
+	ctx, cancel := context.WithTimeout(parent, DefaultCommandTimeout)
 	defer cancel()
 
-	return exc.CommandExecLimited(ctx, DefaultPullTimeoutSec, path, maxBytes, "git", "--no-pager", "diff", "--find-renames", fmt.Sprintf("--unified=%d", contextLines), fromRev+".."+toRev, "--", filePath)
+	return exc.CommandExecLimited(ctx, DefaultCommandTimeout, path, maxBytes, "git", "--no-pager", "diff", "--find-renames", fmt.Sprintf("--unified=%d", contextLines), fromRev+".."+toRev, "--", filePath)
 }
 
 func GitGetUncommitedChanges(path string) (string, error) {
-	ctx, cancel := context.WithTimeout(context.Background(), DefaultPullTimeoutSec)
+	ctx, cancel := context.WithTimeout(context.Background(), DefaultCommandTimeout)
 	defer cancel()
 
-	return exc.CommandExec(ctx, DefaultPullTimeoutSec, path, "git", "status", "--porcelain")
+	return exc.CommandExec(ctx, DefaultCommandTimeout, path, "git", "status", "--porcelain")
 }
 
 func GitHasUncommitedChanges(path string) (bool, error) {

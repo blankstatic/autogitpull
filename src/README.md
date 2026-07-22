@@ -366,6 +366,12 @@ can be detected from `origin/HEAD`.
 
 ## Pull Behavior
 
+Pulls are serialized across the web UI, daemon, TUI, and separate autogitpull
+processes. Repository paths are canonicalized so aliases and symlinks cannot
+bypass the lock. Pulls have a five-minute timeout. If Git reports an
+`index.lock`, autogitpull removes and retries it once only when the lock is a
+regular file at least one hour old; fresh locks are left untouched.
+
 For every registered repository, `autogitpull` does this:
 
 1. Reads the current branch with `git branch --show-current`.
