@@ -13,6 +13,7 @@ import (
 	"github.com/blankstatic/autogitpull/src/internal/config"
 	"github.com/blankstatic/autogitpull/src/internal/db"
 	"github.com/blankstatic/autogitpull/src/internal/plugins"
+	"github.com/blankstatic/autogitpull/src/internal/pulllock"
 	fsutil "github.com/blankstatic/autogitpull/src/pkg/fs"
 	"github.com/blankstatic/autogitpull/src/pkg/git"
 	"github.com/charmbracelet/bubbles/table"
@@ -567,6 +568,12 @@ func handleUnregisterRepo(path string) error {
 }
 
 func handlePullRepo(repo *config.RepoInfo, modelRef *model) error {
+	if !pulllock.TryLock(repo.Path) {
+		modelRef.sendStatusUpdate(repo.Path, "Already pulling")
+		return fmt.Errorf("repository is already being pulled")
+	}
+	defer pulllock.Unlock(repo.Path)
+
 	var handleError error
 	var pullResult string
 	var beforeRev string
